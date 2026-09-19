@@ -14,3 +14,4 @@ workspace = true
 [dependencies]
 cratefield-core = { workspace = true }
 cratefield-module-waitlist = { workspace = true }
+module-support = { path = "../module-support" }

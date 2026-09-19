@@ -20,12 +20,23 @@ impl Runtime for FixedPorts {
 }
 
 /// The ports a Redis-less native boot offers: `Db` from SQLite, `Mailer`
-/// from the Resend adapter, `Signer` from `HARNESS_SECRET`. (The native
-/// runtime also provides `HttpClient`, `Clock`, `IdGen` and `Defer`
-/// unconditionally; those are never the missing ones, so they are left
-/// out to keep this the worst case.)
+/// from the Resend adapter, `Signer` from `HARNESS_SECRET`, plus `Clock`
+/// and `IdGen`, which the native runtime provides unconditionally.
+///
+/// Those two used to be left out as shorthand — "never the missing ones,
+/// so omit them and keep this the worst case". That held only while no
+/// mounted module asked for them. `Support` does, so omitting them made
+/// this fail on the two ports a Redis-less boot always has, which is not
+/// the question being asked. The question is whether a module
+/// hard-requires `RateLimiter` or `KeyValue`; those stay out.
 fn redis_less_native_ports() -> FixedPorts {
-    FixedPorts(vec![Port::Db, Port::Mailer, Port::Signer])
+    FixedPorts(vec![
+        Port::Db,
+        Port::Mailer,
+        Port::Signer,
+        Port::Clock,
+        Port::IdGen,
+    ])
 }
 
 #[test]

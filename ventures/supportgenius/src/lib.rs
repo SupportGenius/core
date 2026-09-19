@@ -1,6 +1,6 @@
-//! The SupportGenius waitlist Worker: one stateless Cloudflare Worker
-//! standing on the Factory Zero harness with the `waitlist` module
-//! composed in.
+//! The SupportGenius Worker: one stateless Cloudflare Worker standing on
+//! the Factory Zero harness with the `waitlist` module composed in, and
+//! the `support` module (routes under `/v1/support`) mounted alongside it.
 //!
 //! The site's form posts `POST /v1/waitlist` with `product:
 //! "supportgenius"`, the entry lands in this Worker's own D1 database,

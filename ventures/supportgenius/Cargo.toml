@@ -33,6 +33,7 @@ doc = false
 cratefield-core = { workspace = true }
 cratefield-runtime-cloudflare = { workspace = true }
 cratefield-module-waitlist = { workspace = true }
+module-support = { path = "../../crates/module-support" }
 cratefield-adapter-resend = { workspace = true }
 cratefield-adapter-turnstile = { workspace = true }
 cratefield-cli = { workspace = true, optional = true }

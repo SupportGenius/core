@@ -786,6 +786,7 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
+ "cratefield-adapter-postgres",
  "cratefield-adapter-sqlite",
  "cratefield-core",
  "futures-core",
@@ -795,6 +796,7 @@ dependencies = [
  "serde",
  "serde_json",
  "time",
+ "tokio",
  "tower",
  "tracing",
 ]
@@ -1812,6 +1814,26 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "module-support"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "cratefield-core",
+ "cratefield-testing",
+ "getrandom 0.4.3",
+ "http",
+ "pollster",
+ "sea-query",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tenancy",
+ "time",
+ "tower",
 ]
 
 [[package]]
@@ -2909,6 +2931,7 @@ dependencies = [
  "cratefield-testing",
  "getrandom 0.4.3",
  "http",
+ "module-support",
  "pollster",
  "supportgenius-composition",
  "worker",
@@ -2938,6 +2961,7 @@ version = "0.1.0"
 dependencies = [
  "cratefield-core",
  "cratefield-module-waitlist",
+ "module-support",
 ]
 
 [[package]]
@@ -2985,6 +3009,9 @@ dependencies = [
 [[package]]
 name = "tenancy"
 version = "0.1.0"
+dependencies = [
+ "cratefield-core",
+]
 
 [[package]]
 name = "thiserror"

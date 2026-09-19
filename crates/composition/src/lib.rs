@@ -32,6 +32,7 @@
 
 use cratefield_core::{HarnessBuilder, Venture};
 use cratefield_module_waitlist::Waitlist;
+use module_support::Support;
 
 /// The venture name, kebab-case.
 pub const NAME: &str = "supportgenius";
@@ -81,6 +82,11 @@ pub fn modules(builder: HarnessBuilder) -> HarnessBuilder {
                 .products(["supportgenius"])
                 .status_redirect("https://supportgeni.us/"),
         )
+        // Mounted on both link targets, not just the Worker: the whole
+        // point of this crate is that the binary and the Worker cannot
+        // drift, and `Support` reaching only one of them would be exactly
+        // that drift.
+        .module(Support::new())
         // Templates register on the harness builder — `Waitlist` itself
         // has no `.templates` method.
         .templates(cratefield_module_waitlist::default_templates())
