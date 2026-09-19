@@ -43,6 +43,26 @@ getrandom = { version = "0.4.3", default-features = false, features = [
 ] }
 http = "1.5.0"
 pollster = { version = "0.4", features = ["macro"] }
+# Shared by crates/module-support (issue #3). Versions and features match
+# what cratefield-module-waitlist 0.1.4 resolves to, so the graph keeps one
+# copy of each.
+axum = { version = "0.8.9", default-features = false, features = [
+    "json",
+    "query",
+    "form",
+    "matched-path",
+    "original-uri",
+] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+schemars = { version = "1.2.2", features = ["preserve_order"] }
+time = { version = "0.3.45", default-features = false, features = [
+    "std",
+    "formatting",
+    "parsing",
+    "wasm-bindgen",
+] }
+tracing = "0.1.44"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
