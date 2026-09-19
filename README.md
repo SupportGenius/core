@@ -5,7 +5,9 @@ built as [Cratefield harness](https://github.com/Cratefield/harness) modules.
 MIT.
 
 **Built so far:** the Cargo workspace, the placeholder `crates/tenancy`,
-and the `ventures/supportgenius` Worker — the SupportGenius waitlist API.
+the `ventures/supportgenius` Worker — the SupportGenius waitlist API — and
+`bin/supportgenius`, the same modules as one static native binary (issue #6),
+both sharing their module list through `crates/composition`.
 The rest of the list below is still scaffolding and an ordered backlog.
 
 The plan, in order, is the issue list. Two modules, not five:

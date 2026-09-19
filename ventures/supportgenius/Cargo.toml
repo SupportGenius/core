@@ -37,6 +37,9 @@ module-support = { path = "../../crates/module-support" }
 cratefield-adapter-resend = { workspace = true }
 cratefield-adapter-turnstile = { workspace = true }
 cratefield-cli = { workspace = true, optional = true }
+# The venture identity and module list, shared with the static binary so
+# the two link targets cannot drift (issue #6).
+supportgenius-composition = { path = "../../crates/composition" }
 worker = { workspace = true }
 async-trait = { workspace = true }
 

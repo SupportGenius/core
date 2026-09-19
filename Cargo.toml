@@ -1,9 +1,10 @@
 [workspace]
 resolver = "3"
 # Globs on purpose: later issues add crates and ventures without editing
-# this file. Today `crates/*` matches only `tenancy` and `ventures/*` only
-# `supportgenius`; cargo accepts a glob that currently matches one entry.
-members = ["crates/*", "ventures/*"]
+# this file. Today `crates/*` matches `tenancy` and `composition`, `bin/*`
+# the static self-hosted binary, and `ventures/*` only `supportgenius`;
+# cargo accepts a glob that currently matches one entry.
+members = ["crates/*", "bin/*", "ventures/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -32,6 +33,16 @@ cratefield-adapter-resend = "0.2"
 cratefield-adapter-turnstile = "0.1"
 cratefield-testing = "0.2"
 cratefield-cli = "0.2"
+# Native-only (tokio/reqwest/redis do not compile to wasm): consumed only
+# by `bin/supportgenius`, whose native deps are target-gated so the wasm
+# graph stays clean.
+cratefield-runtime-native = "0.1"
+# rusqlite with the `bundled` feature: the static musl binary compiles
+# SQLite in, no system lib and no dynamic linking.
+cratefield-adapter-sqlite = "0.1"
+# Postgres is the operator's opt-in (`--features postgres`), not the
+# default: SQLite is what makes the binary run with zero configuration.
+cratefield-adapter-postgres = "0.1"
 # The `http` feature stays off: with it enabled, D1 writes hang under
 # workerd/miniflare (upstream, worker 0.8.5, verified empirically).
 worker = { version = "0.8", default-features = false, features = ["d1"] }
@@ -45,6 +56,11 @@ http = "1.5.0"
 pollster = { version = "0.4", features = ["macro"] }
 # Pure Rust and wasm32-safe: content-addressed chunk ids in module-support.
 sha2 = "0.11"
+# Feature set matched to what runtime-native itself uses, so the binary
+# enables exactly what it needs (`macros`, `rt-multi-thread`) on top.
+tokio = { version = "1.53", default-features = false }
+tracing = "0.1.44"
+bytes = "1.12"
 # The escalation module (issue #4) mirrors the harness `TextModel`/`Tracker`
 # ports locally until core publishes them (see
 # crates/module-escalation/src/ports/mod.rs); those ports need these four.

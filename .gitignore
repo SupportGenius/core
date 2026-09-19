@@ -11,3 +11,7 @@
 
 # Node tooling (wrangler installs via npx).
 node_modules/
+
+# The self-hosted binary's default SQLite database (`DATABASE_URL` unset
+# boots at ./supportgenius.db).
+*.db

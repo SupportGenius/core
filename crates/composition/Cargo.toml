@@ -1,0 +1,17 @@
+[package]
+name = "supportgenius-composition"
+description = "SupportGenius's venture identity and module list, written down exactly once for both link targets"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cratefield-core = { workspace = true }
+cratefield-module-waitlist = { workspace = true }
+module-support = { path = "../module-support" }
