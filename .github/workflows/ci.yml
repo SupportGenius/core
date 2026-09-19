@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The venture's `fz` bin is behind `required-features = ["cli"]`, so
+      # the workspace run above never compiles it — a broken `fz` would
+      # first surface wherever someone runs the migration collector.
+      - name: fz, with its cli feature
+        run: cargo clippy -p supportgenius --all-targets --locked --features cli -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+
+  wasm:
+    name: worker-build (ventures/supportgenius)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install worker-build
+        run: cargo install -q --locked worker-build
+      # worker-build downloads wasm-bindgen, wasm-opt and esbuild the first
+      # time it runs; none of that comes from the cargo cache, so this job
+      # needs network where the pure-cargo ones do not.
+      - name: Build the Worker to wasm
+        working-directory: ventures/supportgenius
+        run: worker-build --release
+      - name: Assert shim exists
+        run: test -f ventures/supportgenius/build/worker/shim.mjs
+
+  migrations-current:
+    # `migrations/` is source, not a build artifact (the venture README).
+    # This re-runs the collector against the compiled-in harness, so a
+    # module change that should have added a migration fails here instead
+    # of shipping an old schema to the next deploy.
+    name: migrations are current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+      - uses: Swatinem/rust-cache@v2
+      - name: Collect, doctor, and diff
+        working-directory: ventures/supportgenius
+        run: |
+          cargo run --locked --features cli --bin fz -- migrations collect
+          cargo run --locked --features cli --bin fz -- doctor
+          if ! git diff --exit-code -- migrations; then
+            echo "::error::migrations/ is stale — re-run 'cargo run --features cli --bin fz -- migrations collect' in ventures/supportgenius and commit the output"
+            exit 1
+          fi
+
+  # The conformance call below is wired now, deliberately: the first
+  # `crates/module-*` that issues #2 onward land starts running the kit
+  # without anyone remembering to switch it on. There are no module crates
+  # yet, and the workflow fails hard when its glob matches nothing — so
+  # this job gates the call and CI stays green until then.
+  detect-modules:
+    name: detect module crates
+    runs-on: ubuntu-latest
+    outputs:
+      has_modules: ${{ steps.detect.outputs.has_modules }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: detect
+        run: |
+          shopt -s nullglob
+          dirs=(crates/module-*)
+          if [ ${#dirs[@]} -gt 0 ]; then
+            echo "has_modules=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_modules=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  conformance:
+    # 18a5176 was HEAD of Cratefield/harness's main when pinned
+    # (2026-09-19), so the pin can be re-checked against that branch.
+    name: conformance (module kit)
+    needs: detect-modules
+    if: needs.detect-modules.outputs.has_modules == 'true'
+    uses: Cratefield/harness/.github/workflows/conformance.yml@18a51769b2dbb65dc2be6282014a6aca2bdc326e
+    with:
+      module-glob: "crates/module-*"

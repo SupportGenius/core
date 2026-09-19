@@ -1,0 +1,63 @@
+[workspace]
+resolver = "3"
+# Globs on purpose: later issues add crates and ventures without editing
+# this file. Today `crates/*` matches only `tenancy` and `ventures/*` only
+# `supportgenius`; cargo accepts a glob that currently matches one entry.
+members = ["crates/*", "ventures/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/SupportGenius/core"
+
+[workspace.dependencies]
+# cratefield-core is pinned to the 0.4 line deliberately, NOT 0.5: every
+# published companion crate this workspace needs —
+# cratefield-runtime-cloudflare 0.1.4, cratefield-module-waitlist 0.1.4,
+# cratefield-adapter-resend 0.2.2, cratefield-adapter-turnstile 0.1.4,
+# cratefield-testing 0.2.2 and cratefield-cli 0.2.2 — still requires
+# core ^0.4. Asking for core 0.5 puts two copies of core in the graph
+# and the waitlist module's `Module` impl (typed against core 0.4) no
+# longer satisfies the harness builder, which is a compile error, not a
+# deprecation. The 0.4.3 -> 0.5.0 API delta is confined to
+# `TenantStatus`, so nothing else in this workspace is affected; revisit
+# the pin when the companions publish against 0.5.
+cratefield-core = "0.4"
+cratefield-runtime-cloudflare = "0.1"
+cratefield-module-waitlist = "0.1"
+cratefield-adapter-resend = "0.2"
+# 0.1.4 is the turnstile adapter line built against core ^0.4.
+cratefield-adapter-turnstile = "0.1"
+cratefield-testing = "0.2"
+cratefield-cli = "0.2"
+# The `http` feature stays off: with it enabled, D1 writes hang under
+# workerd/miniflare (upstream, worker 0.8.5, verified empirically).
+worker = { version = "0.8", default-features = false, features = ["d1"] }
+async-trait = "0.1.92"
+# Enabled by wasm leaf crates: getrandom (reached through the runtime)
+# needs the opt-in wasm_js backend on wasm32-unknown-unknown.
+getrandom = { version = "0.4.3", default-features = false, features = [
+    "wasm_js",
+] }
+http = "1.5.0"
+pollster = { version = "0.4", features = ["macro"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+# A `pub` item in a private module can be named by nobody: it reads as API
+# and is not one.
+unreachable_pub = "warn"
+# A type reachable through a public API but not nameable by the caller.
+unnameable_types = "warn"
+# A cast that does nothing. Zero today; it is here so the first one is
+# caught rather than read past.
+trivial_numeric_casts = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+# Builder-heavy API: nearly every `fn(self) -> Self` and getter trips this
+# lint; the attribute noise outweighs the value.
+must_use_candidate = { level = "allow", priority = 1 }

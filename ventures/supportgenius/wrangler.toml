@@ -1,0 +1,55 @@
+name = "supportgenius"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-09-01"
+
+[build]
+command = "worker-build --release"
+
+[observability]
+enabled = true
+
+# The environment is declared here, not hardcoded into the composition:
+# `HarnessBuilder::build` takes no config, so a hardcoded
+# `VentureEnv::Production` would make the composition refuse to build
+# instead of serving (see src/lib.rs).
+[vars]
+ENV = "production"
+
+# Secrets a human must set before this Worker can do its job
+# (`wrangler secret put <NAME>`):
+#
+#   HARNESS_SECRET   required, >= 32 bytes. Backs the harness `Signer`
+#                    port and log pseudonyms; without it the runtime logs
+#                    "HARNESS_SECRET missing or invalid" and leaves the
+#                    Signer unset.
+#   RESEND_API_KEY   required. The Resend key for the sending subdomain
+#                    `send.supportgeni.us`. Without it the mailer answers
+#                    `NotConfigured` and every join fails loudly (by
+#                    design; there is no no-op mailer here).
+#   TURNSTILE_SECRET required for production traffic. The Turnstile widget
+#                    secret paired with the sitekey on the site's form.
+#                    Without it no Captcha port is mounted and joins skip
+#                    human verification.
+#   ADMIN_TOKEN      optional. Gates `GET /v1/waitlist/admin/export.csv`
+#                    (Bearer auth, constant-time compared). Without it the
+#                    export answers 401.
+
+[[d1_databases]]
+binding = "DB"
+database_name = "supportgenius"
+# NOT A REAL ID. A human runs `wrangler d1 create supportgenius` and pastes
+# the returned UUID here; deploys fail until this is replaced.
+database_id = "REPLACE_ME_WITH_THE_UUID_FROM_WRANGLER_D1_CREATE"
+migrations_dir = "migrations"
+
+# The daily cron. This is the half that makes `Module::scheduled` real in
+# production: at 04:23 UTC every day the Worker's `#[event(scheduled)]`
+# handler (src/lib.rs) fans the event out to each module, and the waitlist
+# module purges pending entries past its retention window and prunes
+# expired mail-cooldown claims.
+[triggers]
+crons = ["23 4 * * *"]
+
+[[routes]]
+pattern = "api.supportgeni.us"
+custom_domain = true
