@@ -43,6 +43,8 @@ getrandom = { version = "0.4.3", default-features = false, features = [
 ] }
 http = "1.5.0"
 pollster = { version = "0.4", features = ["macro"] }
+# Pure Rust and wasm32-safe: content-addressed chunk ids in module-support.
+sha2 = "0.11"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

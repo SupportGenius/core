@@ -1,0 +1,48 @@
+[package]
+name = "module-support"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cratefield-core = { workspace = true }
+sha2 = { workspace = true }
+http = { workspace = true }
+# Shared workspace crate: tenant API keys over the Signer port.
+tenancy = { path = "../tenancy" }
+# sea-query stays on 0.32 with the same feature set the published waitlist
+# module uses, so one backend feature union serves the whole graph and
+# `Statement` values round-trip through core unchanged.
+sea-query = { version = "0.32.7", default-features = false, features = [
+    "backend-sqlite",
+    "thread-safe",
+] }
+bytes = "1"
+axum = { version = "0.8", default-features = false, features = ["query"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", default-features = false, features = [
+    "std",
+    "formatting",
+    "wasm-bindgen",
+] }
+
+# getrandom's wasm_js backend is opt-in per leaf crate on
+# wasm32-unknown-unknown; only the wasm build of this crate needs it
+# (cratefield-core reaches getrandom through `ulid`).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true }
+
+[dev-dependencies]
+# The parity leg (Postgres) needs the `postgres` feature on the kit.
+cratefield-testing = { workspace = true, features = ["postgres"] }
+pollster = { workspace = true }
+# `ServiceExt::oneshot` drives the router without a network; pinned to
+# the same line cratefield-testing builds against so one tower compiles.
+tower = { version = "0.5.3", features = ["util"] }
+
+[lints]
+workspace = true
