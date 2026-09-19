@@ -1,11 +1,15 @@
 [package]
 name = "tenancy"
+description = "Shared tenant API keys over the Signer port: mint, verify, revoke by kid list"
 publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[dependencies]
+cratefield-core = { workspace = true }
 
 [lints]
 workspace = true
