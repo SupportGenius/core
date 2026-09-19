@@ -1,0 +1,62 @@
+[package]
+name = "module-escalation"
+description = "SupportGenius escalation module: a conversation becomes a ticket - drafted, judged, filed, followed up"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# The fake `TextModel`/`Tracker` doubles (src/testing.rs) are off by
+# default so the Worker build never carries them; integration tests turn
+# the feature on through the self dev-dependency below.
+testing = []
+
+[dependencies]
+# The ports, the store (`Database`/`Statement`/`Outbox`/`Clock`/`IdGen`),
+# and `scrub_text` for the mirrored error `Display`s.
+cratefield-core = { workspace = true }
+# `Module::router` returns an `axum::Router`; this module returns it
+# deliberately empty (see `Escalation::router` in lib.rs), so the
+# dependency exists for the trait's return type alone. Same pin and
+# feature set cratefield-core uses, so nothing new enters the graph.
+axum = { version = "0.8.9", default-features = false }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+# The store renders its queries through the same sea-query pin core uses
+# (`Statement::render` builds with the SQLite query builder).
+sea-query = { version = "0.32.7", default-features = false, features = [
+    "backend-sqlite",
+    "thread-safe",
+] }
+# Intake stamps rows with the `Clock` port's `OffsetDateTime`, formatted
+# RFC 3339. Both versions match what cratefield-core already pulls in, so
+# nothing new enters the graph.
+time = { version = "0.3.45", default-features = false, features = [
+    "std",
+    "formatting",
+] }
+
+[dev-dependencies]
+# A crate may depend on itself for tests: this copy enables the `testing`
+# feature, so `tests/*.rs` can `use module_escalation::testing::..` while
+# the plain lib (the one the venture links) stays feature-free.
+module-escalation = { path = ".", features = ["testing"] }
+pollster = { workspace = true }
+# The store and intake round-trip tests run against a real in-memory
+# SQLite through the shipped migration. Already in the lock (0.1.4, built
+# against core ^0.4) via cratefield-testing; this only names the edge.
+cratefield-adapter-sqlite = "0.1"
+# The pipeline acceptance tests drive the stages through the published
+# doubles: `FakeDefer` runs the next stage the moment a stage enqueues it
+# (the path the issue names), and `FakeMailer` is the wired-mailer side of
+# the notify stage's `no_recipient` pin. Already in the lock (0.2.2).
+cratefield-testing = { workspace = true }

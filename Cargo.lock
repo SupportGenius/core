@@ -1286,6 +1286,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
+name = "module-escalation"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "cratefield-adapter-sqlite",
+ "cratefield-core",
+ "cratefield-testing",
+ "module-escalation",
+ "pollster",
+ "sea-query",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "zeroize",
+]
+
+[[package]]
 name = "num-bigint-dig"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
