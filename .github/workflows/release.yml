@@ -1,0 +1,50 @@
+name: Release
+
+# Tagged releases of the static `bin/supportgenius` binary: build the musl
+# binary, smoke it, then attach the tarball and its sha256 checksum to the
+# GitHub release the tag points at.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: package musl binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the static musl binary
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl -p supportgenius-bin
+      - name: Assert the binary is fully static
+        run: |
+          ldd target/x86_64-unknown-linux-musl/release/supportgenius 2>&1 \
+            | grep -q 'statically linked\|not a dynamic executable'
+      - name: Smoke the binary before packaging it
+        run: scripts/smoke.sh
+      - name: Package the tarball and checksum
+        run: |
+          cd target/x86_64-unknown-linux-musl/release
+          tar czf "$GITHUB_WORKSPACE/supportgenius-x86_64-unknown-linux-musl.tar.gz" supportgenius
+          cd "$GITHUB_WORKSPACE"
+          sha256sum supportgenius-x86_64-unknown-linux-musl.tar.gz \
+            > supportgenius-x86_64-unknown-linux-musl.tar.gz.sha256
+      - name: Attach the artifacts to the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            supportgenius-x86_64-unknown-linux-musl.tar.gz
+            supportgenius-x86_64-unknown-linux-musl.tar.gz.sha256

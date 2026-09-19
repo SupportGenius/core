@@ -1,0 +1,51 @@
+[package]
+name = "supportgenius-bin"
+description = "SupportGenius as one static self-hosted binary: the same module list as the Worker, on runtime-native + SQLite (issue #6)"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# One bin target, not auto-discovery: the package is named
+# `supportgenius-bin` but the executable ships as `supportgenius`.
+autobins = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "supportgenius"
+path = "src/main.rs"
+doc = false
+
+[features]
+default = []
+# Postgres behind the `Database` port, for operators who have one.
+# Default is SQLite (rusqlite bundled), so the musl build stays fully
+# static and runs with zero configuration.
+postgres = ["dep:cratefield-adapter-postgres"]
+# Hand-written stub ports (`src/dev_fakes.rs`) selectable at boot with
+# `SUPPORTGENIUS_DEV_FAKES=1`, so a developer can exercise the join flow
+# without Resend/Turnstile credentials. The stubs live in the binary —
+# never in the modules or the composition crate — and warn loudly when
+# active.
+dev-fakes = []
+
+# Native-only deps are target-gated (the pattern `cratefield-runtime-native`
+# itself uses) so the wasm graph of the Worker stays free of
+# tokio/reqwest/redis/rusqlite even with this crate in the workspace.
+[target.'cfg(not(any(target_arch = "wasm32", target_arch = "wasm64")))'.dependencies]
+cratefield-core = { workspace = true }
+cratefield-runtime-native = { workspace = true }
+cratefield-adapter-sqlite = { workspace = true }
+cratefield-adapter-postgres = { workspace = true, optional = true }
+cratefield-adapter-resend = { workspace = true }
+cratefield-adapter-turnstile = { workspace = true }
+supportgenius-composition = { path = "../../crates/composition" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+http = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+# The `dev-fakes` stubs implement `async_trait` ports.
+async-trait = { workspace = true }

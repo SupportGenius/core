@@ -32,20 +32,12 @@ use std::sync::{Arc, OnceLock};
 
 use cratefield_adapter_resend::Resend;
 use cratefield_adapter_turnstile::Turnstile;
-use cratefield_core::{ConfigError, Harness, Mailer, Venture};
-use cratefield_module_waitlist::Waitlist;
+use cratefield_core::{ConfigError, Harness, Mailer};
 use cratefield_runtime_cloudflare::{
     Cloudflare, FetchClient, WorkersClock, serve, serve_scheduled,
 };
+use supportgenius_composition::MAIL_FROM;
 use worker::{Context, Env, Request, Response, event};
-
-/// The address confirmation mail is sent from: the sending subdomain
-/// verified in Resend. The waitlist module's own default is
-/// `no-reply@send.<venture domain>`, and the venture domain here is
-/// `supportgeni.us`, so this is the same address by construction — kept
-/// explicit anyway so the composition does not depend on the module's
-/// default surviving a module upgrade.
-const MAIL_FROM: &str = "no-reply@send.supportgeni.us";
 
 /// Builds the `Cloudflare` runtime the harness is validated against AND
 /// serves with: one instance, cloned into the builder, the original
@@ -75,33 +67,21 @@ pub fn compose(
 
     // The environment is the deployment's to declare, through `ENV` in
     // wrangler.toml (set to production there). Deliberately not hardcoded
-    // here with `.env(VentureEnv::Production)`: `HarnessBuilder::build`
-    // takes no config, so it cannot see the operator's recorded
-    // acceptance, and a hardcoded production env would make the
-    // composition refuse to build at all — a panic at boot instead of a
-    // serving Worker that says loudly what it is missing.
-    let venture = Venture::new("supportgenius", "supportgeni.us")
-        .public_url("https://supportgeni.us")
-        .cors_origins(["https://supportgeni.us", "https://www.supportgeni.us"]);
-
-    let harness = Harness::builder()
-        .venture(venture)
-        // No `/ui` is mounted, so send the post-confirm landing to the
-        // site rather than the module's default status page, which this
-        // Worker does not serve.
-        .module(
-            Waitlist::new()
-                .products(["supportgenius"])
-                .status_redirect("https://supportgeni.us/"),
-        )
-        // Templates register on the harness builder — `Waitlist` itself
-        // has no `.templates` method.
-        .templates(cratefield_module_waitlist::default_templates())
-        // The clone is what `Harness::build` validates `requires()`
-        // against; the original below is what `serve` resolves ports
-        // from. Same instance, so the two cannot disagree.
-        .runtime(runtime.clone())
-        .build()?;
+    // here — or in the composition crate this function now shares with
+    // the static binary — with `.env(VentureEnv::Production)`:
+    // `HarnessBuilder::build` takes no config, so it cannot see the
+    // operator's recorded acceptance, and a hardcoded production env
+    // would make the composition refuse to build at all — a panic at
+    // boot instead of a serving Worker that says loudly what it is
+    // missing.
+    let harness = supportgenius_composition::modules(
+        Harness::builder().venture(supportgenius_composition::venture()),
+    )
+    // The clone is what `Harness::build` validates `requires()`
+    // against; the original below is what `serve` resolves ports
+    // from. Same instance, so the two cannot disagree.
+    .runtime(runtime.clone())
+    .build()?;
 
     Ok((harness, runtime))
 }

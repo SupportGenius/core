@@ -1,5 +1,10 @@
 [toolchain]
 channel = "1.98.1"
 components = ["rustfmt", "clippy"]
-targets = ["wasm32-unknown-unknown"]
+targets = [
+    "wasm32-unknown-unknown",
+    # The static self-hosted binary (`bin/supportgenius`): musl links
+    # rusqlite(bundled) and rustls into one dependency-free executable.
+    "x86_64-unknown-linux-musl",
+]
 profile = "minimal"
