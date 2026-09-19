@@ -124,3 +124,98 @@ jobs:
     uses: Cratefield/harness/.github/workflows/conformance.yml@18a51769b2dbb65dc2be6282014a6aca2bdc326e
     with:
       module-glob: "crates/module-*"
+
+  native:
+    # The site-promise binary: built fully static against musl, then smoked
+    # end-to-end (boot, health endpoints, waitlist join) by scripts/smoke.sh.
+    # Both musl variants are smoked: the plain build — the artifact that
+    # ships — must answer the documented 503 mail-not-configured on join,
+    # the dev-fakes build the 202 success path, and the postgres feature
+    # combo keeps compiling beside them.
+    name: native-binary (musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the static musl binary
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl -p supportgenius-bin
+      - name: Assert the binary is fully static
+        run: |
+          ldd target/x86_64-unknown-linux-musl/release/supportgenius 2>&1 \
+            | grep -q 'statically linked\|not a dynamic executable'
+      # The plain build IS the shipped artifact, so it is uploaded before
+      # the dev-fakes build below overwrites the shared output path — the
+      # artifact must never contain the fakes.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: supportgenius-x86_64-unknown-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/supportgenius
+      # Both musl builds write to the same output path, so each binary is
+      # copied aside under its own name before the next build overwrites
+      # it. Both are then smoked (the script branches on the Captcha port
+      # each reports): the dev-fakes run exercises the successful public
+      # write path the issue wants covered, the plain run the documented
+      # refusal the shipped artifact must keep answering.
+      - name: Copy the plain binary aside
+        run: cp target/x86_64-unknown-linux-musl/release/supportgenius "$RUNNER_TEMP/supportgenius-plain"
+      - name: Build the dev-fakes musl binary
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl -p supportgenius-bin --features dev-fakes
+      - name: Copy the dev-fakes binary aside
+        run: cp target/x86_64-unknown-linux-musl/release/supportgenius "$RUNNER_TEMP/supportgenius-dev-fakes"
+      - name: Smoke both binaries end-to-end
+        run: |
+          scripts/smoke.sh "$RUNNER_TEMP/supportgenius-plain"
+          scripts/smoke.sh "$RUNNER_TEMP/supportgenius-dev-fakes"
+      - name: Feature combos must keep compiling
+        # Compile-only, against the musl target the shipped binary uses:
+        # the postgres combos pull in sqlx/rustls linkage that can break
+        # under musl while the host GNU build stays green, which is the
+        # failure mode this check exists to catch. The plain and
+        # dev-fakes builds were already compiled (and smoked) in release
+        # above, so these are the two combos left uncovered.
+        run: |
+          cargo build --locked -p supportgenius-bin --features postgres --target x86_64-unknown-linux-musl
+          cargo build --locked -p supportgenius-bin --features postgres,dev-fakes --target x86_64-unknown-linux-musl
+
+  docker:
+    # The container build, exercised the way an operator runs it: built from
+    # the repository root, booted with only a HARNESS_SECRET, and probed with
+    # the same endpoint the distroless HEALTHCHECK uses — the binary's own
+    # --check-ready, since distroless has no curl.
+    name: docker-image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t supportgenius:ci -f bin/supportgenius/Dockerfile .
+      - name: Run it and wait for health
+        run: |
+          docker run -d --name supportgenius-ci -p 8080:8080 \
+            -e HARNESS_SECRET="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" \
+            supportgenius:ci
+          for _ in $(seq 1 60); do
+            if curl -fsS -o /dev/null http://127.0.0.1:8080/__ready; then
+              echo "container ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::container never became ready"
+          docker logs supportgenius-ci || true
+          exit 1
+      - name: /__ready must answer 200
+        run: |
+          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/__ready)"
+          if [ "$code" != "200" ]; then
+            echo "::error::/__ready returned $code"
+            exit 1
+          fi
+      - name: Stop the container
+        if: always()
+        run: docker rm -f supportgenius-ci || true
