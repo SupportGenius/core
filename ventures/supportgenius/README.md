@@ -51,6 +51,24 @@ products. Flip `data-open="true"` on the form only after the secrets are
 set (step 3): without the Resend key the API intentionally fails joins
 rather than silently dropping the confirmation mail.
 
+## Model tiers and judging (not wired yet)
+
+The planned escalation flow drafts with one model and judges with a
+second, selected by tier — `fast` and `strong`, the two tiers the
+harness's `RoutingTextModel` defines. `fast` drafts; `strong` judges.
+Neither tier is wired today, to any vendor: the `TextModel` and
+`Tracker` ports live only on the harness's main branch (no published
+`cratefield-core` release carries them, 0.5.0 included), and no
+`TextModel` adapter for any vendor — Anthropic's included — is
+published at all.
+
+The plan is to point both tiers at Anthropic once the wiring exists.
+One vendor on both tiers is not an independent judge: the judge would be
+reviewing the work of the same vendor's model that drafted it. Until a
+second `TextModel` adapter exists to take one of the tiers, the
+independent-judge property is unmet, and this caveat stays in this
+README.
+
 ## Adding a module later
 
 When a later issue composes another module into `src/lib.rs`, refresh this
