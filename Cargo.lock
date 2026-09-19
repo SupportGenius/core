@@ -1817,6 +1817,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "module-escalation"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "cratefield-adapter-sqlite",
+ "cratefield-core",
+ "cratefield-testing",
+ "module-escalation",
+ "pollster",
+ "sea-query",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "zeroize",
+]
+
+[[package]]
 name = "module-support"
 version = "0.1.0"
 dependencies = [
