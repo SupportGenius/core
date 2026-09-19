@@ -1,0 +1,50 @@
+[package]
+name = "supportgenius"
+description = "SupportGenius's waitlist Worker: the Factory Zero harness with the waitlist module, on Workers + D1"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# `cdylib` is what `worker-build` links into the Worker; `rlib` is so the
+# integration tests in `tests/` can link this crate on the host.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[features]
+# The venture-linked `fz` bin stays OUT of the wasm dependency graph:
+# `cratefield-cli` pulls native-only crates (clap, rusqlite) that must
+# never reach a wasm build. This is the venture-side equivalent of the
+# upstream workspace's `exclude` of the venture `fz` bins (ADR 0013).
+cli = ["dep:cratefield-cli"]
+
+[[bin]]
+name = "fz"
+path = "src/fz_main.rs"
+required-features = ["cli"]
+doc = false
+
+[dependencies]
+cratefield-core = { workspace = true }
+cratefield-runtime-cloudflare = { workspace = true }
+cratefield-module-waitlist = { workspace = true }
+cratefield-adapter-resend = { workspace = true }
+cratefield-adapter-turnstile = { workspace = true }
+cratefield-cli = { workspace = true, optional = true }
+worker = { workspace = true }
+async-trait = { workspace = true }
+
+# getrandom's wasm_js backend is opt-in per leaf crate on
+# wasm32-unknown-unknown; only the wasm build of this crate needs it.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true }
+
+[dev-dependencies]
+cratefield-testing = { workspace = true }
+http = { workspace = true }
+pollster = { workspace = true }

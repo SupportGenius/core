@@ -1,0 +1,4 @@
+# `doc_markdown` (pedantic) wants CamelCase words in doc comments backticked
+# unless they are known identifiers; our venture and product name is one such
+# word. `".."` keeps clippy's built-in list alongside ours.
+doc-valid-idents = ["SupportGenius", "SupportGenius's", ".."]
