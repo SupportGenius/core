@@ -22,7 +22,6 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use crate::ports::text_model::{Completion, ModelTier, Prompt, TextModel, TextModelError};
 use crate::ports::tracker::{
     Destination, Filed, TicketDraft, TicketState, TicketStatus, Tracker, TrackerError,
 };
@@ -115,84 +114,12 @@ impl cratefield_core::Clock for SettableClock {
 // ---------------------------------------------------------------------------
 // FakeTextModel
 
-/// An in-memory [`TextModel`] that answers from a scripted queue: each
-/// [`TextModel::complete`] pops the next response, and records the
-/// [`Prompt`] it received so a test can assert the tier, the system prompt
-/// and the JSON Schema a stage actually asked for.
-///
-/// Responses are plain `Result`s so every error arm is reachable from a
-/// test — a `Transient` with its `retry_after`, a `Rejected` with exactly
-/// the provider text the caller must survive, not just a generic failure
-/// (the reason `cratefield_testing`'s `MailerMode::Error` exists).
-///
-/// When the script runs dry the fake answers
-/// [`TextModelError::Transport`] with a fixed marker string, the way
-/// `cratefield_testing::FakeHttpClient` fails loudly on an exhausted
-/// script: a test that walks off the end of its own script is a bug in the
-/// test, not a `NotConfigured` the pipeline should degrade on.
-#[derive(Clone)]
-pub struct FakeTextModel {
-    inner: Arc<FakeTextModelInner>,
-}
-
-struct FakeTextModelInner {
-    scripted: Mutex<VecDeque<Result<Completion, TextModelError>>>,
-    prompts: Mutex<Vec<Prompt>>,
-}
-
-impl FakeTextModel {
-    /// Answers with `responses` in order, then with the exhausted-script
-    /// transport error.
-    #[must_use]
-    pub fn scripted(responses: Vec<Result<Completion, TextModelError>>) -> Self {
-        Self {
-            inner: Arc::new(FakeTextModelInner {
-                scripted: Mutex::new(responses.into_iter().collect()),
-                prompts: Mutex::new(Vec::new()),
-            }),
-        }
-    }
-
-    /// Answers once with a structured completion: the parsed `json` in
-    /// [`Completion::json`], the same value serialised as the text, and
-    /// the model named `"fake-<tier>"`. Everything after that is the
-    /// exhausted-script error. The one-response case is the common one — a
-    /// stage asks for a draft, or a judgement, and that is the whole test.
-    #[must_use]
-    pub fn json(tier: ModelTier, json: serde_json::Value) -> Self {
-        let completion =
-            Completion::new(json.to_string(), format!("fake-{}", tier.name())).json(json);
-        Self::scripted(vec![Ok(completion)])
-    }
-
-    /// Every prompt recorded so far, in completion order.
-    #[must_use]
-    pub fn prompts(&self) -> Vec<Prompt> {
-        self.inner.prompts.lock().expect("text model lock").clone()
-    }
-}
-
-#[async_trait::async_trait]
-impl TextModel for FakeTextModel {
-    async fn complete(&self, prompt: &Prompt) -> Result<Completion, TextModelError> {
-        self.inner
-            .prompts
-            .lock()
-            .expect("text model lock")
-            .push(prompt.clone());
-        let next = self
-            .inner
-            .scripted
-            .lock()
-            .expect("text model lock")
-            .pop_front();
-        next.unwrap_or_else(|| {
-            Err(TextModelError::Transport(
-                "fake text model script exhausted".to_owned(),
-            ))
-        })
-    }
-}
+/// The [`TextModel`](crate::ports::text_model::TextModel) double now lives
+/// beside the port in the shared `text-model` crate (behind its own
+/// `testing` feature, which this crate's `testing` feature turns on); it is
+/// re-exported here so existing `module_escalation::testing::FakeTextModel`
+/// paths keep working.
+pub use text_model::testing::FakeTextModel;
 
 // ---------------------------------------------------------------------------
 // FakeTracker

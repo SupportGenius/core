@@ -63,7 +63,9 @@ tracing = "0.1.44"
 bytes = "1.12"
 # The escalation module (issue #4) mirrors the harness `TextModel`/`Tracker`
 # ports locally until core publishes them (see
-# crates/module-escalation/src/ports/mod.rs); those ports need these four.
+# crates/module-escalation/src/ports/mod.rs; `TextModel` lives in the shared
+# crates/text-model so module-support can use it too); those ports need
+# these four.
 # All four already sit in the dependency graph through cratefield-core, so
 # this pins what is there rather than adding anything new.
 serde = { version = "1.0.229", features = ["derive"] }

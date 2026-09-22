@@ -21,13 +21,29 @@
 //! (ADR 0004, linted by `fz doctor`), Cloudflare D1 has no vector type,
 //! and a Worker isolate has roughly 128 MB of memory. So: an inverted
 //! table, an in-process ranker, and no magic.
+//!
+//! **Answers are grounded or they are not answers.** `POST /messages`
+//! retrieves the top chunks for the user's message, asks the
+//! [`TextModel`] (fast tier) for `{answer, citations, confidence}`, and
+//! a pure decision turns that into `answered`, `clarify` or
+//! `handoff`: a citation naming any chunk not retrieved for *this* request
+//! can never be `answered`, and neither can a confidence below the
+//! tenant's threshold ([`DEFAULT_ANSWER_THRESHOLD`] unless the tenant set
+//! one).
 
+mod answer;
 pub mod bm25;
 pub mod chunk;
 mod handlers;
+mod messages;
 mod store;
 
+pub use answer::DEFAULT_ANSWER_THRESHOLD;
 pub use chunk::tokenize;
+
+use std::sync::Arc;
+
+use text_model::TextModel;
 
 use cratefield_core::{
     Config, ConfigError, DataKind, Disposition, Migrations, Module, ModuleConfig, ModuleContext,
@@ -36,29 +52,61 @@ use cratefield_core::{
 
 pub(crate) const MODULE_NAME: &str = "support";
 
-/// The schema, in one migration: five tables of portable SQL (ADR 0004),
-/// every one of them carrying `tenant_id`.
+/// The v0 schema: five tables of portable SQL (ADR 0004), every one of
+/// them carrying `tenant_id`.
 const MIGRATION_INIT: SqlMigration = SqlMigration::new(
     "0001",
     "init",
     include_str!("../migrations/sqlite/0001_init.sql"),
 );
 
+/// Conversations, their messages and the per-tenant answer threshold.
+const MIGRATION_CONVERSATIONS: SqlMigration = SqlMigration::new(
+    "0002",
+    "conversations",
+    include_str!("../migrations/sqlite/0002_conversations.sql"),
+);
+
 /// The support module: tenant provisioning behind the harness admin
-/// token, API-key-authenticated source ingest and BM25 search for
-/// everything else.
+/// token, API-key-authenticated source ingest, BM25 search and grounded
+/// answers for everything else.
 ///
-/// Deliberately knob-free. Everything tunable — the revoked-kid list,
-/// the admin token — is deployment configuration read through the
-/// `Config` port, so a builder setter here would be a second place the
-/// same setting lived.
-#[derive(Debug, Default)]
-pub struct Support;
+/// Knob-free apart from the model. Everything tunable — the revoked-kid
+/// list, the admin token — is deployment configuration read through the
+/// `Config` port, and the answer threshold is per-tenant data
+/// (`PUT /admin/tenants/{tenant_id}/settings`), so a builder setter for
+/// either would be a second place the same setting lived. The one setter,
+/// [`Support::text_model`], exists because the harness has no `TextModel`
+/// port yet: the model is an object, not a setting.
+#[derive(Default)]
+pub struct Support {
+    text_model: Option<Arc<dyn TextModel>>,
+}
+
+impl std::fmt::Debug for Support {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Support")
+            .field(
+                "text_model",
+                &self.text_model.as_ref().map(|_| "dyn TextModel"),
+            )
+            .finish()
+    }
+}
 
 impl Support {
-    /// A `Support` module with defaults.
+    /// A `Support` module with defaults and no text model: every route
+    /// works except `POST /messages`, which answers
+    /// `503 text-model-not-configured` until one is given.
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// The model `POST /messages` asks for answers.
+    #[must_use]
+    pub fn text_model(mut self, model: Arc<dyn TextModel>) -> Self {
+        self.text_model = Some(model);
+        self
     }
 }
 
@@ -76,7 +124,7 @@ impl Module for Support {
     }
 
     /// `HttpClient` for the `{"url"}` ingest form, `RateLimiter` for the
-    /// per-tenant budget on ingest and search. Both degrade honestly
+    /// per-tenant budget on ingest, search and messages. Both degrade honestly
     /// when absent: URL ingest answers `503 not-ready`, the limiter is
     /// skipped.
     fn optional(&self) -> &'static [Port] {
@@ -90,13 +138,16 @@ impl Module for Support {
             "sg_sources",
             "sg_chunks",
             "sg_postings",
+            "sg_conversations",
+            "sg_messages",
+            "sg_tenant_settings",
         ]
     }
 
     /// Every write here is authenticated — admin token for
-    /// `POST /admin/tenants`, a tenant API key for `/sources` and
-    /// `/search` — so the harness's guarded-write boot gate has nothing
-    /// to hold back.
+    /// `POST /admin/tenants` and its settings route, a tenant API key for
+    /// `/sources`, `/search` and `/messages` — so the harness's
+    /// guarded-write boot gate has nothing to hold back.
     fn public_writes(&self) -> bool {
         false
     }
@@ -124,6 +175,12 @@ impl Module for Support {
     /// version ships no source-deletion route, so content leaves only
     /// with account closure — the only subject this data has is the
     /// tenant itself.
+    ///
+    /// **`sg_messages` is `unreachable` for the same reason.** The end
+    /// users who write in are anonymous to this module — no email, no
+    /// account id — so their words are content without a subject column.
+    /// `sg_conversations` and `sg_tenant_settings` hold flags, a
+    /// threshold and timestamps, and are `none`.
     fn personal_data(&self) -> &'static [PersonalDataSet] {
         const SETS: &[PersonalDataSet] = &[
             PersonalDataSet {
@@ -173,12 +230,32 @@ impl Module for Support {
                  workspace's account is closed; no person is identifiable from a word-count \
                  row. This version ships no source-deletion route.",
             ),
+            PersonalDataSet::none(
+                "sg_conversations",
+                "One row per support conversation: its status, whether it needs a person, \
+                 and timestamps. What was said lives in sg_messages; nothing here names \
+                 anyone.",
+            ),
+            PersonalDataSet::unreachable(
+                "sg_messages",
+                DataKind::Content,
+                "The messages of each support conversation: what the end user wrote, what \
+                 they were shown and what the model answered. The text may mention people.",
+                "The workspace's end users are anonymous to this module: a message carries \
+                 no email, account or other column that identifies its author, so no \
+                 erasure predicate can match a person into it. Messages leave when the \
+                 workspace's account is closed.",
+            ),
+            PersonalDataSet::none(
+                "sg_tenant_settings",
+                "The workspace's answer threshold and when it was last set.",
+            ),
         ];
         SETS
     }
 
     fn migrations(&self) -> Migrations {
-        const MIGRATIONS: [SqlMigration; 1] = [MIGRATION_INIT];
+        const MIGRATIONS: [SqlMigration; 2] = [MIGRATION_INIT, MIGRATION_CONVERSATIONS];
         // Refuses a gap, a duplicate or an out-of-order id at compile
         // time.
         const _: () = assert_migration_set(&MIGRATIONS);
@@ -230,6 +307,6 @@ impl Module for Support {
     }
 
     fn router(&self, ctx: ModuleContext) -> axum::Router {
-        handlers::router(std::sync::Arc::new(ctx))
+        handlers::router(Arc::new(ctx), self.text_model.clone())
     }
 }

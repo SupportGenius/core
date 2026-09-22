@@ -3,6 +3,10 @@
     "file": "0007_support_0001_init.sql",
     "sha256": "c55b0fb12a7dcdc620659f2dc77989771cfd4df761c41b9afc3a1baf60c3f3cc"
   },
+  "support/0002": {
+    "file": "0008_support_0002_conversations.sql",
+    "sha256": "d6e8cfb2ffdcab08eb38bcdfa64e5274de4e903b5760501f8282e9abf9a1389c"
+  },
   "waitlist/0001": {
     "file": "0001_waitlist_0001_init.sql",
     "sha256": "504c3e013f921975e286b27f6253ac5f2b9f884bf2b89f6d077c4931760c54ea"

@@ -7,7 +7,7 @@
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -19,8 +19,11 @@ use cratefield_core::{
     RateLimit, RateLimitFailure, Scope, Signer, check_rate_limit, rate_limited, require_admin,
 };
 
+use text_model::TextModel;
+
 use crate::bm25;
 use crate::chunk::{Chunker, tokenize};
+use crate::messages;
 use crate::store::{self, ApiKeyRow, ChunkRow, STATUS_ACTIVE, SourceRow, TenantRow};
 
 /// The inline `text` ceiling for `POST /sources`. Not arbitrary: `/v1/*`
@@ -55,21 +58,36 @@ const UNAUTHORIZED: ProblemDef = ProblemDef {
 
 pub(crate) struct ModuleState {
     pub ctx: Arc<ModuleContext>,
+    /// The model `POST /messages` asks. `None` is a deployment that was
+    /// not given one: the route answers `503 text-model-not-configured`
+    /// rather than pretending to answer.
+    pub text_model: Option<Arc<dyn TextModel>>,
 }
 
-pub(crate) fn router(ctx: Arc<ModuleContext>) -> axum::Router {
-    let state = Arc::new(ModuleState { ctx });
+pub(crate) fn router(
+    ctx: Arc<ModuleContext>,
+    text_model: Option<Arc<dyn TextModel>>,
+) -> axum::Router {
+    let state = Arc::new(ModuleState { ctx, text_model });
     axum::Router::new()
         .route("/admin/tenants", post(create_tenant))
+        .route(
+            "/admin/tenants/{tenant_id}/settings",
+            put(messages::put_settings),
+        )
         .route("/sources", post(ingest_source))
         .route("/search", get(search))
+        .route("/messages", post(messages::post_message))
         .with_state(state)
 }
 
 /// A required port, absent. `requires()` names every port used here, so
 /// this is a harness bug, not a request problem — but a `panic!` in a
 /// Worker isolate costs more than a 500, so it is answered instead.
-fn required_port<'a, T: ?Sized>(port: Option<&'a T>, name: &'a str) -> Result<&'a T, Problem> {
+pub(crate) fn required_port<'a, T: ?Sized>(
+    port: Option<&'a T>,
+    name: &'a str,
+) -> Result<&'a T, Problem> {
     port.ok_or_else(|| Problem::internal().with_detail(format!("required port {name} is missing")))
 }
 
@@ -78,7 +96,10 @@ fn required_port<'a, T: ?Sized>(port: Option<&'a T>, name: &'a str) -> Result<&'
 /// from module config (`SUPPORT_REVOKED_KIDS`, parsed by
 /// [`tenancy::parse_revoked_kids`]); the tenant row must exist and be
 /// active. All failure paths collapse into [`UNAUTHORIZED`].
-async fn authenticate(ctx: &ModuleContext, headers: &HeaderMap) -> Result<String, Problem> {
+pub(crate) async fn authenticate(
+    ctx: &ModuleContext,
+    headers: &HeaderMap,
+) -> Result<String, Problem> {
     let unauthorized = || Problem::new(&UNAUTHORIZED);
     let Some(signer) = ctx.ports.signer.as_deref() else {
         return Err(unauthorized());
@@ -116,11 +137,12 @@ async fn authenticate(ctx: &ModuleContext, headers: &HeaderMap) -> Result<String
 /// by tenant id rather than IP: these routes are authenticated, so the
 /// budget that matters is the tenant's, and an IP bucket would let one
 /// office full of colleagues exhaust each other. The limiter is the only
-/// backstop on `/search` (a full corpus fetch and rank per request), so a
+/// backstop on `/search` and `/messages` (a full corpus fetch and rank per
+/// request, and on `/messages` a paid model call), so a
 /// transport failure here fails closed.
 ///
 /// `Some` is the 429 response the handler returns verbatim.
-async fn guard_rate_limit(ctx: &ModuleContext, tenant_id: &str) -> Option<Response> {
+pub(crate) async fn guard_rate_limit(ctx: &ModuleContext, tenant_id: &str) -> Option<Response> {
     let keys = [format!("support:{tenant_id}")];
     if let RateLimit::Denied { retry_after } = check_rate_limit(
         ctx.ports.rate_limiter.as_ref(),
@@ -428,41 +450,79 @@ async fn search(
     }
     let db: &dyn Database = required_port(ctx.ports.db.as_deref(), "Db")?;
 
-    let terms = tokenize(query.q.as_deref().unwrap_or(""));
-    if terms.is_empty() {
-        return Ok(Json(json!({ "results": [] })).into_response());
-    }
-
-    let corpus = store::corpus_stats(db, &tenant_id).await?;
-    let postings = store::postings_for(db, &tenant_id, &terms).await?;
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    let ranked = bm25::rank(&terms, &postings, &corpus, &bm25::Params::default());
-
-    let top: Vec<String> = ranked
+    let hits = retrieve(
+        db,
+        &tenant_id,
+        query.q.as_deref().unwrap_or(""),
+        limit as usize,
+    )
+    .await?;
+    let results: Vec<Value> = hits
         .iter()
-        .take(limit as usize)
-        .map(|scored| scored.chunk_id.clone())
-        .collect();
-    let chunks = store::chunks_by_id(db, &tenant_id, &top).await?;
-    let by_id: HashMap<&str, &ChunkRow> = chunks
-        .iter()
-        .map(|chunk| (chunk.id.as_str(), chunk))
-        .collect();
-
-    let results: Vec<Value> = ranked
-        .iter()
-        .take(limit as usize)
-        .filter_map(|scored| {
-            let chunk = by_id.get(scored.chunk_id.as_str())?;
-            Some(json!({
-                "chunk_id": chunk.id,
-                "source_id": chunk.source_id,
-                "title": chunk.title,
-                "score": scored.score,
-                "text": chunk.body,
-            }))
+        .map(|hit| {
+            json!({
+                "chunk_id": hit.chunk.id,
+                "source_id": hit.chunk.source_id,
+                "title": hit.chunk.title,
+                "score": hit.score,
+                "text": hit.chunk.body,
+            })
         })
         .collect();
 
     Ok(Json(json!({ "results": results })).into_response())
+}
+
+/// One ranked hit from [`retrieve`]: the chunk and its BM25 score.
+pub(crate) struct Retrieved {
+    pub chunk: ChunkRow,
+    pub score: f64,
+}
+
+/// BM25 retrieval over one tenant's index: the top `k` chunks for `query`,
+/// best first. The one retrieval path — `GET /search` shows its result,
+/// `POST /messages` grounds the model in it — so what a tenant finds by
+/// searching is exactly what an answer can cite.
+///
+/// A query that tokenises to nothing retrieves nothing, without touching
+/// the database. A ranked id whose chunk row is gone (it cannot be today:
+/// chunks and postings are written in one batch and never deleted) is
+/// skipped rather than failing the request.
+pub(crate) async fn retrieve(
+    db: &dyn Database,
+    tenant_id: &str,
+    query: &str,
+    k: usize,
+) -> Result<Vec<Retrieved>, cratefield_core::DbError> {
+    let terms = tokenize(query);
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let corpus = store::corpus_stats(db, tenant_id).await?;
+    let postings = store::postings_for(db, tenant_id, &terms).await?;
+    let mut ranked = bm25::rank(&terms, &postings, &corpus, &bm25::Params::default());
+    ranked.truncate(k);
+
+    let top: Vec<String> = ranked
+        .iter()
+        .map(|scored| scored.chunk_id.clone())
+        .collect();
+    let mut by_id: HashMap<String, ChunkRow> = store::chunks_by_id(db, tenant_id, &top)
+        .await?
+        .into_iter()
+        .map(|chunk| (chunk.id.clone(), chunk))
+        .collect();
+
+    Ok(ranked
+        .into_iter()
+        .filter_map(|scored| {
+            let chunk = by_id.remove(&scored.chunk_id)?;
+            Some(Retrieved {
+                chunk,
+                score: scored.score,
+            })
+        })
+        .collect())
 }
