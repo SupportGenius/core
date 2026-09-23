@@ -22,7 +22,23 @@
 //! adapter verifies the widget token the site form posts; when it is
 //! absent no `Captcha` port is mounted at all. Both secrets are read from
 //! the Worker `Env` binding at init — never `std::env`, which is empty on
-//! Workers.
+//! Workers. Absence is not "off in production": `ENV = "production"`
+//! (wrangler.toml `[vars]`) makes the harness production-readiness gate
+//! answer `503 not-production-ready` to every `/v1/*` request until the
+//! Captcha port is effectively configured (`cratefield-core`
+//! `production_readiness`), and the waitlist join itself fails closed on a
+//! missing port in production (`verify_human_form`). So Turnstile is
+//! effectively required in production; in development/staging joins skip
+//! human verification, which is why the join must not stand on captcha
+//! alone (see **Rate limit**).
+//!
+//! **Rate limit.** A `RateLimiter` is mounted **unconditionally** (issue
+//! #16 / #17): the public `POST /v1/waitlist` mail send and the
+//! authenticated `/v1/support/{search,sources}` full-corpus fetch must
+//! have a volume ceiling that does not depend on any optional secret. It
+//! is backed by the Workers Rate Limiting binding `RATE_LIMITER` declared
+//! in wrangler.toml; the waitlist path keys on IP and normalized email and
+//! the support path on tenant id, all through the one shared port.
 //!
 //! **One runtime, twice used.** The `Cloudflare` runtime is built exactly
 //! once per composition and then handed to both `Harness::builder` and
@@ -60,7 +76,17 @@ pub fn compose(
     mailer: Arc<dyn Mailer>,
     captcha: Option<Turnstile>,
 ) -> Result<(Harness, Cloudflare), ConfigError> {
-    let mut runtime = Cloudflare::new().db("DB").mailer_arc(mailer);
+    // The `RateLimiter` is mounted unconditionally (issue #16 / #17): the
+    // public mail path and the support search/sources routes must have a
+    // volume ceiling regardless of which optional secrets an operator set.
+    // Backed by the `RATE_LIMITER` Workers Rate Limiting binding in
+    // wrangler.toml; if that binding is missing from a deployment the
+    // runtime logs once and leaves the port unmounted (fail-open), so the
+    // binding is part of the deploy, not an option.
+    let mut runtime = Cloudflare::new()
+        .db("DB")
+        .mailer_arc(mailer)
+        .rate_limiter("RATE_LIMITER");
     if let Some(captcha) = captcha {
         runtime = runtime.captcha(captcha);
     }

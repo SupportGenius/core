@@ -28,11 +28,31 @@ ENV = "production"
 #                    design; there is no no-op mailer here).
 #   TURNSTILE_SECRET required for production traffic. The Turnstile widget
 #                    secret paired with the sitekey on the site's form.
-#                    Without it no Captcha port is mounted and joins skip
-#                    human verification.
+#                    Without it no Captcha port is mounted; because ENV is
+#                    `production` below, the harness production-readiness
+#                    gate then answers 503 to every `/v1/*` request (and the
+#                    join fails closed) until it is set — so it is
+#                    effectively required in production, not silently
+#                    optional. In a non-production ENV joins skip human
+#                    verification.
 #   ADMIN_TOKEN      optional. Gates `GET /v1/waitlist/admin/export.csv`
 #                    (Bearer auth, constant-time compared). Without it the
 #                    export answers 401.
+
+# The Workers Rate Limiting binding backing the harness `RateLimiter`
+# port, mounted unconditionally in src/lib.rs so the public
+# `POST /v1/waitlist` mail send (issue #16) and the authenticated
+# `/v1/support/{search,sources}` full-corpus fetch (issue #17) always have
+# a volume ceiling — there is no optional secret to forget. `namespace_id`
+# is any integer unique among this account's rate-limit namespaces;
+# `period` must be 10 or 60 (seconds); `limit` is requests per period per
+# key (the waitlist path keys on IP and email, support on tenant id). Tune
+# `limit`/`period` to taste — this is a safety ceiling, not a quota.
+[[unsafe.bindings]]
+name = "RATE_LIMITER"
+type = "ratelimit"
+namespace_id = "1001"
+simple = { limit = 60, period = 60 }
 
 [[d1_databases]]
 binding = "DB"

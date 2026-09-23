@@ -36,7 +36,7 @@ scripts/smoke.sh target/x86_64-unknown-linux-musl/release/supportgenius
 | `HARNESS_SECRET` | **required** | Secret for the `Signer` port. Without it the harness cannot wire the port and the process exits at boot. |
 | `LISTEN_ADDR` | `127.0.0.1:8080` | Socket to serve on; containers want `0.0.0.0:8080`. `--check-ready` probes this address. |
 | `DATABASE_URL` | unset → SQLite at `./supportgenius.db` | `sqlite://<path>` or `sqlite::memory:` opens SQLite; `postgres://`/`postgresql://` opens Postgres **only in a `postgres`-feature build** (a clear error names the rebuild otherwise). The chosen path is logged at boot. |
-| `REDIS_URL` | unset | When set, Redis backs the `RateLimiter` and `KeyValue` ports. **Unset, rate limiting fails open by design**: the ports stay unmounted, core resolves no limiter to "allowed", and the degradation is logged exactly once at boot (`REDIS_URL unset: RateLimiter and KeyValue ports not configured`) — never per request. |
+| `REDIS_URL` | unset | When set, Redis backs the `RateLimiter` and `KeyValue` ports. **Unset in dev/staging, rate limiting fails open by design**: the ports stay unmounted, core resolves no limiter to "allowed", and the degradation is logged exactly once at boot — never per request. **Unset with `ENV=production` the binary refuses to boot** (issues #16/#17): the public mail path and support search/sources routes must not run without a volume ceiling. |
 | `RESEND_API_KEY` | unset | Production mailer (Resend). Unset, Resend answers `NotConfigured` and sends nothing — reported, never faked. |
 | `MAIL_FROM` | compiled venture default | From address for outgoing mail. |
 | `MAIL_REPLY_TO` | unset | Reply-To for outgoing mail. |
@@ -71,9 +71,12 @@ container exits at boot.
 
 ## Redis, restated for operators
 
-Without `REDIS_URL` there are no `RateLimiter`/`KeyValue` ports, and rate
-limiting fails open — the service stays up and simply does not throttle.
-Every module call site picks `RateLimitFailure::FailOpen` (enforced by a
-composition-crate test over `requires()`), so this is the documented
-self-hosted contract, not an accident; the boot log says so exactly once.
+Without `REDIS_URL` there are no `RateLimiter`/`KeyValue` ports, and in
+dev/staging rate limiting fails open — the service stays up and simply
+does not throttle. Every module call site picks `RateLimitFailure::FailOpen`
+(enforced by a composition-crate test over `requires()`), so this is the
+documented self-hosted contract, not an accident; the boot log says so
+exactly once. **In production it is not a contract but a gap**, so
+`ENV=production` with no `REDIS_URL` refuses to boot (issues #16/#17)
+rather than serving the public mail and support endpoints uncapped.
 Set `REDIS_URL` to get real rate limiting (and key-value storage) back.
