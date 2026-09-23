@@ -1,6 +1,13 @@
 //! A temporary **local mirror** of two harness ports: [`text_model`]
 //! (`TextModel`) and [`tracker`] (`Tracker`).
 //!
+//! `text_model` now lives in the shared, non-module `text-model` crate
+//! (`crates/text-model`), because the support module answers through the
+//! same port and modules must not depend on each other. It is re-exported
+//! here unchanged, so `crate::ports::text_model::*` and
+//! `module_escalation::ports::text_model::*` keep resolving; the rules
+//! below still describe it.
+//!
 //! Both exist on harness `main`
 //! (`crates/core/src/ports/text_model.rs`, `crates/core/src/ports/tracker.rs`)
 //! but are **absent from published `cratefield-core 0.4.3`** — they are the
@@ -30,5 +37,5 @@
 //! - Harness's own `#[cfg(test)]` router tests are dropped with the routers;
 //!   the remaining unit tests travel with the types they pin.
 
-pub mod text_model;
+pub use ::text_model;
 pub mod tracker;

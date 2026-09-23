@@ -1830,6 +1830,7 @@ dependencies = [
  "sea-query",
  "serde",
  "serde_json",
+ "text-model",
  "thiserror",
  "time",
  "zeroize",
@@ -1851,6 +1852,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tenancy",
+ "text-model",
  "time",
  "tower",
 ]
@@ -3030,6 +3032,16 @@ name = "tenancy"
 version = "0.1.0"
 dependencies = [
  "cratefield-core",
+]
+
+[[package]]
+name = "text-model"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cratefield-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -15,9 +15,12 @@ workspace = true
 # The fake `TextModel`/`Tracker` doubles (src/testing.rs) are off by
 # default so the Worker build never carries them; integration tests turn
 # the feature on through the self dev-dependency below.
-testing = []
+testing = ["text-model/testing"]
 
 [dependencies]
+# The shared `TextModel` port mirror (re-exported as `ports::text_model`)
+# and, under `testing`, its `FakeTextModel`.
+text-model = { path = "../text-model" }
 # The ports, the store (`Database`/`Statement`/`Outbox`/`Clock`/`IdGen`),
 # and `scrub_text` for the mirrored error `Display`s.
 cratefield-core = { workspace = true }

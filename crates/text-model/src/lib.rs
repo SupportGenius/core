@@ -19,8 +19,17 @@
 //! variant the caller can match, so a module that cannot degrade without
 //! its model fails loudly instead of silently producing nothing.
 //!
-//! Mirrored verbatim from harness `main`; see [`crate::ports`] for the
-//! mirroring rules.
+//! Mirrored verbatim from harness `main`. The mirroring rules (what was
+//! copied, what was dropped, and how the swap to `cratefield_core` goes
+//! when core publishes the port) are in `module-escalation`'s
+//! `src/ports/mod.rs`. This is a shared, non-module crate so that every
+//! module can name the port without depending on another module — the
+//! support module answers through it, the escalation module drafts and
+//! judges through it. `testing::FakeTextModel` sits behind the `testing`
+//! feature so the Worker build never carries it.
+
+#[cfg(feature = "testing")]
+pub mod testing;
 
 use std::time::Duration;
 

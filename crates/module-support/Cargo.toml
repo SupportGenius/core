@@ -13,6 +13,8 @@ sha2 = { workspace = true }
 http = { workspace = true }
 # Shared workspace crate: tenant API keys over the Signer port.
 tenancy = { path = "../tenancy" }
+# Shared workspace crate: the TextModel port `POST /messages` asks.
+text-model = { path = "../text-model" }
 # sea-query stays on 0.32 with the same feature set the published waitlist
 # module uses, so one backend feature union serves the whole graph and
 # `Statement` values round-trip through core unchanged.
@@ -43,6 +45,8 @@ pollster = { workspace = true }
 # `ServiceExt::oneshot` drives the router without a network; pinned to
 # the same line cratefield-testing builds against so one tower compiles.
 tower = { version = "0.5.3", features = ["util"] }
+# `FakeTextModel` for the `/messages` route tests.
+text-model = { path = "../text-model", features = ["testing"] }
 
 [lints]
 workspace = true

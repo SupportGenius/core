@@ -9,7 +9,7 @@
 //! is reachable without a tenant id, and nothing here ignores one.
 
 use cratefield_core::{Database, DbError, Statement};
-use sea_query::{Alias, Expr, Func, Query};
+use sea_query::{Alias, Expr, Func, OnConflict, Query};
 use time::format_description::well_known::Rfc3339;
 
 use crate::bm25::{Corpus, Posting};
@@ -48,7 +48,7 @@ pub(crate) struct SourceRow {
 }
 
 /// What `chunks_by_id` returns for one ranked hit: enough to quote the
-/// chunk back with its source.
+/// chunk back with its source, or to show it to the model.
 pub(crate) struct ChunkRow {
     pub id: String,
     pub source_id: String,
@@ -334,6 +334,256 @@ pub(crate) async fn chunks_by_id(
             })
         })
         .collect())
+}
+
+/// A conversation as loaded for a turn. `status` is not loaded: in this
+/// schema `status = 'escalated'` iff `needs_escalation = 1`, so the flag
+/// alone carries everything the turn needs.
+pub(crate) struct ConversationRow {
+    pub id: String,
+    pub needs_escalation: bool,
+}
+
+/// The conversation `conversation_id`, **scoped to the tenant**: a row
+/// from another tenant is no row at all, which is what makes an unknown
+/// and a foreign conversation the same `404`.
+pub(crate) async fn find_conversation(
+    db: &dyn Database,
+    tenant_id: &str,
+    conversation_id: &str,
+) -> Result<Option<ConversationRow>, DbError> {
+    let mut select = Query::select();
+    select
+        .columns(["id", "needs_escalation"])
+        .from(iden("sg_conversations"))
+        .and_where(Expr::col(iden("id")).eq(conversation_id))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id));
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows.rows.first().map(|row| ConversationRow {
+        id: row.get("id").unwrap_or_default(),
+        needs_escalation: row.get::<i64>("needs_escalation").unwrap_or(0) != 0,
+    }))
+}
+
+/// What a turn reads from the conversation's messages before the model
+/// is asked.
+pub(crate) struct ConversationCounts {
+    /// Every message so far — the next message's `seq`.
+    pub messages: i64,
+    /// Assistant messages that were clarifies — the budget
+    /// [`crate::answer::MAX_CLARIFY_TURNS`] is spent against.
+    pub clarifies: u32,
+}
+
+/// The conversation's message and clarify counts, scoped to the tenant.
+pub(crate) async fn conversation_counts(
+    db: &dyn Database,
+    tenant_id: &str,
+    conversation_id: &str,
+) -> Result<ConversationCounts, DbError> {
+    let count = |clarifies_only: bool| {
+        let mut select = Query::select();
+        select
+            .expr_as(Func::count(Expr::col(iden("id"))), Alias::new("n"))
+            .from(iden("sg_messages"))
+            .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+            .and_where(Expr::col(iden("conversation_id")).eq(conversation_id));
+        if clarifies_only {
+            select
+                .and_where(Expr::col(iden("role")).eq(ROLE_ASSISTANT))
+                .and_where(Expr::col(iden("outcome")).eq(crate::answer::OUTCOME_CLARIFY));
+        }
+        Statement::render(&select)
+    };
+    let first = |rows: &cratefield_core::Rows| {
+        rows.rows
+            .first()
+            .and_then(|row| row.get::<i64>("n"))
+            .unwrap_or(0)
+    };
+    let messages = first(&db.query(&count(false)).await?);
+    let clarifies = first(&db.query(&count(true)).await?);
+    Ok(ConversationCounts {
+        messages,
+        clarifies: u32::try_from(clarifies).unwrap_or(u32::MAX),
+    })
+}
+
+/// The tenant's stored answer threshold, in percent. `None` when the
+/// tenant has never set one and [`crate::DEFAULT_ANSWER_THRESHOLD`]
+/// applies.
+pub(crate) async fn tenant_threshold_pct(
+    db: &dyn Database,
+    tenant_id: &str,
+) -> Result<Option<i64>, DbError> {
+    let mut select = Query::select();
+    select
+        .column(iden("answer_threshold_pct"))
+        .from(iden("sg_tenant_settings"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id));
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows
+        .rows
+        .first()
+        .and_then(|row| row.get::<i64>("answer_threshold_pct")))
+}
+
+/// Upserts the tenant's answer threshold. `ON CONFLICT … DO UPDATE SET …
+/// = excluded.…` is the one upsert form SQLite and Postgres agree on.
+pub(crate) async fn upsert_tenant_threshold(
+    db: &dyn Database,
+    tenant_id: &str,
+    answer_threshold_pct: i64,
+    updated_at: &str,
+) -> Result<(), DbError> {
+    let mut insert = Query::insert();
+    insert
+        .into_table(iden("sg_tenant_settings"))
+        .columns(["tenant_id", "answer_threshold_pct", "updated_at"])
+        .values_panic([
+            tenant_id.into(),
+            answer_threshold_pct.into(),
+            updated_at.into(),
+        ])
+        .on_conflict(
+            OnConflict::column(iden("tenant_id"))
+                .update_columns([iden("answer_threshold_pct"), iden("updated_at")])
+                .to_owned(),
+        );
+    execute(db, &Statement::render(&insert)).await
+}
+
+pub(crate) const ROLE_USER: &str = "user";
+pub(crate) const ROLE_ASSISTANT: &str = "assistant";
+
+const CONVERSATION_OPEN: &str = "open";
+const CONVERSATION_ESCALATED: &str = "escalated";
+
+/// One decided turn's write, built by the handler once the decision is
+/// made.
+pub(crate) struct Turn {
+    pub conversation_id: String,
+    pub tenant_id: String,
+    /// `false` when this turn creates the conversation.
+    pub conversation_existed: bool,
+    /// Whether *this* turn escalates (a handoff). Escalation is monotonic:
+    /// a turn that does not escalate never writes the flag, so it cannot
+    /// clear one a concurrent handoff has just set.
+    pub escalates: bool,
+    pub now: String,
+    /// The user message's `seq` (the conversation's prior message count);
+    /// the assistant reply is `user_seq + 1`.
+    pub user_seq: i64,
+    pub user_message_id: String,
+    pub user_message: String,
+    pub assistant_message_id: String,
+    /// What the user is shown: the model's answer when the outcome is
+    /// `answered`, the canned message otherwise.
+    pub assistant_body: String,
+    /// What the model actually said, stored whatever the outcome. Equal
+    /// to `assistant_body` on an `answered` turn; on a downgraded one the
+    /// two deliberately differ, and this stays out of every user-facing
+    /// path.
+    pub model_answer: String,
+    pub outcome: String,
+    pub confidence_pct: i64,
+    /// The model's raw citations as a JSON string, persisted whatever the
+    /// outcome — the response may hide them, the row does not.
+    pub citations_json: String,
+}
+
+/// The statements for one turn: the conversation (insert or update) plus
+/// the user message and the assistant message. The caller runs them in
+/// **one** `batch_atomic`, so a half turn — a conversation with no
+/// messages, an answer with no question behind it — cannot survive a
+/// crash between statements.
+pub(crate) fn turn_statements(turn: &Turn) -> Vec<Statement> {
+    let conversation = if turn.conversation_existed {
+        let mut update = Query::update();
+        update.table(iden("sg_conversations"));
+        if turn.escalates {
+            update.values([
+                (iden("status"), CONVERSATION_ESCALATED.into()),
+                (iden("needs_escalation"), 1_i64.into()),
+            ]);
+        }
+        update
+            .value(iden("updated_at"), turn.now.clone())
+            .and_where(Expr::col(iden("id")).eq(turn.conversation_id.as_str()))
+            .and_where(Expr::col(iden("tenant_id")).eq(turn.tenant_id.as_str()));
+        Statement::render(&update)
+    } else {
+        let status = if turn.escalates {
+            CONVERSATION_ESCALATED
+        } else {
+            CONVERSATION_OPEN
+        };
+        let mut insert = Query::insert();
+        insert
+            .into_table(iden("sg_conversations"))
+            .columns([
+                "id",
+                "tenant_id",
+                "status",
+                "needs_escalation",
+                "created_at",
+                "updated_at",
+            ])
+            .values_panic([
+                turn.conversation_id.clone().into(),
+                turn.tenant_id.clone().into(),
+                status.into(),
+                i64::from(turn.escalates).into(),
+                turn.now.clone().into(),
+                turn.now.clone().into(),
+            ]);
+        Statement::render(&insert)
+    };
+
+    let mut messages = Query::insert();
+    messages
+        .into_table(iden("sg_messages"))
+        .columns([
+            "id",
+            "conversation_id",
+            "tenant_id",
+            "role",
+            "seq",
+            "body",
+            "model_answer",
+            "outcome",
+            "confidence_pct",
+            "citations",
+            "created_at",
+        ])
+        .values_panic([
+            turn.user_message_id.clone().into(),
+            turn.conversation_id.clone().into(),
+            turn.tenant_id.clone().into(),
+            ROLE_USER.into(),
+            turn.user_seq.into(),
+            turn.user_message.clone().into(),
+            Option::<String>::None.into(),
+            Option::<String>::None.into(),
+            Option::<i64>::None.into(),
+            Option::<String>::None.into(),
+            turn.now.clone().into(),
+        ])
+        .values_panic([
+            turn.assistant_message_id.clone().into(),
+            turn.conversation_id.clone().into(),
+            turn.tenant_id.clone().into(),
+            ROLE_ASSISTANT.into(),
+            (turn.user_seq + 1).into(),
+            turn.assistant_body.clone().into(),
+            turn.model_answer.clone().into(),
+            turn.outcome.clone().into(),
+            turn.confidence_pct.into(),
+            turn.citations_json.clone().into(),
+            turn.now.clone().into(),
+        ]);
+
+    vec![conversation, Statement::render(&messages)]
 }
 
 /// ISO-8601 (RFC 3339) from a `Clock` port reading — timestamps are bound
