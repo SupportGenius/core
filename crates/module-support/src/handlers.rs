@@ -133,13 +133,26 @@ pub(crate) async fn authenticate(
     }
 }
 
-/// Applies the optional `RateLimiter` port, one bucket per tenant. Keyed
-/// by tenant id rather than IP: these routes are authenticated, so the
-/// budget that matters is the tenant's, and an IP bucket would let one
-/// office full of colleagues exhaust each other. The limiter is the only
-/// backstop on `/search` and `/messages` (a full corpus fetch and rank per
-/// request, and on `/messages` a paid model call), so a
-/// transport failure here fails closed.
+/// Applies the `RateLimiter` port, one bucket per tenant. Keyed by tenant
+/// id rather than IP: these routes are authenticated, so the budget that
+/// matters is the tenant's, and an IP bucket would let one office full of
+/// colleagues exhaust each other.
+///
+/// The limiter is the only backstop on `/search` and `/messages`: `/search`
+/// is a full-corpus postings fetch and BM25 rank per request (since
+/// `store::postings_for` is deliberately unbounded — a `LIMIT` would
+/// corrupt ranking; see its docs), and `/messages` adds a paid model call.
+/// `FailClosed` therefore governs a *transport failure of a limiter that
+/// is present*: once one is composed, a flaky limiter denies rather than
+/// waving the corpus scan (or the model call) through. It does **not**
+/// manufacture a backstop from nothing — an *absent* limiter resolves to
+/// `RateLimit::Allowed` (`check_rate_limit` short-circuits on `None`),
+/// independent of `FailClosed`. So this guard only bites when the
+/// composition actually mounts a `RateLimiter`: the Cloudflare Worker does,
+/// unconditionally (`RATE_LIMITER` in wrangler.toml), and the native binary
+/// does when `REDIS_URL` is set — which it requires in production. The
+/// limiter is the effective per-tenant ceiling; bounding `postings_for`
+/// itself is a separate correctness problem and is not attempted here.
 ///
 /// `Some` is the 429 response the handler returns verbatim.
 pub(crate) async fn guard_rate_limit(ctx: &ModuleContext, tenant_id: &str) -> Option<Response> {

@@ -10,8 +10,11 @@
 //! export HARNESS_SECRET=$(openssl rand -hex 32)
 //! # DATABASE_URL unset -> SQLite at ./supportgenius.db; or:
 //! export DATABASE_URL=sqlite:///var/lib/supportgenius/state.db   # or postgres://…
-//! export REDIS_URL=redis://127.0.0.1:6379        # optional; without it
-//!                                                # rate limiting fails open
+//! export REDIS_URL=redis://127.0.0.1:6379        # rate limiter + KV; without
+//!                                                # it rate limiting fails open
+//!                                                # in dev/staging, and the
+//!                                                # binary refuses to boot when
+//!                                                # ENV=production (issues #16/#17)
 //! LISTEN_ADDR=127.0.0.1:8080 ./supportgenius
 //! curl -fsS http://127.0.0.1:8080/__health && curl -fsS http://127.0.0.1:8080/__ready
 //! ```
@@ -36,6 +39,7 @@ use cratefield_adapter_sqlite::SqliteDatabase;
 use cratefield_adapter_turnstile::Turnstile;
 use cratefield_core::{
     Captcha, Clock, Config, Database, Harness, HttpClient, KeyValue, Mailer, RateLimiter, Venture,
+    VentureEnv,
 };
 use cratefield_runtime_native::{
     EnvConfig, Native, OutboundOptions, ReqwestClient, TokioClock, install_tracing, serve,
@@ -98,8 +102,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let kv: Arc<dyn KeyValue> = redis.kv;
         runtime = runtime.rate_limiter_arc(rate_limiter).kv_arc(kv);
         tracing::info!("redis rate limiter and key-value ports configured");
+    } else if is_production(config) {
+        // Production must not silently fail rate limiting open: without a
+        // limiter the public mail path (issue #16) and the support
+        // search/sources routes (issue #17) have no volume ceiling, and
+        // the core `production_readiness` gate does not cover the limiter
+        // the way it covers captcha/signer. A self-host that declares
+        // `ENV=production` has opted into production posture, so require
+        // Redis there; a dev/staging box keeps the fail-open degradation
+        // below and runs with zero configuration.
+        return Err("ENV=production but REDIS_URL is unset: refusing to boot without a \
+             RateLimiter on the public mail and support endpoints. Set REDIS_URL (Redis \
+             backs the RateLimiter and KeyValue ports), or run with ENV=development or \
+             ENV=staging to accept fail-open rate limiting."
+            .into());
     } else {
-        tracing::warn!("REDIS_URL unset: RateLimiter and KeyValue ports not configured");
+        tracing::warn!(
+            "REDIS_URL unset: RateLimiter and KeyValue ports not configured (fail-open; \
+             ENV=production would require Redis here)"
+        );
     }
 
     let http: Arc<dyn HttpClient> = Arc::new(ReqwestClient::new());
@@ -239,6 +260,14 @@ async fn open_database(config: EnvConfig) -> Result<BootDb, Box<dyn std::error::
         )
         .into())
     }
+}
+
+/// Whether this deployment declares itself production (`ENV=production`),
+/// matching `cratefield-core`'s own parse (unset/blank is development).
+/// Production requires a real `RateLimiter`; development and staging accept
+/// the fail-open degradation so a self-host runs with zero configuration.
+fn is_production(config: EnvConfig) -> bool {
+    config.get("ENV").as_deref().and_then(VentureEnv::parse) == Some(VentureEnv::Production)
 }
 
 /// The compiled venture identity with `SUPPORTGENIUS_*` env applied on
