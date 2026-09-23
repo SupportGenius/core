@@ -111,11 +111,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         // `ENV=production` has opted into production posture, so require
         // Redis there; a dev/staging box keeps the fail-open degradation
         // below and runs with zero configuration.
-        return Err("ENV=production but REDIS_URL is unset: refusing to boot without a \
+        return Err(
+            "ENV=production but REDIS_URL is unset: refusing to boot without a \
              RateLimiter on the public mail and support endpoints. Set REDIS_URL (Redis \
              backs the RateLimiter and KeyValue ports), or run with ENV=development or \
              ENV=staging to accept fail-open rate limiting."
-            .into());
+                .into(),
+        );
     } else {
         tracing::warn!(
             "REDIS_URL unset: RateLimiter and KeyValue ports not configured (fail-open; \
