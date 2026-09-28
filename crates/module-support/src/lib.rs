@@ -65,6 +65,15 @@ const MIGRATION_CONVERSATIONS: SqlMigration = SqlMigration::new(
     include_str!("../migrations/sqlite/0002_conversations.sql"),
 );
 
+/// Source management: `external_id` (caller-side identity, one source per
+/// id per tenant) and `updated_at`, with the per-tenant unique index the
+/// replace-in-place ingest stands on.
+const MIGRATION_SOURCE_MANAGEMENT: SqlMigration = SqlMigration::new(
+    "0003",
+    "source_management",
+    include_str!("../migrations/sqlite/0003_source_management.sql"),
+);
+
 /// The support module: tenant provisioning behind the harness admin
 /// token, API-key-authenticated source ingest, BM25 search and grounded
 /// answers for everything else.
@@ -158,10 +167,12 @@ impl Module for Support {
     /// tenant's own documents, which may mention people; there is no
     /// column that identifies one, so no `… = ?` predicate can match a
     /// subject into them, and saying `none` would tell a manifest a
-    /// table full of quoted prose holds nothing about anybody. This
-    /// version ships no source-deletion route, so content leaves only
-    /// with account closure — the only subject this data has is the
-    /// tenant itself.
+    /// table full of quoted prose holds nothing about anybody. A tenant
+    /// can delete (or replace) a source it indexed, which removes that
+    /// document's rows wholesale — but a deletion names a *document*, not
+    /// a person, so erasure of a subject from the corpus is still not
+    /// expressible and content leaves for good only with account closure
+    /// — the only subject this data has is the tenant itself.
     ///
     /// **`sg_messages` is `unreachable` for the same reason.** The end
     /// users who write in are anonymous to this module — no email, no
@@ -193,11 +204,14 @@ impl Module for Support {
             PersonalDataSet::unreachable(
                 "sg_sources",
                 DataKind::Content,
-                "Documents the workspace added — a title, an optional source URL and the \
-                 size of what was indexed. The document text itself may mention people.",
+                "Documents the workspace added — a title, an optional source URL, the \
+                 caller's optional external id for it and the size of what was indexed. \
+                 The document text itself may mention people.",
                 "The rows belong to the workspace, not to any person the rows can name, so \
-                 no erasure predicate can match them. This version ships no source-deletion \
-                 route; the content leaves when the workspace's account is closed.",
+                 no erasure predicate can match them. `DELETE /v1/support/sources/{id}` \
+                 removes a source the workspace indexed — but a deletion names a document, \
+                 not a person; content leaves for good when the workspace's account is \
+                 closed.",
             ),
             PersonalDataSet::unreachable(
                 "sg_chunks",
@@ -205,7 +219,7 @@ impl Module for Support {
                 "Passages of the workspace's documents, kept verbatim so an answer can \
                  quote them. They may quote people.",
                 "Same as sg_sources: the text is reachable only through the workspace. \
-                 This version ships no source-deletion route; chunks leave when the \
+                 Chunks leave when their source is deleted or replaced, and when the \
                  workspace's account is closed.",
             ),
             PersonalDataSet::unreachable(
@@ -213,9 +227,9 @@ impl Module for Support {
                 DataKind::Content,
                 "The search index over the workspace's documents: which word occurs in \
                  which passage and how often.",
-                "The index is a projection of sg_chunks and leaves with them when the \
-                 workspace's account is closed; no person is identifiable from a word-count \
-                 row. This version ships no source-deletion route.",
+                "The index is a projection of sg_chunks and leaves with them — on source \
+                 deletion or replacement, or when the workspace's account is closed; no \
+                 person is identifiable from a word-count row.",
             ),
             PersonalDataSet::none(
                 "sg_conversations",
@@ -242,7 +256,11 @@ impl Module for Support {
     }
 
     fn migrations(&self) -> Migrations {
-        const MIGRATIONS: [SqlMigration; 2] = [MIGRATION_INIT, MIGRATION_CONVERSATIONS];
+        const MIGRATIONS: [SqlMigration; 3] = [
+            MIGRATION_INIT,
+            MIGRATION_CONVERSATIONS,
+            MIGRATION_SOURCE_MANAGEMENT,
+        ];
         // Refuses a gap, a duplicate or an out-of-order id at compile
         // time.
         const _: () = assert_migration_set(&MIGRATIONS);

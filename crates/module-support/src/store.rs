@@ -43,8 +43,12 @@ pub(crate) struct SourceRow {
     pub tenant_id: String,
     pub title: String,
     pub url: Option<String>,
+    /// The caller's own identity for the document, unique per tenant.
+    /// `None` is an anonymous source.
+    pub external_id: Option<String>,
     pub byte_len: i64,
     pub created_at: String,
+    pub updated_at: String,
 }
 
 /// What `chunks_by_id` returns for one ranked hit: enough to quote the
@@ -61,10 +65,12 @@ async fn execute(db: &dyn Database, stmt: &Statement) -> Result<(), DbError> {
     db.execute(stmt).await.map(|_| ())
 }
 
-/// Postings travel to `batch_atomic` in statements of this many rows.
-/// Four bound values per row keeps each statement far under the
-/// conservative 999-parameter limit some sqlite builds still enforce.
-const POSTINGS_PER_STATEMENT: usize = 120;
+/// Rows and ids travel to `batch_atomic` in statements of this many at a
+/// time. At two to seven bound values per row — the chunk insert is the
+/// seven — every statement stays far under the conservative
+/// 999-parameter limit some sqlite builds still enforce, including a
+/// 48 KiB document that chunks to over a hundred one-word windows.
+const ROWS_PER_STATEMENT: usize = 120;
 
 fn iden(name: &str) -> Alias {
     Alias::new(name)
@@ -116,6 +122,81 @@ pub(crate) async fn insert_api_key(db: &dyn Database, key: &ApiKeyRow) -> Result
     execute(db, &Statement::render(&insert)).await
 }
 
+/// The `sg_chunks` insert statements for `chunks` — the source's windows,
+/// stamped with the tenant, the source and its `created_at`, batched
+/// [`ROWS_PER_STATEMENT`] rows per statement (seven values per row).
+fn chunk_insert_statements(
+    tenant_id: &str,
+    source_id: &str,
+    created_at: &str,
+    chunks: &[&Chunk],
+) -> Vec<Statement> {
+    chunks
+        .chunks(ROWS_PER_STATEMENT)
+        .map(|group| {
+            let mut insert_chunks = Query::insert();
+            insert_chunks.into_table(iden("sg_chunks")).columns([
+                "id",
+                "tenant_id",
+                "source_id",
+                "ordinal",
+                "body",
+                "term_count",
+                "created_at",
+            ]);
+            for chunk in group {
+                insert_chunks.values_panic([
+                    chunk.id.clone().into(),
+                    tenant_id.into(),
+                    source_id.into(),
+                    chunk.ordinal.into(),
+                    chunk.text.clone().into(),
+                    chunk.length.into(),
+                    created_at.into(),
+                ]);
+            }
+            Statement::render(&insert_chunks)
+        })
+        .collect()
+}
+
+/// The inverted-index half of an ingest: the `(tenant_id, term, chunk_id,
+/// tf)` rows for `chunks`, in the chunker's term-sorted order so the batch
+/// is deterministic for a given document, batched
+/// [`ROWS_PER_STATEMENT`] rows per statement.
+fn posting_insert_statements(tenant_id: &str, chunks: &[&Chunk]) -> Vec<Statement> {
+    let postings: Vec<(&str, &str, &str, u32)> = chunks
+        .iter()
+        .flat_map(|chunk| {
+            chunk
+                .terms
+                .iter()
+                .map(move |(term, tf)| (tenant_id, term.as_str(), chunk.id.as_str(), *tf))
+        })
+        .collect();
+    postings
+        .chunks(ROWS_PER_STATEMENT)
+        .map(|group| {
+            let mut insert_postings = Query::insert();
+            insert_postings.into_table(iden("sg_postings")).columns([
+                "tenant_id",
+                "term",
+                "chunk_id",
+                "tf",
+            ]);
+            for (tenant_id, term, chunk_id, tf) in group {
+                insert_postings.values_panic([
+                    (*tenant_id).into(),
+                    (*term).into(),
+                    (*chunk_id).into(),
+                    (*tf).into(),
+                ]);
+            }
+            Statement::render(&insert_postings)
+        })
+        .collect()
+}
+
 /// The source row, its chunks and the chunks' postings land in **one**
 /// `batch_atomic`: a half-indexed source must never be able to exist,
 /// because a source whose postings are missing some terms is worse than
@@ -130,77 +211,426 @@ pub(crate) async fn insert_source_with_chunks(
     let mut insert_source = Query::insert();
     insert_source
         .into_table(iden("sg_sources"))
-        .columns(["id", "tenant_id", "title", "url", "byte_len", "created_at"])
+        .columns([
+            "id",
+            "tenant_id",
+            "title",
+            "url",
+            "external_id",
+            "byte_len",
+            "created_at",
+            "updated_at",
+        ])
         .values_panic([
             source.id.clone().into(),
             source.tenant_id.clone().into(),
             source.title.clone().into(),
             source.url.clone().into(),
+            source.external_id.clone().into(),
             source.byte_len.into(),
             source.created_at.clone().into(),
+            source.updated_at.clone().into(),
         ]);
     statements.push(Statement::render(&insert_source));
 
-    let mut insert_chunks = Query::insert();
-    insert_chunks.into_table(iden("sg_chunks")).columns([
-        "id",
-        "tenant_id",
-        "source_id",
-        "ordinal",
-        "body",
-        "term_count",
-        "created_at",
-    ]);
-    for chunk in chunks {
-        insert_chunks.values_panic([
-            chunk.id.clone().into(),
-            source.tenant_id.clone().into(),
-            source.id.clone().into(),
-            chunk.ordinal.into(),
-            chunk.text.clone().into(),
-            chunk.length.into(),
-            source.created_at.clone().into(),
-        ]);
-    }
-    if !chunks.is_empty() {
-        statements.push(Statement::render(&insert_chunks));
-    }
-
-    // (tenant_id, term, chunk_id, tf) rows, in the chunker's term-sorted
-    // order so the batch is deterministic for a given document.
-    let postings: Vec<(&str, &str, &str, u32)> = chunks
-        .iter()
-        .flat_map(|chunk| {
-            chunk.terms.iter().map(move |(term, tf)| {
-                (
-                    source.tenant_id.as_str(),
-                    term.as_str(),
-                    chunk.id.as_str(),
-                    *tf,
-                )
-            })
-        })
-        .collect();
-    for group in postings.chunks(POSTINGS_PER_STATEMENT) {
-        let mut insert_postings = Query::insert();
-        insert_postings.into_table(iden("sg_postings")).columns([
-            "tenant_id",
-            "term",
-            "chunk_id",
-            "tf",
-        ]);
-        for (tenant_id, term, chunk_id, tf) in group {
-            insert_postings.values_panic([
-                (*tenant_id).into(),
-                (*term).into(),
-                (*chunk_id).into(),
-                (*tf).into(),
-            ]);
-        }
-        statements.push(Statement::render(&insert_postings));
-    }
+    let windows: Vec<&Chunk> = chunks.iter().collect();
+    statements.extend(chunk_insert_statements(
+        &source.tenant_id,
+        &source.id,
+        &source.created_at,
+        &windows,
+    ));
+    statements.extend(posting_insert_statements(&source.tenant_id, &windows));
 
     db.batch_atomic(&statements).await
+}
+
+/// One source as the source-management routes show it: the row plus how
+/// many windows it was chunked into. `origin` on the wire is derived from
+/// `url` (`Some` is `"url"`, `None` is `"text"`).
+pub(crate) struct SourceSummary {
+    pub id: String,
+    pub title: String,
+    pub url: Option<String>,
+    pub external_id: Option<String>,
+    pub byte_len: i64,
+    pub updated_at: String,
+    pub chunk_count: i64,
+}
+
+/// The source-list columns plus their grouped chunk count: a `LEFT JOIN`
+/// so a source with no chunks (empty text) still lists, with `COUNT`
+/// over the join and every selected source column in the `GROUP BY`, so
+/// the grouping is unambiguous on every engine.
+fn summary_select() -> sea_query::SelectStatement {
+    let mut select = Query::select();
+    select
+        .expr_as(Expr::col((iden("s"), iden("id"))), Alias::new("id"))
+        .expr_as(Expr::col((iden("s"), iden("title"))), Alias::new("title"))
+        .expr_as(Expr::col((iden("s"), iden("url"))), Alias::new("url"))
+        .expr_as(
+            Expr::col((iden("s"), iden("external_id"))),
+            Alias::new("external_id"),
+        )
+        .expr_as(
+            Expr::col((iden("s"), iden("byte_len"))),
+            Alias::new("byte_len"),
+        )
+        .expr_as(
+            Expr::col((iden("s"), iden("updated_at"))),
+            Alias::new("updated_at"),
+        )
+        .expr_as(
+            Func::count(Expr::col((iden("c"), iden("id")))),
+            Alias::new("chunk_count"),
+        )
+        .from_as(iden("sg_sources"), iden("s"))
+        .join_as(
+            sea_query::JoinType::LeftJoin,
+            iden("sg_chunks"),
+            iden("c"),
+            Expr::col((iden("c"), iden("source_id")))
+                .eq(Expr::col((iden("s"), iden("id"))))
+                .and(
+                    Expr::col((iden("c"), iden("tenant_id")))
+                        .eq(Expr::col((iden("s"), iden("tenant_id")))),
+                ),
+        );
+    select
+}
+
+fn summary_from(row: &cratefield_core::Row) -> Option<SourceSummary> {
+    Some(SourceSummary {
+        id: row.get("id")?,
+        title: row.get("title")?,
+        url: row.get("url")?,
+        external_id: row.get("external_id")?,
+        byte_len: row.get("byte_len")?,
+        updated_at: row.get("updated_at")?,
+        chunk_count: row.get("chunk_count")?,
+    })
+}
+
+/// The tenant's sources, keyset-paginated by id, oldest ULID first: at
+/// most `limit` rows starting strictly after `after` (`None` is from the
+/// top). Pagination rides the primary key, so a page boundary is stable
+/// no matter what ingests land between two requests.
+pub(crate) async fn list_sources(
+    db: &dyn Database,
+    tenant_id: &str,
+    limit: u32,
+    after: Option<&str>,
+) -> Result<Vec<SourceSummary>, DbError> {
+    let mut select = summary_select();
+    select.and_where(Expr::col((iden("s"), iden("tenant_id"))).eq(tenant_id));
+    if let Some(after) = after {
+        select.and_where(Expr::col((iden("s"), iden("id"))).gt(after));
+    }
+    select
+        .group_by_columns([
+            (iden("s"), iden("id")),
+            (iden("s"), iden("title")),
+            (iden("s"), iden("url")),
+            (iden("s"), iden("external_id")),
+            (iden("s"), iden("byte_len")),
+            (iden("s"), iden("updated_at")),
+        ])
+        .order_by((iden("s"), iden("id")), sea_query::Order::Asc)
+        .limit(u64::from(limit));
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows.rows.iter().filter_map(summary_from).collect())
+}
+
+/// One source by id, scoped to the tenant — a foreign id is no source at
+/// all, which is what makes unknown and foreign the same 404.
+pub(crate) async fn find_source_summary(
+    db: &dyn Database,
+    tenant_id: &str,
+    source_id: &str,
+) -> Result<Option<SourceSummary>, DbError> {
+    let mut select = summary_select();
+    select
+        .and_where(Expr::col((iden("s"), iden("tenant_id"))).eq(tenant_id))
+        .and_where(Expr::col((iden("s"), iden("id"))).eq(source_id))
+        .group_by_columns([
+            (iden("s"), iden("id")),
+            (iden("s"), iden("title")),
+            (iden("s"), iden("url")),
+            (iden("s"), iden("external_id")),
+            (iden("s"), iden("byte_len")),
+            (iden("s"), iden("updated_at")),
+        ]);
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows.rows.first().and_then(summary_from))
+}
+
+/// The tenant's source carrying this `external_id`, if any — the lookup
+/// the replace-in-place ingest stands on. Scoped to the tenant, as the
+/// unique index is.
+pub(crate) async fn find_source_by_external_id(
+    db: &dyn Database,
+    tenant_id: &str,
+    external_id: &str,
+) -> Result<Option<SourceRow>, DbError> {
+    source_by(db, tenant_id, "external_id", external_id).await
+}
+
+/// The source row for `id`, scoped to the tenant. Carries the columns the
+/// replace path needs; the routes show [`SourceSummary`] instead.
+pub(crate) async fn find_source(
+    db: &dyn Database,
+    tenant_id: &str,
+    source_id: &str,
+) -> Result<Option<SourceRow>, DbError> {
+    source_by(db, tenant_id, "id", source_id).await
+}
+
+/// `SELECT … FROM sg_sources WHERE tenant_id = ? AND <column> = ?`, the
+/// one shape both source lookups take.
+async fn source_by(
+    db: &dyn Database,
+    tenant_id: &str,
+    column: &str,
+    value: &str,
+) -> Result<Option<SourceRow>, DbError> {
+    let mut select = Query::select();
+    select
+        .columns([
+            "id",
+            "tenant_id",
+            "title",
+            "url",
+            "external_id",
+            "byte_len",
+            "created_at",
+            "updated_at",
+        ])
+        .from(iden("sg_sources"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden(column)).eq(value));
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows.rows.first().map(|row| SourceRow {
+        id: row.get("id").unwrap_or_default(),
+        tenant_id: row.get("tenant_id").unwrap_or_default(),
+        title: row.get("title").unwrap_or_default(),
+        url: row.get("url").unwrap_or_default(),
+        external_id: row.get("external_id").unwrap_or_default(),
+        byte_len: row.get("byte_len").unwrap_or_default(),
+        created_at: row.get("created_at").unwrap_or_default(),
+        updated_at: row.get("updated_at").unwrap_or_default(),
+    }))
+}
+
+/// One stored chunk's bookkeeping: its content address and its position.
+pub(crate) struct StoredChunk {
+    pub id: String,
+    pub ordinal: u32,
+}
+
+/// The stored chunk ids and ordinals of one source, in ordinal order —
+/// the old side of the replace diff.
+async fn chunk_index(
+    db: &dyn Database,
+    tenant_id: &str,
+    source_id: &str,
+) -> Result<Vec<StoredChunk>, DbError> {
+    let mut select = Query::select();
+    select
+        .columns(["id", "ordinal"])
+        .from(iden("sg_chunks"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden("source_id")).eq(source_id))
+        .order_by(iden("ordinal"), sea_query::Order::Asc);
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows
+        .rows
+        .iter()
+        .filter_map(|row| {
+            Some(StoredChunk {
+                id: row.get("id")?,
+                ordinal: row.get("ordinal")?,
+            })
+        })
+        .collect())
+}
+
+/// `DELETE FROM <table> WHERE tenant_id = ? AND <column> IN (…)`, ids
+/// batched [`ROWS_PER_STATEMENT`] per statement — one parameter per id,
+/// for the same reason the inserts are batched.
+fn delete_tenant_in(table: &str, column: &str, tenant_id: &str, ids: &[String]) -> Vec<Statement> {
+    ids.chunks(ROWS_PER_STATEMENT)
+        .map(|group| {
+            let mut delete = Query::delete();
+            delete
+                .from_table(iden(table))
+                .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+                .and_where(Expr::col(iden(column)).is_in(group.iter().map(String::as_str)));
+            Statement::render(&delete)
+        })
+        .collect()
+}
+
+/// Replaces one source's whole chunk set in **one** `batch_atomic`: the
+/// source row's metadata first, then the diff between the stored windows
+/// and the re-chunked ones. `source` is the row as it should read after
+/// the call — the stored `id` and `tenant_id`, its `created_at` carried
+/// through untouched, and `updated_at` also stamping any window the
+/// replacement adds. The caller chunks with the *same* source id, so a
+/// window whose text survived the edit keeps its content-addressed id and
+/// its row — `created_at` included — is not touched at all; only vanished
+/// windows (postings first, then the rows) and added windows are written,
+/// and a kept window whose ordinal moved gets an `UPDATE`.
+///
+/// Residual races are bounded by the batches: a DELETE that committed
+/// before this batch left the row update matching nothing and the windows
+/// written here orphaned, so the row is re-checked afterwards and the
+/// [`delete_source`] batch sweeps them. Two concurrent replaces of one
+/// source chunk identically, so the loser's insert hits the chunk
+/// primary key and its whole batch rolls back — a clean `500`, never a
+/// half-applied write.
+pub(crate) async fn replace_source_chunks(
+    db: &dyn Database,
+    source: &SourceRow,
+    chunks: &[Chunk],
+) -> Result<(), DbError> {
+    let stored = chunk_index(db, &source.tenant_id, &source.id).await?;
+    let new_ids: std::collections::HashSet<&str> =
+        chunks.iter().map(|chunk| chunk.id.as_str()).collect();
+    let vanished: Vec<String> = stored
+        .iter()
+        .filter(|chunk| !new_ids.contains(chunk.id.as_str()))
+        .map(|chunk| chunk.id.clone())
+        .collect();
+    let old_ordinals: std::collections::HashMap<&str, u32> = stored
+        .iter()
+        .map(|chunk| (chunk.id.as_str(), chunk.ordinal))
+        .collect();
+    let added: Vec<&Chunk> = chunks
+        .iter()
+        .filter(|chunk| !old_ordinals.contains_key(chunk.id.as_str()))
+        .collect();
+
+    let mut statements: Vec<Statement> = Vec::new();
+
+    let mut update_source = Query::update();
+    update_source
+        .table(iden("sg_sources"))
+        .values([
+            (iden("title"), source.title.as_str().into()),
+            (iden("url"), source.url.as_deref().into()),
+            (iden("external_id"), source.external_id.as_deref().into()),
+            (iden("byte_len"), source.byte_len.into()),
+            (iden("updated_at"), source.updated_at.as_str().into()),
+        ])
+        .and_where(Expr::col(iden("id")).eq(source.id.as_str()))
+        .and_where(Expr::col(iden("tenant_id")).eq(source.tenant_id.as_str()));
+    statements.push(Statement::render(&update_source));
+
+    // Postings before their chunks: no foreign keys enforce the order
+    // today, but the index is a projection of the rows — never the other
+    // way round.
+    statements.extend(delete_tenant_in(
+        "sg_postings",
+        "chunk_id",
+        &source.tenant_id,
+        &vanished,
+    ));
+    statements.extend(delete_tenant_in(
+        "sg_chunks",
+        "id",
+        &source.tenant_id,
+        &vanished,
+    ));
+
+    for chunk in chunks {
+        // Only kept windows are renumbered: an added window is inserted
+        // with its ordinal already, so an UPDATE would be a no-op against
+        // a row this same batch is about to insert.
+        if old_ordinals
+            .get(chunk.id.as_str())
+            .is_none_or(|old| *old == chunk.ordinal)
+        {
+            continue;
+        }
+        let mut renumber = Query::update();
+        renumber
+            .table(iden("sg_chunks"))
+            .value(iden("ordinal"), chunk.ordinal)
+            .and_where(Expr::col(iden("id")).eq(chunk.id.as_str()))
+            .and_where(Expr::col(iden("tenant_id")).eq(source.tenant_id.as_str()));
+        statements.push(Statement::render(&renumber));
+    }
+
+    // Added windows carry the replacement's instant as their created_at;
+    // the windows that survived keep the instant they were first written.
+    statements.extend(chunk_insert_statements(
+        &source.tenant_id,
+        &source.id,
+        &source.updated_at,
+        &added,
+    ));
+    statements.extend(posting_insert_statements(&source.tenant_id, &added));
+
+    db.batch_atomic(&statements).await?;
+
+    // The re-check the doc above promises: if a DELETE committed between
+    // the caller's existence read and this batch, the row is gone but the
+    // windows written above are not — sweep them with the same
+    // delete-by-source batch. (A DELETE committing after this check also
+    // wins: it deletes by source, so it takes whatever this batch wrote.)
+    if find_source(db, &source.tenant_id, &source.id)
+        .await?
+        .is_none()
+    {
+        delete_source(db, &source.tenant_id, &source.id).await?;
+    }
+    Ok(())
+}
+
+/// Deletes one source and its whole index in **one** `batch_atomic`: the
+/// postings of its chunks — by subquery over `sg_chunks`, not a pre-read
+/// id list, so windows a concurrent replace committed mid-flight are
+/// swept too — then the chunks, then the row. Every statement is a no-op
+/// if the source is already gone, so a race that removes the row first
+/// still leaves nothing behind.
+pub(crate) async fn delete_source(
+    db: &dyn Database,
+    tenant_id: &str,
+    source_id: &str,
+) -> Result<(), DbError> {
+    let mut delete_postings = Query::delete();
+    delete_postings
+        .from_table(iden("sg_postings"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(
+            Expr::col(iden("chunk_id")).in_subquery(
+                Query::select()
+                    .column(iden("id"))
+                    .from(iden("sg_chunks"))
+                    .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+                    .and_where(Expr::col(iden("source_id")).eq(source_id))
+                    .to_owned(),
+            ),
+        );
+
+    let mut delete_chunks = Query::delete();
+    delete_chunks
+        .from_table(iden("sg_chunks"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden("source_id")).eq(source_id));
+
+    let mut delete_row = Query::delete();
+    delete_row
+        .from_table(iden("sg_sources"))
+        .and_where(Expr::col(iden("id")).eq(source_id))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id));
+
+    db.batch_atomic(&[
+        Statement::render(&delete_postings),
+        Statement::render(&delete_chunks),
+        Statement::render(&delete_row),
+    ])
+    .await
 }
 
 /// Chunk count and mean document length for one tenant's index — the two

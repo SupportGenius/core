@@ -12,10 +12,12 @@
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use cratefield_core::{
-    Completion, Database, MapConfig, ModelTier, Module, Prompt, Statement, TextModel,
+    Completion, Database, Decision, MapConfig, ModelTier, Module, Prompt, Statement, TextModel,
     TextModelError,
 };
-use cratefield_testing::{Dialect, FakeHttpClient, FakeTextModel, TestHarness, TextModelMode};
+use cratefield_testing::{
+    Dialect, FakeHttpClient, FakeRateLimiter, FakeTextModel, TestHarness, TextModelMode,
+};
 use module_support::Support;
 use module_support::chunk::Chunker;
 use serde_json::{Value, json};
@@ -47,10 +49,17 @@ impl Reply {
         let bytes = to_bytes(response.into_body(), 1024 * 1024)
             .await
             .expect("response body reads");
+        // A 204 carries no body, which parses as null rather than as an
+        // error — every other response here is JSON.
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).expect("response body is JSON")
+        };
         Self {
             status,
             headers,
-            body: serde_json::from_slice(&bytes).expect("response body is JSON"),
+            body,
         }
     }
 
@@ -1759,5 +1768,650 @@ async fn messages_needs_a_valid_api_key() {
         assert_eq!(malformed.status, StatusCode::UNAUTHORIZED);
         assert!(model.prompts().is_empty());
         assert_eq!(count_of(&kit, "sg_messages"), 0);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Issue #28: source management — `GET /sources`, `GET /sources/{id}`,
+// `PUT /sources/{id}`, `DELETE /sources/{id}`, and the replace-in-place
+// ingest for a repeated `external_id`.
+// ---------------------------------------------------------------------
+
+fn source_path(source_id: &str) -> String {
+    format!("{SOURCES}/{source_id}")
+}
+
+/// `id|created_at` for every chunk of one source, in ordinal order: a
+/// row that survived a replace keeps both, a re-inserted row cannot.
+fn chunk_rows_of(kit: &TestHarness, source_id: &str) -> Vec<String> {
+    text_column(
+        kit,
+        &format!(
+            "SELECT id || '|' || created_at AS v FROM sg_chunks \
+             WHERE source_id = '{source_id}' ORDER BY ordinal"
+        ),
+    )
+}
+
+async fn get_source(kit: &TestHarness, key: &str, path: &str) -> Reply {
+    send(&kit.router, Method::GET, path, Some(key), None).await
+}
+
+#[pollster::test]
+async fn deleting_a_source_removes_it_from_the_index_and_the_corpus() {
+    for kit in kits() {
+        let tenant = mint_tenant(&kit, "Deleted").await;
+        let api_key = body_str(&tenant, "api_key");
+
+        // A and B share the term "quokka", C does not; each document is
+        // one chunk, so B's quokka score is scored against df = 2 of
+        // N = 3 — and, once A is gone, against df = 1 of N = 2.
+        let a = ingest(
+            &kit,
+            &api_key,
+            json!({ "external_id": "a", "text": "quokka quokka ferritin" }),
+        )
+        .await;
+        let b = ingest(
+            &kit,
+            &api_key,
+            json!({ "external_id": "b", "text": "quokka quokka kangaroo pad" }),
+        )
+        .await;
+        let c = ingest(
+            &kit,
+            &api_key,
+            json!({ "external_id": "c", "text": "billing plans change on the page" }),
+        )
+        .await;
+        for reply in [&a, &b, &c] {
+            assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.body);
+        }
+        let (a_id, b_id) = (
+            body_str(&a.body, "source_id"),
+            body_str(&b.body, "source_id"),
+        );
+        let a_chunk = text_column(
+            &kit,
+            &format!("SELECT id AS v FROM sg_chunks WHERE source_id = '{a_id}'"),
+        );
+        assert_eq!(a_chunk.len(), 1, "fixture documents are one chunk");
+
+        let score_of_b = |reply: &Reply| -> f64 {
+            reply.body["results"]
+                .as_array()
+                .expect("results")
+                .iter()
+                .find(|hit| hit["source_id"] == b_id.as_str())
+                .map(|hit| hit["score"].as_f64().expect("score"))
+                .expect("B matches quokka")
+        };
+        let before = search(&kit, &api_key, "q=quokka").await;
+        assert_eq!(before.body["results"].as_array().expect("r").len(), 2);
+        let score_before = score_of_b(&before);
+
+        let deleted = send(
+            &kit.router,
+            Method::DELETE,
+            &source_path(&a_id),
+            Some(&api_key),
+            None,
+        )
+        .await;
+        assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{}", deleted.body);
+
+        // The row, its chunk and its postings are all gone.
+        assert_eq!(
+            count_where(&kit, "sg_sources", &format!("id = '{a_id}'")),
+            0
+        );
+        assert_eq!(
+            count_where(&kit, "sg_chunks", &format!("source_id = '{a_id}'")),
+            0
+        );
+        assert_eq!(
+            count_where(&kit, "sg_postings", &format!("chunk_id = '{}'", a_chunk[0])),
+            0
+        );
+
+        // A term only A indexed retrieves nothing now, and the corpus
+        // shrank to B and C.
+        let ferritin = search(&kit, &api_key, "q=ferritin").await;
+        assert_eq!(
+            ferritin.body["results"].as_array().expect("r").len(),
+            0,
+            "{}",
+            ferritin.body
+        );
+        let after = search(&kit, &api_key, "q=quokka").await;
+        let results = after.body["results"].as_array().expect("r");
+        assert_eq!(results.len(), 1, "{}", after.body);
+        assert_eq!(results[0]["source_id"], b_id.as_str());
+        let score_after = score_of_b(&after);
+
+        // The rise is exactly BM25's df correction: in a fresh tenant
+        // holding only B and C — the corpus the original one now is — B
+        // scores precisely what it scores here, and more than before,
+        // because quokka went from df 2 of N 3 to df 1 of N 2.
+        let fresh = mint_tenant(&kit, "Fresh").await;
+        let fresh_key = body_str(&fresh, "api_key");
+        ingest(
+            &kit,
+            &fresh_key,
+            json!({ "text": "quokka quokka kangaroo pad" }),
+        )
+        .await;
+        ingest(
+            &kit,
+            &fresh_key,
+            json!({ "text": "billing plans change on the page" }),
+        )
+        .await;
+        let alone = search(&kit, &fresh_key, "q=quokka").await;
+        let score_alone = alone.body["results"][0]["score"].as_f64().expect("score");
+        assert!(
+            score_after > score_before,
+            "df dropped, idf rose: {score_after} vs {score_before}"
+        );
+        // Bit-exact by construction, not by luck: a single-term query over
+        // one posting row per chunk has one float expression with one
+        // evaluation order, so the same inputs must produce the same bits.
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(
+                score_after, score_alone,
+                "B scores exactly what it scores in the equivalent fresh corpus"
+            );
+        }
+
+        // B and C were untouched by A's deletion.
+        assert_eq!(
+            count_where(&kit, "sg_sources", &format!("id = '{b_id}'")),
+            1
+        );
+        assert_eq!(
+            count_where(
+                &kit,
+                "sg_chunks",
+                &format!("source_id = '{}'", body_str(&c.body, "source_id"))
+            ),
+            1
+        );
+    }
+}
+
+#[pollster::test]
+async fn replacing_a_source_keeps_the_surviving_windows_and_diffs_the_index() {
+    for kit in kits() {
+        let tenant = mint_tenant(&kit, "Replaced").await;
+        let api_key = body_str(&tenant, "api_key");
+        let tenant_id = body_str(&tenant, "tenant_id");
+        let words: Vec<String> = (0..400).map(|i| format!("word{i:03}")).collect();
+        let original = words.join(" ");
+        let created = ingest(
+            &kit,
+            &api_key,
+            json!({ "title": "Before", "external_id": "doc", "text": original }),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+        let source_id = body_str(&created.body, "source_id");
+
+        let before_ids = text_column(
+            &kit,
+            &format!(
+                "SELECT id AS v FROM sg_chunks WHERE source_id = '{source_id}' ORDER BY ordinal"
+            ),
+        );
+        let before_rows = chunk_rows_of(&kit, &source_id);
+
+        // One paragraph — words 200..210 — changes.
+        let mut edited = words.clone();
+        for (i, word) in edited.iter_mut().enumerate() {
+            if (200..210).contains(&i) {
+                *word = format!("mark{i:03}");
+            }
+        }
+        let updated = edited.join(" ");
+        let put = send(
+            &kit.router,
+            Method::PUT,
+            &source_path(&source_id),
+            Some(&api_key),
+            Some(&json!({ "title": "After", "external_id": "doc", "text": updated }).to_string()),
+        )
+        .await;
+        assert_eq!(put.status, StatusCode::OK, "{}", put.body);
+        assert_eq!(put.body["id"], source_id.as_str());
+        assert_eq!(put.body["title"], "After");
+        assert_eq!(put.body["origin"], "text");
+        assert_eq!(put.body["external_id"], "doc");
+        assert_eq!(put.body["bytes"], updated.len());
+        assert_eq!(put.body["origin"], "text");
+
+        // What is stored is exactly what the chunker produces for the
+        // edited text under the SAME source id — so the windows that did
+        // not overlap the edit kept their content-addressed ids, and the
+        // edit is confined to the window that spans words 200..210.
+        let expected = Chunker::default().split(&tenant_id, &source_id, &updated);
+        let after_ids: Vec<&str> = expected.iter().map(|c| c.id.as_str()).collect();
+        assert!(after_ids.len() > 1, "fixture must span several chunks");
+        let stored_ids = text_column(
+            &kit,
+            &format!(
+                "SELECT id AS v FROM sg_chunks WHERE source_id = '{source_id}' ORDER BY ordinal"
+            ),
+        );
+        assert_eq!(stored_ids, after_ids);
+
+        let kept: std::collections::HashSet<&str> = before_ids
+            .iter()
+            .filter(|id| after_ids.contains(&id.as_str()))
+            .map(String::as_str)
+            .collect();
+        let removed: Vec<&String> = before_ids
+            .iter()
+            .filter(|id| !after_ids.contains(&id.as_str()))
+            .collect();
+        assert!(!kept.is_empty(), "unchanged windows must keep their ids");
+        assert_eq!(
+            removed.len(),
+            1,
+            "exactly the window overlapping words 200..210 is re-chunked"
+        );
+
+        // Vanished ids have neither chunk rows nor postings left.
+        for id in &removed {
+            assert_eq!(count_where(&kit, "sg_chunks", &format!("id = '{id}'")), 0);
+            assert_eq!(
+                count_where(&kit, "sg_postings", &format!("chunk_id = '{id}'")),
+                0
+            );
+        }
+
+        // Surviving rows were not re-inserted: same row identity (id and
+        // created_at, ordinal order), and the index as a whole matches a
+        // fresh ingest of the edited text.
+        let after_rows = chunk_rows_of(&kit, &source_id);
+        let kept_rows: Vec<&String> = after_rows
+            .iter()
+            .filter(|row| kept.contains(row.split('|').next().expect("id|ts")))
+            .collect();
+        assert_eq!(
+            kept_rows.len(),
+            kept.len(),
+            "every kept window is still one row"
+        );
+        for row in kept_rows {
+            assert!(
+                before_rows.contains(row),
+                "{row} must be the pre-replace row, created_at included"
+            );
+        }
+        let expected_postings: usize = expected.iter().map(|chunk| chunk.terms.len()).sum();
+        assert_eq!(
+            count_where(
+                &kit,
+                "sg_postings",
+                &format!("chunk_id IN (SELECT id FROM sg_chunks WHERE source_id = '{source_id}')")
+            ),
+            expected_postings
+        );
+
+        // A body external_id another source of the tenant already holds
+        // is a 409 before anything is written — not a bare unique-index
+        // 500 — and it changes neither source.
+        let other = ingest(
+            &kit,
+            &api_key,
+            json!({ "title": "Twin", "external_id": "twin", "text": "twin text" }),
+        )
+        .await;
+        assert_eq!(other.status, StatusCode::CREATED, "{}", other.body);
+        let clashed = send(
+            &kit.router,
+            Method::PUT,
+            &source_path(&source_id),
+            Some(&api_key),
+            Some(r#"{"text":"clashed","external_id":"twin"}"#),
+        )
+        .await;
+        assert_eq!(clashed.status, StatusCode::CONFLICT, "{}", clashed.body);
+        assert_eq!(
+            clashed.problem_type(),
+            format!("{PROBLEMS}source-external-id-conflict")
+        );
+        assert_eq!(count_of(&kit, "sg_sources"), 2);
+        assert_eq!(
+            text_column(
+                &kit,
+                &format!("SELECT id AS v FROM sg_chunks WHERE source_id = '{source_id}'")
+            )
+            .len(),
+            after_ids.len(),
+            "a clashed replace writes nothing"
+        );
+    }
+}
+
+#[pollster::test]
+async fn reingesting_an_external_id_replaces_the_source_in_place() {
+    for kit in kits() {
+        let tenant = mint_tenant(&kit, "Upserted").await;
+        let api_key = body_str(&tenant, "api_key");
+        let tenant_id = body_str(&tenant, "tenant_id");
+        let v1 = "the refund window is thirty days";
+        let first = ingest(
+            &kit,
+            &api_key,
+            json!({ "external_id": "handbook", "text": v1 }),
+        )
+        .await;
+        assert_eq!(first.status, StatusCode::CREATED, "{}", first.body);
+        let source_id = body_str(&first.body, "source_id");
+
+        let v2 = "the refund window is now forty five days and covers shipping";
+        let second = ingest(
+            &kit,
+            &api_key,
+            json!({ "external_id": "handbook", "title": "Handbook", "text": v2 }),
+        )
+        .await;
+        assert_eq!(second.status, StatusCode::OK, "{}", second.body);
+        assert_eq!(second.body["source_id"], source_id.as_str(), "same id");
+
+        // One source row, and the chunk/posting set of a fresh v2.
+        assert_eq!(count_of(&kit, "sg_sources"), 1);
+        let expected = Chunker::default().split(&tenant_id, &source_id, v2);
+        assert_eq!(expected.len(), 1, "fixture documents are one chunk");
+        assert_eq!(
+            count_where(&kit, "sg_chunks", &format!("source_id = '{source_id}'")),
+            expected.len()
+        );
+        let stored_ids = text_column(
+            &kit,
+            &format!(
+                "SELECT id AS v FROM sg_chunks WHERE source_id = '{source_id}' ORDER BY ordinal"
+            ),
+        );
+        let expected_ids: Vec<&str> = expected.iter().map(|chunk| chunk.id.as_str()).collect();
+        assert_eq!(stored_ids, expected_ids);
+        assert_eq!(
+            count_where(
+                &kit,
+                "sg_postings",
+                &format!("chunk_id = '{}'", expected_ids[0])
+            ),
+            expected[0].terms.len(),
+            "the old version's postings are gone, the new version's are in"
+        );
+
+        // The index serves the new text: the v2-only word retrieves, the
+        // v1-only word does not.
+        let forty = search(&kit, &api_key, "q=forty").await;
+        assert_eq!(
+            forty.body["results"].as_array().expect("r").len(),
+            1,
+            "{}",
+            forty.body
+        );
+        let thirty = search(&kit, &api_key, "q=thirty").await;
+        assert_eq!(
+            thirty.body["results"].as_array().expect("r").len(),
+            0,
+            "{}",
+            thirty.body
+        );
+
+        // The uniqueness is per tenant: another workspace's "handbook" is
+        // its own source, created fresh.
+        let other = mint_tenant(&kit, "Other").await;
+        let theirs = ingest(
+            &kit,
+            &body_str(&other, "api_key"),
+            json!({ "external_id": "handbook", "text": v1 }),
+        )
+        .await;
+        assert_eq!(theirs.status, StatusCode::CREATED, "{}", theirs.body);
+        assert_ne!(theirs.body["source_id"], source_id.as_str());
+        assert_eq!(count_of(&kit, "sg_sources"), 2);
+    }
+}
+
+#[pollster::test]
+async fn url_ingest_defaults_the_external_id_to_the_url_so_reposts_replace() {
+    for dialect in Dialect::available() {
+        let url = "https://docs.example/handbook";
+        let plain = |body: &'static str| {
+            http::Response::builder()
+                .status(200)
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(bytes::Bytes::from_static(body.as_bytes()))
+                .map_err(|err| cratefield_core::HttpError::Transport(err.to_string()))
+        };
+        let fake = FakeHttpClient::scripted(vec![
+            plain("quokka habitat notes"),
+            plain("quokka habitat notes, revised"),
+        ]);
+        let kit = TestHarness::with_database_and_ports(support(), dialect, |ports| {
+            ports.config = Arc::new(MapConfig::from_pairs([("ADMIN_TOKEN", ADMIN_TOKEN)]));
+            ports.http = Some(Arc::new(fake.clone()));
+        });
+        let tenant = mint_tenant(&kit, "Fetched twice").await;
+        let api_key = body_str(&tenant, "api_key");
+
+        let first = ingest(&kit, &api_key, json!({ "url": url })).await;
+        assert_eq!(first.status, StatusCode::CREATED, "{}", first.body);
+        let source_id = body_str(&first.body, "source_id");
+
+        let second = ingest(&kit, &api_key, json!({ "url": url })).await;
+        assert_eq!(second.status, StatusCode::OK, "{}", second.body);
+        assert_eq!(second.body["source_id"], source_id.as_str());
+        assert_eq!(count_of(&kit, "sg_sources"), 1);
+
+        // The derived identity is visible on the source, along with its
+        // url origin.
+        let got = get_source(&kit, &api_key, &source_path(&source_id)).await;
+        assert_eq!(got.status, StatusCode::OK, "{}", got.body);
+        assert_eq!(got.body["origin"], "url");
+        assert_eq!(got.body["external_id"], url);
+    }
+}
+
+#[pollster::test]
+async fn sources_list_get_and_foreign_ids_are_tenant_scoped() {
+    for kit in kits() {
+        let a = mint_tenant(&kit, "Lister A").await;
+        let b = mint_tenant(&kit, "Lister B").await;
+        let (a_key, b_key) = (body_str(&a, "api_key"), body_str(&b, "api_key"));
+        let a_id = body_str(&a, "tenant_id");
+
+        let docs = [
+            ("Alpha", Some("alpha"), "alpha covers refunds"),
+            ("Beta", None, "beta covers shipping and returns"),
+            ("Gamma", Some("gamma"), "gamma covers billing plans"),
+        ];
+        for (title, external_id, text) in docs {
+            let mut body = json!({ "title": title, "text": text });
+            if let Some(external_id) = external_id {
+                body["external_id"] = json!(external_id);
+            }
+            let reply = ingest(&kit, &a_key, body).await;
+            assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.body);
+        }
+
+        let list = get_source(&kit, &a_key, SOURCES).await;
+        assert_eq!(list.status, StatusCode::OK, "{}", list.body);
+        let items = list.body["sources"].as_array().expect("sources");
+        assert_eq!(items.len(), 3, "{}", list.body);
+        assert_eq!(list.body["next"], Value::Null, "{}", list.body);
+        let ids: Vec<&str> = items
+            .iter()
+            .map(|item| item["id"].as_str().expect("id"))
+            .collect();
+        assert!(
+            ids.windows(2).all(|pair| pair[0] < pair[1]),
+            "keyset order is id order: {ids:?}"
+        );
+
+        // The item shape, on the first item; then spot checks matched by
+        // title — id order is not ingest order within one millisecond.
+        let by_title = |probe: &str| {
+            items
+                .iter()
+                .find(|item| item["title"] == probe)
+                .expect("every listed source is one of the fixtures")
+        };
+        let item = &items[0];
+        for key in [
+            "id",
+            "title",
+            "origin",
+            "external_id",
+            "bytes",
+            "chunk_count",
+            "updated_at",
+        ] {
+            assert!(item.get(key).is_some(), "missing {key}: {item}");
+        }
+        assert_eq!(by_title("Alpha")["external_id"], "alpha");
+        assert_eq!(by_title("Alpha")["bytes"], "alpha covers refunds".len());
+        assert_eq!(by_title("Alpha")["chunk_count"], 1);
+        assert!(by_title("Beta")["external_id"].is_null());
+        assert!(
+            by_title("Gamma")["updated_at"]
+                .as_str()
+                .is_some_and(|ts| !ts.is_empty()),
+            "{}",
+            by_title("Gamma")
+        );
+
+        // Pagination: two pages over the same keyset order.
+        let page1 = get_source(&kit, &a_key, &format!("{SOURCES}?limit=2")).await;
+        assert_eq!(page1.body["sources"].as_array().expect("s").len(), 2);
+        assert_eq!(page1.body["next"], ids[1], "{}", page1.body);
+        let page2 = get_source(&kit, &a_key, &format!("{SOURCES}?limit=2&after={}", ids[1])).await;
+        let rest = page2.body["sources"].as_array().expect("s");
+        assert_eq!(rest.len(), 1, "{}", page2.body);
+        assert_eq!(rest[0]["id"], ids[2]);
+        assert_eq!(page2.body["next"], Value::Null, "{}", page2.body);
+        // The clamps: 0 becomes 1, 1000 becomes 100 (and 3 < 100 anyway).
+        let clamped = get_source(&kit, &a_key, &format!("{SOURCES}?limit=0")).await;
+        assert_eq!(clamped.body["sources"].as_array().expect("s").len(), 1);
+
+        // GET one matches the list item exactly.
+        let one = get_source(&kit, &a_key, &source_path(ids[0])).await;
+        assert_eq!(one.status, StatusCode::OK, "{}", one.body);
+        assert_eq!(one.body, items[0]);
+        let unknown = get_source(&kit, &a_key, &source_path("no-such-source")).await;
+        assert_eq!(unknown.status, StatusCode::NOT_FOUND, "{}", unknown.body);
+        assert_eq!(unknown.problem_type(), format!("{PROBLEMS}not-found"));
+
+        // Another tenant's ids do not exist here: not on GET, not on PUT,
+        // not on DELETE — and nothing of A's is touched either way.
+        let a_rows_before = chunk_rows_of(&kit, ids[0]);
+        let a_counts = || {
+            (
+                count_where(&kit, "sg_sources", &format!("tenant_id = '{a_id}'")),
+                count_where(&kit, "sg_chunks", &format!("tenant_id = '{a_id}'")),
+                count_where(&kit, "sg_postings", &format!("tenant_id = '{a_id}'")),
+            )
+        };
+        let counts_before = a_counts();
+        let foreign_get = get_source(&kit, &b_key, &source_path(ids[0])).await;
+        assert_eq!(foreign_get.status, StatusCode::NOT_FOUND);
+        let foreign_put = send(
+            &kit.router,
+            Method::PUT,
+            &source_path(ids[0]),
+            Some(&b_key),
+            Some(r#"{"text":"stolen contents"}"#),
+        )
+        .await;
+        assert_eq!(
+            foreign_put.status,
+            StatusCode::NOT_FOUND,
+            "{}",
+            foreign_put.body
+        );
+        let foreign_delete = send(
+            &kit.router,
+            Method::DELETE,
+            &source_path(ids[0]),
+            Some(&b_key),
+            None,
+        )
+        .await;
+        assert_eq!(foreign_delete.status, StatusCode::NOT_FOUND);
+        assert_eq!(a_counts(), counts_before, "a foreign id deletes nothing");
+        assert_eq!(chunk_rows_of(&kit, ids[0]), a_rows_before);
+
+        // B's own list is empty: listing is tenant-scoped too.
+        let b_list = get_source(&kit, &b_key, SOURCES).await;
+        assert_eq!(b_list.body["sources"].as_array().expect("s").len(), 0);
+        assert_eq!(b_list.body["next"], Value::Null);
+    }
+}
+
+#[pollster::test]
+async fn every_source_route_rate_limits_before_touching_the_store() {
+    for dialect in Dialect::available() {
+        // Minting the tenant goes through the limiter too, so the first
+        // decision lets it through; every source route after it is refused.
+        let limiter = FakeRateLimiter::scripted(
+            vec![Decision {
+                ok: true,
+                retry_after: None,
+                quota: None,
+            }],
+            Decision {
+                ok: false,
+                retry_after: Some(Duration::from_secs(3)),
+                quota: None,
+            },
+        );
+        let kit = TestHarness::with_database_and_ports(support(), dialect, |ports| {
+            ports.config = Arc::new(MapConfig::from_pairs([("ADMIN_TOKEN", ADMIN_TOKEN)]));
+            ports.rate_limiter = Some(Arc::new(limiter.clone()));
+        });
+        let tenant = mint_tenant(&kit, "Limited").await;
+        let minted = limiter.calls();
+        let api_key = body_str(&tenant, "api_key");
+        let missing = source_path("no-such-source");
+        let malformed = format!("{SOURCES}?limit=abc");
+
+        // Each route answers 429 before anything else — including before
+        // the 404s the unknown ids would earn, and before the query
+        // string is parsed, so a malformed `limit` is a 429 here too.
+        for (method, path, body) in [
+            (Method::POST, SOURCES, Some(r#"{"text":"hello world"}"#)),
+            (Method::GET, SOURCES, None),
+            (Method::GET, malformed.as_str(), None),
+            (Method::GET, missing.as_str(), None),
+            (Method::PUT, missing.as_str(), Some(r#"{"text":"hello"}"#)),
+            (Method::DELETE, missing.as_str(), None),
+        ] {
+            let reply = send(&kit.router, method.clone(), path, Some(&api_key), body).await;
+            assert_eq!(
+                reply.status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "{method} {path}: {}",
+                reply.body
+            );
+            assert_eq!(
+                reply
+                    .headers
+                    .get(header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+                Some("3"),
+                "{method} {path}"
+            );
+        }
+        assert_eq!(
+            limiter.calls() - minted,
+            6,
+            "one limiter check per request, reached every time"
+        );
+        assert_eq!(count_of(&kit, "sg_sources"), 0, "nothing was written");
     }
 }
