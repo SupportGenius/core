@@ -21,7 +21,10 @@ Resend; a Cloudflare Turnstile widget gates the site's form.
 
 The Worker also answers the daily cron (`23 4 * * *`, `[triggers]` in
 `wrangler.toml`): the waitlist module purges pending entries past its
-retention window and prunes expired mail-cooldown claims. The `#[event(scheduled)]`
+retention window and prunes expired mail-cooldown claims, and the support
+module's connectors re-sync their sources (issue #29; no per-connector
+scheduling to configure — every module's `scheduled` hook runs on the
+same trigger). The `#[event(scheduled)]`
 handler in `src/lib.rs` is the other half.
 
 ## Deploying (a human runs these)

@@ -3191,6 +3191,7 @@ dependencies = [
  "cratefield-core",
  "cratefield-runtime-native",
  "http",
+ "pollster",
  "supportgenius-composition",
  "tokio",
  "tracing",

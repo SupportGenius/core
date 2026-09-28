@@ -19,6 +19,15 @@
 //! curl -fsS http://127.0.0.1:8080/__health && curl -fsS http://127.0.0.1:8080/__ready
 //! ```
 //!
+//! Scheduled module work (issue #29's connector re-sync among it) runs
+//! off `CRONS`: comma-separated five-field cron expressions (UTC), the
+//! environment counterpart of a Worker's `[triggers] crons`. Each
+//! expression fans out to every module's `Module::scheduled` — an
+//! invalid entry fails the boot, not the schedule. Without `CRONS`,
+//! connector fetches still run at creation time (through `Defer`); they
+//! just wait for the next `POST` or a manually driven re-sync to
+//! re-check their sources.
+//!
 //! `--check-ready` runs the container health check (GET `/__ready`
 //! against the configured listen address, exit 0/1) — distroless ships
 //! no curl, so the binary checks itself.
