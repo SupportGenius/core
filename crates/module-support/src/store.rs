@@ -125,6 +125,18 @@ pub(crate) async fn insert_source_with_chunks(
     source: &SourceRow,
     chunks: &[Chunk],
 ) -> Result<(), DbError> {
+    let statements = source_with_chunks_statements(source, chunks);
+    db.batch_atomic(&statements).await
+}
+
+/// The statements [`insert_source_with_chunks`] executes, exposed so the
+/// upload extract job can land the source *and* its terminal upload
+/// update in one batch of its own — the upload must never go `extracted`
+/// without the source it claims to have produced.
+pub(crate) fn source_with_chunks_statements(
+    source: &SourceRow,
+    chunks: &[Chunk],
+) -> Vec<Statement> {
     let mut statements: Vec<Statement> = Vec::new();
 
     let mut insert_source = Query::insert();
@@ -200,7 +212,7 @@ pub(crate) async fn insert_source_with_chunks(
         statements.push(Statement::render(&insert_postings));
     }
 
-    db.batch_atomic(&statements).await
+    statements
 }
 
 /// Chunk count and mean document length for one tenant's index — the two
@@ -584,6 +596,370 @@ pub(crate) fn turn_statements(turn: &Turn) -> Vec<Statement> {
         ]);
 
     vec![conversation, Statement::render(&messages)]
+}
+
+// ---------------------------------------------------------------------------
+// Chunked uploads (issue #30). The part *bytes* live in the `Blob` port;
+// these rows carry only identity, sizes and state, so every statement
+// below stays in the portable table subset.
+// ---------------------------------------------------------------------------
+
+pub(crate) const UPLOAD_OPEN: &str = "open";
+pub(crate) const UPLOAD_COMPLETE: &str = "complete";
+pub(crate) const UPLOAD_EXTRACTED: &str = "extracted";
+pub(crate) const UPLOAD_FAILED: &str = "failed";
+
+pub(crate) struct UploadRow {
+    pub id: String,
+    pub tenant_id: String,
+    pub filename: String,
+    pub content_type: String,
+    pub declared_bytes: i64,
+    pub received_bytes: i64,
+    pub status: String,
+    pub source_id: Option<String>,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+}
+
+pub(crate) struct UploadPartRow {
+    pub n: i64,
+    pub bytes: i64,
+}
+
+fn upload_row(row: &cratefield_core::Row) -> Option<UploadRow> {
+    Some(UploadRow {
+        id: row.get("id")?,
+        tenant_id: row.get("tenant_id")?,
+        filename: row.get("filename")?,
+        content_type: row.get("content_type")?,
+        declared_bytes: row.get("declared_bytes")?,
+        received_bytes: row.get("received_bytes")?,
+        status: row.get("status")?,
+        source_id: row.get("source_id")?,
+        error: row.get("error")?,
+        created_at: row.get("created_at")?,
+        completed_at: row.get("completed_at")?,
+    })
+}
+
+pub(crate) async fn insert_upload(db: &dyn Database, upload: &UploadRow) -> Result<(), DbError> {
+    let mut insert = Query::insert();
+    insert
+        .into_table(iden("sg_uploads"))
+        .columns([
+            "id",
+            "tenant_id",
+            "filename",
+            "content_type",
+            "declared_bytes",
+            "received_bytes",
+            "status",
+            "source_id",
+            "error",
+            "created_at",
+            "completed_at",
+        ])
+        .values_panic([
+            upload.id.clone().into(),
+            upload.tenant_id.clone().into(),
+            upload.filename.clone().into(),
+            upload.content_type.clone().into(),
+            upload.declared_bytes.into(),
+            upload.received_bytes.into(),
+            upload.status.clone().into(),
+            upload.source_id.clone().into(),
+            upload.error.clone().into(),
+            upload.created_at.clone().into(),
+            upload.completed_at.clone().into(),
+        ]);
+    execute(db, &Statement::render(&insert)).await
+}
+
+/// The tenant's own upload — a row from another tenant is no row at all,
+/// the same convention as [`find_conversation`].
+pub(crate) async fn find_upload(
+    db: &dyn Database,
+    tenant_id: &str,
+    upload_id: &str,
+) -> Result<Option<UploadRow>, DbError> {
+    let mut select = Query::select();
+    select
+        .columns([
+            "id",
+            "tenant_id",
+            "filename",
+            "content_type",
+            "declared_bytes",
+            "received_bytes",
+            "status",
+            "source_id",
+            "error",
+            "created_at",
+            "completed_at",
+        ])
+        .from(iden("sg_uploads"))
+        .and_where(Expr::col(iden("id")).eq(upload_id))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id));
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows.rows.first().and_then(upload_row))
+}
+
+/// The tenant's retained upload storage in bytes: `declared_bytes` summed
+/// over uploads whose parts still exist (`open` and `complete`). A
+/// terminal upload ('extracted'/'failed') has had its part blobs deleted,
+/// so it no longer counts against the quota — the indexed `sg_sources`
+/// row an 'extracted' upload leaves behind is the index's business, not
+/// the upload quota's.
+pub(crate) async fn tenant_retained_upload_bytes(
+    db: &dyn Database,
+    tenant_id: &str,
+) -> Result<i64, DbError> {
+    let mut select = Query::select();
+    select
+        .expr_as(
+            Func::coalesce(vec![
+                Func::sum(Expr::col(iden("declared_bytes"))).into(),
+                Expr::value(0_i64),
+            ]),
+            Alias::new("retained"),
+        )
+        .from(iden("sg_uploads"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(
+            Expr::col(iden("status")).is_in([UPLOAD_OPEN.to_owned(), UPLOAD_COMPLETE.to_owned()]),
+        );
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows
+        .rows
+        .first()
+        .and_then(|row| row.get::<i64>("retained"))
+        .unwrap_or(0))
+}
+
+/// Stores (or, on a re-`PUT`, replaces) one part's size row. `ON CONFLICT
+/// … DO UPDATE` is the one upsert form SQLite and Postgres agree on.
+pub(crate) async fn upsert_upload_part(
+    db: &dyn Database,
+    upload_id: &str,
+    n: i64,
+    bytes: i64,
+) -> Result<(), DbError> {
+    let mut insert = Query::insert();
+    insert
+        .into_table(iden("sg_upload_parts"))
+        .columns(["upload_id", "n", "bytes"])
+        .values_panic([upload_id.into(), n.into(), bytes.into()])
+        .on_conflict(
+            OnConflict::columns([iden("upload_id"), iden("n")])
+                .update_column(iden("bytes"))
+                .to_owned(),
+        );
+    execute(db, &Statement::render(&insert)).await
+}
+
+/// `UPDATE sg_uploads SET received_bytes = ?` — the progress the GET
+/// upload route reports between parts. `complete` writes the
+/// authoritative total in its own guarded statement, so this is
+/// bookkeeping only.
+pub(crate) async fn set_upload_received(
+    db: &dyn Database,
+    upload_id: &str,
+    received_bytes: i64,
+) -> Result<(), DbError> {
+    let mut update = Query::update();
+    update
+        .table(iden("sg_uploads"))
+        .values([(iden("received_bytes"), received_bytes.into())])
+        .and_where(Expr::col(iden("id")).eq(upload_id));
+    execute(db, &Statement::render(&update)).await
+}
+
+/// The upload's parts in ordinal order. The extract job and `complete`
+/// both derive contiguity and the running total from this list.
+pub(crate) async fn upload_parts(
+    db: &dyn Database,
+    upload_id: &str,
+) -> Result<Vec<UploadPartRow>, DbError> {
+    let mut select = Query::select();
+    select
+        .columns(["n", "bytes"])
+        .from(iden("sg_upload_parts"))
+        .and_where(Expr::col(iden("upload_id")).eq(upload_id))
+        .order_by(iden("n"), sea_query::Order::Asc);
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows
+        .rows
+        .iter()
+        .filter_map(|row| {
+            Some(UploadPartRow {
+                n: row.get("n")?,
+                bytes: row.get("bytes")?,
+            })
+        })
+        .collect())
+}
+
+/// `UPDATE sg_uploads SET status = 'complete', …` for
+/// `POST /uploads/{id}/complete`, guarded on the upload still being
+/// `open` so a collected upload is never flipped back. The outbox insert
+/// that pairs with it is the caller's; the job id is derived from the
+/// upload id (see `uploads::extract_job_id`), so a duplicate `complete`
+/// loses to the outbox's primary key instead of enqueueing a second
+/// extract.
+pub(crate) fn close_upload_stmt(
+    upload_id: &str,
+    received_bytes: i64,
+    completed_at: &str,
+) -> Statement {
+    let mut update = Query::update();
+    update
+        .table(iden("sg_uploads"))
+        .values([
+            (iden("status"), UPLOAD_COMPLETE.into()),
+            (iden("received_bytes"), received_bytes.into()),
+            (iden("completed_at"), completed_at.into()),
+        ])
+        .and_where(Expr::col(iden("id")).eq(upload_id))
+        .and_where(Expr::col(iden("status")).eq(UPLOAD_OPEN));
+    Statement::render(&update)
+}
+
+/// The write that ends an extract job: the upload's terminal status, the
+/// deletion of its part rows, and the retirement of the finished outbox
+/// job — one batch, so an upload is never left half-decided. The part
+/// *blobs* are deleted after the batch commits (see `uploads`), never
+/// inside it — a blob write cannot join a database transaction.
+pub(crate) enum UploadOutcome {
+    /// The extract job indexed the document.
+    Extracted {
+        upload_id: String,
+        source_id: String,
+        completed_at: String,
+    },
+    /// The extract job could not read the document; `error` says why.
+    Failed {
+        upload_id: String,
+        error: String,
+        completed_at: String,
+    },
+}
+
+impl UploadOutcome {
+    /// `UPDATE sg_uploads …` for this outcome.
+    fn statement(&self) -> Statement {
+        let (upload_id, values) = match self {
+            Self::Extracted {
+                upload_id,
+                source_id,
+                completed_at,
+            } => (
+                upload_id,
+                [
+                    (iden("status"), UPLOAD_EXTRACTED.into()),
+                    (iden("source_id"), source_id.clone().into()),
+                    (iden("error"), Option::<String>::None.into()),
+                    (iden("completed_at"), completed_at.clone().into()),
+                ],
+            ),
+            Self::Failed {
+                upload_id,
+                error,
+                completed_at,
+            } => (
+                upload_id,
+                [
+                    (iden("status"), UPLOAD_FAILED.into()),
+                    (iden("source_id"), Option::<String>::None.into()),
+                    (iden("error"), error.clone().into()),
+                    (iden("completed_at"), completed_at.clone().into()),
+                ],
+            ),
+        };
+        let mut update = Query::update();
+        update
+            .table(iden("sg_uploads"))
+            .values(values)
+            .and_where(Expr::col(iden("id")).eq(upload_id.as_str()));
+        Statement::render(&update)
+    }
+}
+
+/// `DELETE FROM sg_upload_parts WHERE upload_id = ?`.
+pub(crate) fn delete_upload_parts_stmt(upload_id: &str) -> Statement {
+    let mut delete = Query::delete();
+    delete
+        .from_table(iden("sg_upload_parts"))
+        .and_where(Expr::col(iden("upload_id")).eq(upload_id));
+    Statement::render(&delete)
+}
+
+/// `DELETE FROM sg_support_outbox WHERE id = ?` — the same write
+/// `Outbox::complete` runs, as a statement so the extract job's terminal
+/// batch can retire it atomically with the upload's status change.
+pub(crate) fn complete_outbox_stmt(job_id: &str) -> Statement {
+    let mut delete = Query::delete();
+    delete
+        .from_table(iden(crate::uploads::OUTBOX_TABLE))
+        .and_where(Expr::col(iden("id")).eq(job_id));
+    Statement::render(&delete)
+}
+
+/// The statements that make an upload terminal (rows only; blobs after).
+pub(crate) fn upload_outcome_statements(outcome: &UploadOutcome, job_id: &str) -> Vec<Statement> {
+    let upload_id = match outcome {
+        UploadOutcome::Extracted { upload_id, .. } | UploadOutcome::Failed { upload_id, .. } => {
+            upload_id
+        }
+    };
+    vec![
+        outcome.statement(),
+        delete_upload_parts_stmt(upload_id),
+        complete_outbox_stmt(job_id),
+    ]
+}
+
+/// Open uploads created before `cutoff` — the cron GC's work list.
+pub(crate) async fn open_uploads_before(
+    db: &dyn Database,
+    cutoff: &str,
+) -> Result<Vec<UploadRow>, DbError> {
+    let mut select = Query::select();
+    select
+        .columns([
+            "id",
+            "tenant_id",
+            "filename",
+            "content_type",
+            "declared_bytes",
+            "received_bytes",
+            "status",
+            "source_id",
+            "error",
+            "created_at",
+            "completed_at",
+        ])
+        .from(iden("sg_uploads"))
+        .and_where(Expr::col(iden("status")).eq(UPLOAD_OPEN))
+        .and_where(Expr::col(iden("created_at")).lt(cutoff));
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows.rows.iter().filter_map(upload_row).collect())
+}
+
+/// The statements that forget an upload and its parts. The part blobs are
+/// deleted before this batch commits, so a row that survives names no
+/// blob storage and a blob that survives (a delete that failed) names no
+/// row — see `uploads::gc_abandoned`.
+pub(crate) fn delete_upload_statements(upload_id: &str) -> Vec<Statement> {
+    let mut delete = Query::delete();
+    delete
+        .from_table(iden("sg_uploads"))
+        .and_where(Expr::col(iden("id")).eq(upload_id));
+    vec![
+        delete_upload_parts_stmt(upload_id),
+        Statement::render(&delete),
+    ]
 }
 
 /// ISO-8601 (RFC 3339) from a `Clock` port reading — timestamps are bound

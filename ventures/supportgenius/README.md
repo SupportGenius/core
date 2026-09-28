@@ -21,8 +21,10 @@ Resend; a Cloudflare Turnstile widget gates the site's form.
 
 The Worker also answers the daily cron (`23 4 * * *`, `[triggers]` in
 `wrangler.toml`): the waitlist module purges pending entries past its
-retention window and prunes expired mail-cooldown claims. The `#[event(scheduled)]`
-handler in `src/lib.rs` is the other half.
+retention window and prunes expired mail-cooldown claims; the support
+module drains any leftover upload `extract` jobs and collects uploads
+abandoned before completion. The `#[event(scheduled)]` handler in
+`src/lib.rs` is the other half.
 
 ## Deploying (a human runs these)
 
@@ -30,7 +32,10 @@ handler in `src/lib.rs` is the other half.
 2. Paste the returned database UUID into `database_id` in `wrangler.toml`
    (it currently holds an obvious `REPLACE_ME...` placeholder; deploys
    fail until it is replaced).
-3. Set the secrets — each with `npx wrangler secret put <NAME>`:
+3. `npx wrangler r2 bucket create supportgenius-uploads` — the bucket the
+   chunked-upload routes (`POST /v1/support/uploads`) store document
+   parts in, bound as `BLOB` in `wrangler.toml`.
+4. Set the secrets — each with `npx wrangler secret put <NAME>`:
    - `HARNESS_SECRET` (required, at least 32 bytes; backs the harness
      `Signer` port),
    - `RESEND_API_KEY` (required; the join endpoint fails loudly without
@@ -38,10 +43,10 @@ handler in `src/lib.rs` is the other half.
    - `TURNSTILE_SECRET` (required for production traffic; without it no
      captcha is mounted),
    - `ADMIN_TOKEN` (optional; gates the admin CSV export).
-4. `npx worker-build --release` (or let `wrangler deploy` run it via
+5. `npx worker-build --release` (or let `wrangler deploy` run it via
    `[build]`) and confirm `build/worker/shim.mjs` appears.
-5. `npx wrangler d1 migrations apply supportgenius --remote`
-6. `npx wrangler deploy`
+6. `npx wrangler d1 migrations apply supportgenius --remote`
+7. `npx wrangler deploy`
 
 ## The site's half
 

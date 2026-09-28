@@ -24,18 +24,22 @@ use crate::bm25;
 use crate::chunk::{Chunker, tokenize};
 use crate::messages;
 use crate::store::{self, ApiKeyRow, ChunkRow, STATUS_ACTIVE, SourceRow, TenantRow};
+use crate::uploads;
 
-/// The inline `text` ceiling for `POST /sources`. Not arbitrary: `/v1/*`
-/// request bodies are already capped at 64 KiB
-/// (`cratefield_core::MAX_BODY_BYTES`), and `Blob::signed_url` is
-/// GET-only, so there is no presigned upload path a larger document could
-/// arrive through. 48 KiB keeps a maximal document inside a maximal
-/// request with room for the rest of the JSON.
+/// The inline `text` ceiling for `POST /sources`, and one part's ceiling
+/// for the chunked-upload routes (`uploads::PART_BYTES`). Not arbitrary:
+/// `/v1/*` request bodies are already capped at 64 KiB
+/// (`cratefield_core::MAX_BODY_BYTES`) and `Blob::signed_url` is GET-only,
+/// so the only way a larger document arrives is as upload parts, one
+/// request each. 48 KiB keeps a maximal document — or part — inside a
+/// maximal request with room for the rest of the JSON.
 pub(crate) const MAX_TEXT_BYTES: usize = 48 * 1024;
 
 /// Tenant display name ceiling, in bytes of UTF-8. A name is prose for a
-/// dashboard, not a document; anything past this is a mistake.
-const MAX_NAME_BYTES: usize = 200;
+/// dashboard, not a document; anything past this is a mistake. The
+/// upload routes borrow it for `filename` (a document's name is prose
+/// for a search hit, not a path).
+pub(crate) const MAX_NAME_BYTES: usize = 200;
 
 /// `limit` handling for `GET /search`: default 10, hard range 1..=50.
 const DEFAULT_LIMIT: u32 = 10;
@@ -75,6 +79,13 @@ pub(crate) fn router(
             put(messages::put_settings),
         )
         .route("/sources", post(ingest_source))
+        .route("/uploads", post(uploads::create_upload))
+        .route("/uploads/{upload_id}/parts/{n}", put(uploads::put_part))
+        .route(
+            "/uploads/{upload_id}/complete",
+            post(uploads::complete_upload),
+        )
+        .route("/uploads/{upload_id}", get(uploads::get_upload))
         .route("/search", get(search))
         .route("/messages", post(messages::post_message))
         .with_state(state)
@@ -334,7 +345,7 @@ async fn ingest_source(
 
 /// Title fallback: an absent or whitespace title becomes `Untitled`,
 /// which is what a result list should say rather than an empty string.
-fn clean_title(raw: Option<String>) -> String {
+pub(crate) fn clean_title(raw: Option<String>) -> String {
     match raw {
         Some(title) => {
             let trimmed = title.trim();
@@ -385,7 +396,7 @@ async fn fetch_text(http: &dyn HttpClient, url: &str) -> Result<String, Problem>
 /// set of entities that survive in prose, and collapses whitespace. It
 /// makes no attempt at structure, semantics or completeness — a page it
 /// mangles still indexes, just badly.
-fn html_to_text(html: &str) -> String {
+pub(crate) fn html_to_text(html: &str) -> String {
     let scripts_dropped = drop_block(html, "<script", "</script>");
     let blocks_dropped = drop_block(&scripts_dropped, "<style", "</style>");
     let without_tags = strip_tags(&blocks_dropped);
