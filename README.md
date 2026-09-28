@@ -26,7 +26,12 @@ decision (ADR 0013). The site README still says it is "to live in
 `SupportGenius/waitlist-backend`" — that line predates the decision, is
 superseded by it, and needs correcting in the site repository.
 
-Two ports this needs do not exist in the harness yet and are being added
-there: `TextModel` and `Tracker`. Those are the first blockers.
+The two ports this needs — `TextModel` and `Tracker` — exist in
+`cratefield-core` 0.5 (harness rev `b50c1d9`): `module-escalation`
+requires both, `module-support` takes the model as optional and degrades
+`POST /v1/support/messages` to `503 text-model-not-configured` without
+one. Until core "0.6" publishes to crates.io (Cratefield/harness#558),
+the whole `cratefield-*` set is pinned to that one git rev — see the
+comment in `Cargo.toml`.
 
 A [Factory Zero](https://factory0.ventures) venture.

@@ -2,12 +2,8 @@
 //! model, checked by an independent one, filed by a router, followed up
 //! until it closes (issue #4, `/workspace/README.md`).
 //!
-//! The crate is four layers:
+//! The crate is three layers:
 //!
-//! - [`ports`] mirrors the `TextModel` and `Tracker` traits the pipeline
-//!   is written against (with the `testing` fakes behind the feature
-//!   gate) — core 0.4.3 publishes no such ports, so until it does they
-//!   live here and move when it does.
 //! - [`model`] is the stage/status vocabulary and the two JSON schemas;
 //!   [`store`] is the sea-query data access; [`intake`] is the
 //!   cross-module handoff that turns a conversation into statements the
@@ -31,17 +27,19 @@ mod pipeline;
 pub mod error;
 pub mod intake;
 pub mod model;
-pub mod ports;
 pub mod store;
 
 pub use error::Error;
 pub use intake::{Handoff, Intake};
 pub use pipeline::{Pipeline, RetryPolicy};
 
-/// Fake [`crate::ports::text_model::TextModel`] and
-/// [`crate::ports::tracker::Tracker`] doubles for tests. Behind the
-/// `testing` feature so the Worker build never carries them; `tests/`
-/// enable it through the crate's self dev-dependency.
+/// Test doubles the published fakes do not cover: a seeded in-memory
+/// [`cratefield_core::Config`] and a clock a test can move forward. The
+/// `TextModel`/`Tracker` doubles themselves are
+/// `cratefield_testing::{FakeTextModel, FakeTracker}` — the port and its
+/// fake publish together, so nothing is mirrored here. Behind the
+/// `testing` feature so the Worker build never carries test doubles;
+/// `tests/` enable it through the crate's self dev-dependency.
 #[cfg(feature = "testing")]
 pub mod testing;
 
@@ -67,87 +65,45 @@ use crate::intake::OUTBOX_TABLE;
 
 /// The SupportGenius escalation module (issue #4).
 ///
-/// Construct it with the two ports the published harness does not have
-/// yet, register it with the harness, and let [`Module::scheduled`] drain
-/// the outbox on cron. The conversation enters through
-/// [`Escalation::intake`], whose statements the caller commits with its
-/// own write; everything after that is the [`Pipeline`], driven by cron:
+/// Register it with the harness and let [`Module::scheduled`] drain the
+/// outbox on cron. The conversation enters through [`Escalation::intake`],
+/// whose statements the caller commits with its own write; everything
+/// after that is the [`Pipeline`], driven by cron. The two ports the
+/// pipeline cannot run without — `TextModel` and `Tracker` — are not
+/// passed here at all: the module requires them, and the harness hands
+/// them to every stage through the runtime's
+/// [`Ports`](cratefield_core::Ports):
 ///
 /// ```no_run
-/// use std::sync::Arc;
-///
 /// use cratefield_core::Module as _;
 /// use module_escalation::Escalation;
 ///
-/// # struct MyModel;
-/// #[async_trait::async_trait]
-/// impl module_escalation::ports::text_model::TextModel for MyModel {
-///     async fn complete(
-///         &self,
-///         _prompt: &module_escalation::ports::text_model::Prompt,
-///     ) -> Result<
-///         module_escalation::ports::text_model::Completion,
-///         module_escalation::ports::text_model::TextModelError,
-///     > {
-///         unimplemented!("your model adapter")
-///     }
-/// }
-/// # struct MyTracker;
-/// #[async_trait::async_trait]
-/// impl module_escalation::ports::tracker::Tracker for MyTracker {
-///     async fn file(
-///         &self,
-///         _dest: &module_escalation::ports::tracker::Destination,
-///         _cred: &module_escalation::ports::tracker::Credential,
-///         _draft: &module_escalation::ports::tracker::TicketDraft,
-///     ) -> Result<
-///         module_escalation::ports::tracker::Filed,
-///         module_escalation::ports::tracker::TrackerError,
-///     > {
-///         unimplemented!("your tracker adapter")
-///     }
-///     async fn status(
-///         &self,
-///         _dest: &module_escalation::ports::tracker::Destination,
-///         _cred: &module_escalation::ports::tracker::Credential,
-///         _external_id: &str,
-///     ) -> Result<
-///         module_escalation::ports::tracker::TicketStatus,
-///         module_escalation::ports::tracker::TrackerError,
-///     > {
-///         unimplemented!("your tracker adapter")
-///     }
-/// }
-///
-/// let module = Escalation::new(Arc::new(MyModel), Arc::new(MyTracker));
+/// let module = Escalation::new();
 /// assert_eq!(module.name(), "escalation");
+/// // requires() names what the runtime must provide before build():
+/// assert_eq!(
+///     module.requires(),
+///     &[
+///         cratefield_core::Port::Db,
+///         cratefield_core::Port::TextModel,
+///         cratefield_core::Port::Tracker,
+///     ]
+/// );
 /// ```
-#[derive(Clone)]
-pub struct Escalation {
-    model: Arc<dyn TextModel>,
-    tracker: Arc<dyn Tracker>,
-}
-
-use crate::ports::text_model::TextModel;
-use crate::ports::tracker::Tracker;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Escalation;
 
 impl Escalation {
     /// The module's name as the harness mounts it (`/v1/escalation`).
     pub const NAME: &'static str = "escalation";
 
-    /// Builds the module over the two ports the pipeline cannot run
-    /// without.
-    ///
-    /// **These arrive through the module's own constructor, not through
-    /// [`ModuleContext::ports`](cratefield_core::Ports)**, because
-    /// `cratefield-core` 0.4.3's [`Port`] enum has no `TextModel` or
-    /// `Tracker` variant to require or resolve — they are mirrored in
-    /// [`crate::ports`] for exactly that reason. When core publishes the
-    /// two ports, both move: the mirror is deleted, the fields become
-    /// `ctx.ports` resolutions, and this constructor loses its arguments.
+    /// Builds the module. It carries no state: the pipeline's ports are
+    /// resolved per drain from the runtime's
+    /// [`Ports`](cratefield_core::Ports), so one instance can serve any
+    /// number of harnesses.
     #[must_use]
-    pub fn new(model: Arc<dyn TextModel>, tracker: Arc<dyn Tracker>) -> Self {
-        Self { model, tracker }
+    pub fn new() -> Self {
+        Self
     }
 
     /// The conversation → first-outbox-row handoff.
@@ -170,14 +126,15 @@ impl Module for Escalation {
         env!("CARGO_PKG_VERSION")
     }
 
-    /// The one port that exists to require. The pipeline's other inputs
-    /// cannot be declared here yet: `TextModel` and `Tracker` have no
-    /// [`Port`] variant in published core (see [`Escalation::new`]), so
-    /// they arrive through the module constructor instead — a real gap in
-    /// the harness's port list, tracked by the issue, not a choice to
-    /// hide a dependency.
+    /// Everything the pipeline cannot run without: the database the
+    /// outbox lives in, the model that drafts and judges, and the tracker
+    /// the draft is filed into. Declaring the last two means
+    /// [`cratefield_core::HarnessBuilder::build`] refuses a composition
+    /// that forgets them with "module `escalation` requires port … which
+    /// the runtime does not provide" at startup, instead of the first
+    /// cron tick finding a `None` and silently draining nothing.
     fn requires(&self) -> &'static [Port] {
-        &[Port::Db]
+        &[Port::Db, Port::TextModel, Port::Tracker]
     }
 
     /// `Mailer` delivers the notify stage's message; `Clock` and `IdGen`
@@ -359,6 +316,14 @@ impl Module for Escalation {
                 // always resolves it; a test harness may not.
                 return Ok(());
             };
+            // Same for the two ports build() also refuses to compose
+            // without. `None` here means a hand-rolled context skipped
+            // them; draining nothing beats panicking a cron tick.
+            let (Some(model), Some(tracker)) =
+                (ctx.ports.text_model.clone(), ctx.ports.tracker.clone())
+            else {
+                return Ok(());
+            };
             let clock = ctx
                 .ports
                 .clock
@@ -381,8 +346,8 @@ impl Module for Escalation {
 
             let pipeline = Pipeline::new(
                 db,
-                self.model.clone(),
-                self.tracker.clone(),
+                model,
+                tracker,
                 ctx.ports.mailer.clone(),
                 ctx.ports.config.clone(),
                 clock,
@@ -408,25 +373,10 @@ impl Module for Escalation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::text_model::ModelTier;
-    use crate::ports::tracker::Filed;
-    use crate::testing::{FakeTextModel, FakeTracker};
     use cratefield_core::{EmptyConfig, MapConfig};
 
     fn module() -> Escalation {
-        Escalation::new(
-            Arc::new(FakeTextModel::json(
-                ModelTier::Fast,
-                serde_json::json!({
-                    "title": "t", "repro_steps": [], "expected": "e", "actual": "a",
-                    "severity": "info",
-                }),
-            )),
-            Arc::new(FakeTracker::accepting(Filed {
-                external_id: "ext-1".to_owned(),
-                url: "https://tracker.test/ext-1".to_owned(),
-            })),
-        )
+        Escalation::new()
     }
 
     #[test]
@@ -434,7 +384,10 @@ mod tests {
         let module = module();
         assert_eq!(module.name(), "escalation");
         assert_eq!(module.version(), env!("CARGO_PKG_VERSION"));
-        assert_eq!(module.requires(), &[Port::Db]);
+        assert_eq!(
+            module.requires(),
+            &[Port::Db, Port::TextModel, Port::Tracker]
+        );
         assert!(module.optional().contains(&Port::Mailer));
         let tables = module.tables();
         assert_eq!(tables.len(), 5);

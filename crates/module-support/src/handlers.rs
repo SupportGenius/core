@@ -16,10 +16,9 @@ use std::sync::Arc;
 
 use cratefield_core::{
     Clock, Database, HttpClient, IdGen, Json, ModuleConfig, ModuleContext, Problem, ProblemDef,
-    RateLimit, RateLimitFailure, Scope, Signer, check_rate_limit, rate_limited, require_admin,
+    RateLimit, RateLimitFailure, Scope, Signer, TextModel, check_rate_limit, rate_limited,
+    require_admin,
 };
-
-use text_model::TextModel;
 
 use crate::bm25;
 use crate::chunk::{Chunker, tokenize};
@@ -157,14 +156,14 @@ pub(crate) async fn authenticate(
 /// `Some` is the 429 response the handler returns verbatim.
 pub(crate) async fn guard_rate_limit(ctx: &ModuleContext, tenant_id: &str) -> Option<Response> {
     let keys = [format!("support:{tenant_id}")];
-    if let RateLimit::Denied { retry_after } = check_rate_limit(
+    if let RateLimit::Denied { decision } = check_rate_limit(
         ctx.ports.rate_limiter.as_ref(),
         &keys,
         RateLimitFailure::FailClosed,
     )
     .await
     {
-        return Some(rate_limited(retry_after));
+        return Some(rate_limited(&decision));
     }
     None
 }

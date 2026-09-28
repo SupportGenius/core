@@ -7,10 +7,10 @@
 # database, then asserts the health endpoints, the waitlist endpoint, the
 # single boot-time REDIS_URL notice, and that --check-ready agrees with
 # the live server. Works against either build variant — the plain or the
-# dev-fakes build — with the expected waitlist status depending on whether
-# a Captcha port is mounted (202 for a dev-fakes join, the documented 503
-# mail-not-configured from the plain build). Exits non-zero on the first
-# failed assertion.
+# dev-fakes build — and both must answer a valid join with the same
+# `202 {"ok":true}`: the dev-fakes build sends the confirm mail through
+# its stub mailer, the plain build writes the row and defers the mail it
+# cannot send. Exits non-zero on the first failed assertion.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -147,31 +147,17 @@ WAITLIST_RESP="$(curl -s -w $'\n%{http_code}' -X POST -H 'Content-Type: applicat
   -d "$WAITLIST_PAYLOAD" "$BASE_URL/v1/waitlist")" || WAITLIST_RESP=$'\n000'
 WAITLIST_STATUS="${WAITLIST_RESP##*$'\n'}"
 WAITLIST_BODY="${WAITLIST_RESP%$'\n'*}"
-case "$CAPTCHA_STATE" in
-  configured)
-    # Dev fakes: StubMailer reports Sent, so the join must genuinely
-    # succeed — exactly `202 Accepted` with {"ok":true} (the waitlist
-    # module's `accepted()`).
-    [ "$WAITLIST_STATUS" = "202" ] ||
-      fail "POST /v1/waitlist returned $WAITLIST_STATUS, expected exactly 202 with dev fakes active; got: $WAITLIST_BODY"
-    printf '%s' "$WAITLIST_BODY" | grep -q '"ok"[[:space:]]*:[[:space:]]*true' ||
-      fail "POST /v1/waitlist answered $WAITLIST_STATUS but not {\"ok\":true}; got: $WAITLIST_BODY"
-    ;;
-  absent)
-    # Plain build (no dev-fakes feature — what CI's native job builds and
-    # release.yml ships): no Captcha port, and Development env lets the
-    # join pass the human-form gate. Mail is then sent BEFORE the row is
-    # written (waitlist handlers.rs `join`), and the keyless Resend
-    # adapter reports NotConfigured without a network call; the venture
-    # refuses to fake a send, so the documented, correct answer is
-    # exactly `503` carrying the `mail-not-configured` problem (core
-    # problems.rs maps that slug to SERVICE_UNAVAILABLE).
-    [ "$WAITLIST_STATUS" = "503" ] ||
-      fail "POST /v1/waitlist returned $WAITLIST_STATUS, expected exactly 503 mail-not-configured without dev fakes; got: $WAITLIST_BODY"
-    printf '%s' "$WAITLIST_BODY" | grep -q 'problems/mail-not-configured' ||
-      fail "POST /v1/waitlist answered 503 but not the mail-not-configured problem; got: $WAITLIST_BODY"
-    ;;
-esac
+# Both build variants must answer exactly `202 Accepted` with {"ok":true}
+# (the waitlist module's `accepted()`), for different reasons: the
+# dev-fakes build's StubMailer reports Sent, so the join genuinely
+# succeeds; the plain build has no Mailer at all, and the pinned waitlist
+# writes the row first and defers the confirm mail through the Defer port
+# AFTER the response (harness crates/module-waitlist `join`) — a
+# mailer-less join still succeeds, and only the log carries the ERROR.
+[ "$WAITLIST_STATUS" = "202" ] ||
+  fail "POST /v1/waitlist returned $WAITLIST_STATUS, expected exactly 202; got: $WAITLIST_BODY"
+printf '%s' "$WAITLIST_BODY" | grep -q '"ok"[[:space:]]*:[[:space:]]*true' ||
+  fail "POST /v1/waitlist answered $WAITLIST_STATUS but not {\"ok\":true}; got: $WAITLIST_BODY"
 echo "   POST /v1/waitlist -> $WAITLIST_STATUS (Captcha port: $CAPTCHA_STATE)"
 
 # The support module (source ingest + message reply, issues #2 and #3) is not

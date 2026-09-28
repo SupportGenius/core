@@ -17,9 +17,11 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use text_model::{Completion, ModelTier, Prompt, TextModel, TextModelError};
 
-use cratefield_core::{Clock, Database, IdGen, Json, Problem, ProblemDef, Scope, require_admin};
+use cratefield_core::{
+    Clock, Completion, Database, IdGen, Json, ModelTier, Problem, ProblemDef, Prompt, Scope,
+    TextModel, TextModelError, require_admin,
+};
 
 use crate::answer::{self, DEFAULT_ANSWER_THRESHOLD, ModelReply, Outcome};
 use crate::handlers::{

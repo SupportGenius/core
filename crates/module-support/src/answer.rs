@@ -5,7 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use text_model::Completion;
+
+use cratefield_core::Completion;
 
 /// The answer threshold that applies when a tenant has not stored one:
 /// `answered` needs a model confidence of at least this. Override it per
@@ -226,7 +227,7 @@ mod tests {
         MAX_CLARIFY_TURNS, ModelCitation, ModelReply, Outcome, confidence_pct, decide, parse_reply,
         pct_confidence, pct_confidence_f64, reply_schema,
     };
-    use text_model::Completion;
+    use cratefield_core::Completion;
 
     fn reply(answer: &str, citations: &[&str], confidence: f32) -> ModelReply {
         ModelReply {

@@ -1,16 +1,13 @@
-//! The crate's error type: one enum over the database, the mirrored
-//! `TextModel`/`Tracker` ports, the published `Mailer` port and local
-//! decoding, with [`Error::is_retryable`] so a stage can decide between
+//! The crate's error type: one enum over the database, the `TextModel`/
+//! `Tracker` ports, the `Mailer` port and local decoding, with
+//! [`Error::is_retryable`] so a stage can decide between
 //! `retry_later` (transient — the outbox will re-deliver) and a terminal
 //! outcome (the ticket moves on without the work having succeeded).
 
 use std::time::Duration;
 
-use cratefield_core::DbError;
+use cratefield_core::{DbError, TextModelError, TrackerError};
 use thiserror::Error;
-
-use crate::ports::text_model::TextModelError;
-use crate::ports::tracker::TrackerError;
 
 /// Everything that can fail between intake and notification.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -20,17 +17,15 @@ pub enum Error {
     /// transient by [`Error::is_retryable`] — the outbox redelivers.
     #[error("database failure: {0}")]
     Db(#[from] DbError),
-    /// The [`crate::ports::text_model::TextModel`] refused or could not
-    /// complete a prompt.
+    /// The [`cratefield_core::TextModel`] refused or could not complete a
+    /// prompt.
     #[error("text model failure: {0}")]
     Model(#[from] TextModelError),
-    /// The [`crate::ports::tracker::Tracker`] refused or could not file a
+    /// The [`cratefield_core::Tracker`] refused or could not file a
     /// ticket.
     #[error("tracker failure: {0}")]
     Tracker(#[from] TrackerError),
-    /// The [`cratefield_core::Mailer`] failed on the notify stage. (Core
-    /// 0.4.3 does publish the mail port, unlike the mirrored model/tracker
-    /// pair, so this variant wraps the real type.)
+    /// The [`cratefield_core::Mailer`] failed on the notify stage.
     #[error("mail failure: {0}")]
     Mail(#[from] cratefield_core::MailError),
     /// A stored value did not decode: a payload, event detail or
@@ -98,8 +93,6 @@ impl Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::text_model::TextModelError;
-    use crate::ports::tracker::TrackerError;
 
     #[test]
     fn transient_port_failures_are_retryable_and_terminal_ones_are_not() {

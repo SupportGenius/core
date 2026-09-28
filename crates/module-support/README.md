@@ -72,15 +72,18 @@ has answered and the turn has been decided.
 
 | Failure | Response |
 | --- | --- |
-| No model given to `Support::new().text_model(..)`, or the model reports `NotConfigured` | `503 text-model-not-configured` |
+| No `TextModel` port in the runtime `Ports`, or the model reports `NotConfigured` | `503 text-model-not-configured` |
 | `Transient` | `503 text-model-unavailable`, with `Retry-After` (the provider's pause, else 2 s) |
 | Refused, transport failure, unparseable or wrong-shape reply | `502 text-model-invalid-answer` |
 | Unknown or another tenant's `conversation_id` | `404`, before the model is called |
 | Empty or over 4000-character message | `400 validation-failed` |
 
-The model is wired with `Support::new().text_model(Arc<dyn TextModel>)`.
-The port is the shared `text-model` crate, a local mirror of the harness
-port until core publishes one.
+The model arrives through the runtime's `Ports`
+(`Port::TextModel`, declared optional): the harness hands whatever it
+resolved to the module's router, and nothing about the model is passed
+through a builder. It is the `TextModel` port of `cratefield-core`,
+pinned by the workspace's single `cratefield-*` git rev (see the root
+`Cargo.toml`).
 
 ## Retrieval, and its constraints on purpose
 

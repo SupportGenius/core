@@ -12,17 +12,17 @@ repository.workspace = true
 workspace = true
 
 [features]
-# The fake `TextModel`/`Tracker` doubles (src/testing.rs) are off by
-# default so the Worker build never carries them; integration tests turn
-# the feature on through the self dev-dependency below.
-testing = ["text-model/testing"]
+# The module-local doubles (src/testing.rs: `FakeConfig` and
+# `SettableClock`; the `TextModel`/`Tracker` doubles come from
+# `cratefield_testing`) are off by default so the Worker build never
+# carries them; integration tests turn the feature on through the self
+# dev-dependency below.
+testing = []
 
 [dependencies]
-# The shared `TextModel` port mirror (re-exported as `ports::text_model`)
-# and, under `testing`, its `FakeTextModel`.
-text-model = { path = "../text-model" }
-# The ports, the store (`Database`/`Statement`/`Outbox`/`Clock`/`IdGen`),
-# and `scrub_text` for the mirrored error `Display`s.
+# The ports (`TextModel`/`Tracker` included), the store
+# (`Database`/`Statement`/`Outbox`/`Clock`/`IdGen`), and `scrub_text` for
+# the error `Display`s.
 cratefield-core = { workspace = true }
 # `Module::router` returns an `axum::Router`; this module returns it
 # deliberately empty (see `Escalation::router` in lib.rs), so the
@@ -33,7 +33,6 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-zeroize = { workspace = true }
 # The store renders its queries through the same sea-query pin core uses
 # (`Statement::render` builds with the SQLite query builder).
 sea-query = { version = "0.32.7", default-features = false, features = [
@@ -55,11 +54,12 @@ time = { version = "0.3.45", default-features = false, features = [
 module-escalation = { path = ".", features = ["testing"] }
 pollster = { workspace = true }
 # The store and intake round-trip tests run against a real in-memory
-# SQLite through the shipped migration. Already in the lock (0.1.4, built
-# against core ^0.4) via cratefield-testing; this only names the edge.
-cratefield-adapter-sqlite = "0.1"
+# SQLite through the shipped migration. Already in the lock through
+# cratefield-testing; this only names the edge.
+cratefield-adapter-sqlite = { workspace = true }
 # The pipeline acceptance tests drive the stages through the published
-# doubles: `FakeDefer` runs the next stage the moment a stage enqueues it
-# (the path the issue names), and `FakeMailer` is the wired-mailer side of
-# the notify stage's `no_recipient` pin. Already in the lock (0.2.2).
+# doubles: `FakeTextModel`/`FakeTracker` script the two ports this module
+# consumes, `FakeDefer` runs the next stage the moment a stage enqueues
+# it (the path the issue names), and `FakeMailer` is the wired-mailer
+# side of the notify stage's `no_recipient` pin.
 cratefield-testing = { workspace = true }

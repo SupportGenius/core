@@ -179,14 +179,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         runtime = runtime.captcha_arc(captcha);
     }
 
-    // Landing site for the `dev-fakes` TextModel stub, when one becomes
-    // possible: published cratefield-core 0.4 (and 0.5) has no
-    // `TextModel` port, and `crates/module-support` — the module that
-    // would consume it — has not merged. When both land, a
-    // `StubTextModel` goes here, selected by `SUPPORTGENIUS_DEV_FAKES`
-    // alongside the stubs above and written by hand in `src/dev_fakes.rs`
-    // (never `cratefield-testing` in a shipping binary, never a stub in
-    // the modules or the composition crate).
+    // Deliberately no TextModel stub here. The port exists now (core 0.5)
+    // and its fake ships in `cratefield-testing` — which is exactly why
+    // it is not wired: a shipping binary must not depend on the testing
+    // crate, and a hand-written `StubTextModel` would exist only to make
+    // `POST /v1/support/messages` answer something in a dev boot. Without
+    // it the route degrades the way production would with the port
+    // unconfigured: `503 text-model-not-configured`, everything else
+    // working. If a developer ever needs a *working* messages route
+    // locally, the honest move is a real provider key in the environment,
+    // not a fake answer in the binary.
 
     // Single tenant, seeded at boot from env: the compiled identity is
     // the default, and these variables exist for operators who front the

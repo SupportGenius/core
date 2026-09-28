@@ -5,13 +5,13 @@
 //!
 //! Two naming notes. The ticket's own lifecycle enum is [`Status`] — not
 //! `TicketStatus`, which is the port's check-response type in
-//! [`crate::ports::tracker`]. And the `judge` stage's output type is
+//! `cratefield_core`. And the `judge` stage's output type is
 //! [`Judgment`], to keep `Verdict` free for the judge's actual decision.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::ports::tracker::Severity;
+use cratefield_core::Severity;
 
 /// The width of one stage's band in the audit `seq` numbering: a stage's
 /// events occupy `[ordinal * SEQ_BAND, ordinal * SEQ_BAND + SEQ_BAND)`.
