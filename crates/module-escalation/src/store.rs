@@ -14,13 +14,13 @@
 //! 2. **Async readers** — take `&dyn Database` and return decoded rows.
 //!
 //! [`outbox_complete_stmt`] and [`outbox_retry_later_stmt`] exist only
-//! because published core 0.4.3 has no statement form of
-//! `Outbox::complete`/`Outbox::retry_later` — the only way to complete a
-//! stage inside the same batch that enqueues the next one would
-//! otherwise be a second round trip after the batch, which loses
-//! atomicity. They were rendered from the exact query bodies core's own
-//! methods build (verified against the 0.4.3 source and pinned by the
-//! tests below), and should be deleted when core grows
+//! because core at the rev this workspace pins (see the root `Cargo.toml`)
+//! has no statement form of `Outbox::complete`/`Outbox::retry_later` —
+//! the only way to complete a stage inside the same batch that enqueues
+//! the next one would otherwise be a second round trip after the batch,
+//! which loses atomicity. They are rendered from the exact query bodies
+//! core's own methods build (checked against the pinned source and pinned
+//! by the tests below), and should be deleted when core grows
 //! `complete_statement`/`retry_later_statement`.
 
 use cratefield_core::{Database, Row, Statement};
@@ -30,7 +30,8 @@ use crate::error::Error;
 use crate::model::{
     Drafted, EventKind, Judgment, Stage, StagePayload, Status, Ticket, TicketEvent, Verdict,
 };
-use crate::ports::tracker::{Destination, Filed, Severity};
+
+use cratefield_core::{Destination, Filed, Severity};
 
 fn iden(name: &str) -> Alias {
     Alias::new(name)
@@ -285,9 +286,10 @@ pub fn put_destination_stmt(
 /// `DELETE FROM "<table>" WHERE "id" = ?` — so a stage handler can
 /// complete its own outbox row **inside the same** `batch_atomic` that
 /// records its result and enqueues the next stage. Exists only because
-/// core 0.4.3 exposes no `complete_statement`; delete it (and switch the
-/// stages to core) when core grows one. The SQL is pinned verbatim in the
-/// tests below against what core's own method renders.
+/// core has no `complete_statement` at the rev this workspace pins;
+/// delete it (and switch the stages to core) when core grows one. The SQL
+/// is pinned verbatim in the tests below against what core's own method
+/// renders.
 #[must_use]
 pub fn outbox_complete_stmt(table: &str, id: &str) -> Statement {
     let mut delete = Query::delete();
@@ -299,8 +301,9 @@ pub fn outbox_complete_stmt(table: &str, id: &str) -> Statement {
 
 /// Releases a held inbox claim: `DELETE FROM <table> WHERE event_key = ?`.
 ///
-/// Core 0.4.3's [`cratefield_core::Inbox`] has `claim` and `seen` — both
-/// immediate — and no statement form of *releasing* a key. A retrying stage
+/// Core's [`cratefield_core::Inbox`] — at the rev this workspace pins, as
+/// in every published version so far — has `claim` and `seen`, both
+/// immediate, and no statement form of *releasing* a key. A retrying stage
 /// needs exactly that: the claim is taken **before** the port call, so a
 /// retryable failure has to give the key back inside the same
 /// [`Database::batch_atomic`] that reschedules the outbox row. Release the
@@ -322,8 +325,8 @@ pub fn inbox_release_stmt(table: &str, event_key: &str) -> Statement {
 /// next_attempt_at)` — increments `attempts`, moves `next_attempt_at`,
 /// clears the lease — so a transient stage failure reschedules inside the
 /// same `batch_atomic` that audits the retry. Exists only because core
-/// 0.4.3 exposes no `retry_later_statement`; delete it when core grows
-/// one. The SQL is pinned verbatim in the tests below.
+/// has no `retry_later_statement` at the rev this workspace pins; delete
+/// it when core grows one. The SQL is pinned verbatim in the tests below.
 #[must_use]
 pub fn outbox_retry_later_stmt(table: &str, id: &str, next_attempt_at: &str) -> Statement {
     let mut update = Query::update();
@@ -592,8 +595,8 @@ mod tests {
     /// The two outbox statements must be byte-for-byte what core's own
     /// `complete`/`retry_later` issue, or a batch that pairs them with an
     /// enqueue would be writing a different dialect than the drainer
-    /// expects. Rendered from core 0.4.3's own query bodies and pinned
-    /// here; regenerate if core's SQL ever changes.
+    /// expects. Rendered from the pinned core's own query bodies and
+    /// pinned here; regenerate if core's SQL ever changes.
     #[test]
     fn outbox_complete_stmt_matches_core_verbatim() {
         let stmt = outbox_complete_stmt("sg_escalation_outbox", "01JDEMO");

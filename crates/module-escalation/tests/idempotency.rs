@@ -6,24 +6,14 @@
 
 mod support;
 
+use cratefield_testing::{FakeTracker, TrackerMode};
 use module_escalation::model::{EventKind, Stage, Status};
-use module_escalation::ports::text_model::ModelTier;
-use module_escalation::testing::{FakeTextModel, FakeTracker};
 
-/// Drafted, judged `file`, tracker accepts once.
+/// Drafted, judged `file`, tracker accepts.
 fn happy() -> support::Fixture {
     support::fixture(
-        FakeTextModel::scripted(vec![
-            Ok(support::completion(
-                ModelTier::Fast,
-                support::drafted_json(),
-            )),
-            Ok(support::completion(
-                ModelTier::Strong,
-                support::file_judgment(),
-            )),
-        ]),
-        FakeTracker::accepting(support::filed()),
+        support::happy_model(),
+        FakeTracker::new(TrackerMode::FileOk),
     )
 }
 

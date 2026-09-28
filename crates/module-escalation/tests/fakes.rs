@@ -1,34 +1,28 @@
-//! Smoke test for the `testing` feature: these fakes live behind
-//! `module-escalation`'s `testing` feature, enabled here by the crate's
-//! self dev-dependency. They implement the mirrored ports in
-//! `module_escalation::ports`, so this also pins the port shapes a test
-//! can drive: scripted completions with their errors, recorded prompts,
-//! and a tracker asserted called exactly once (or never).
+//! Smoke test for the test doubles these suites lean on: the published
+//! `cratefield_testing::{FakeTextModel, FakeTracker}` (the ports and their
+//! fakes publish together in core 0.5, so nothing is mirrored in this
+//! crate) and the crate-local `testing` fixtures. This pins the shapes a
+//! test can drive: per-tier completion modes with their errors, recorded
+//! prompts, and a tracker asserted called exactly once (or never).
 
 use std::time::Duration;
 
-use module_escalation::ports::text_model::{
-    Completion, ModelTier, Prompt, TextModel, TextModelError,
+use cratefield_core::{
+    Completion, Credential, Destination, ModelTier, Prompt, Severity, TextModel as _, TicketDraft,
+    TicketState, Tracker as _, TrackerError,
 };
-use module_escalation::ports::tracker::{
-    Credential, Destination, Filed, Severity, TicketDraft, TicketState, TicketStatus, Tracker,
-};
-use module_escalation::testing::{FakeTextModel, FakeTracker};
+use cratefield_testing::{FakeTextModel, FakeTracker, TextModelMode, TrackerMode};
 
 #[test]
-fn the_fake_text_model_answers_in_order_and_records_the_prompts() {
-    let model = FakeTextModel::scripted(vec![
-        Ok(
-            Completion::new("a draft", "fake-1").json(serde_json::json!({
-                "title": "Checkout failing",
-                "severity": "error",
-            })),
-        ),
-        Err(TextModelError::Transient {
-            retry_after: Some(Duration::from_secs(30)),
-        }),
-        Err(TextModelError::Rejected("bad schema".to_owned())),
-    ]);
+fn the_fake_text_model_answers_per_tier_and_records_the_prompts() {
+    let draft = Completion::new("a draft", "fake-fast").json(serde_json::json!({
+        "title": "Checkout failing",
+        "severity": "error",
+    }));
+    let model = FakeTextModel::new(TextModelMode::Transient {
+        retry_after: Some(Duration::from_secs(30)),
+    });
+    model.set_mode_for(ModelTier::Fast, TextModelMode::Complete(draft));
 
     let schema = serde_json::json!({ "type": "object" });
     let prompt = |tier| {
@@ -37,55 +31,40 @@ fn the_fake_text_model_answers_in_order_and_records_the_prompts() {
             .json_schema(schema.clone())
     };
 
-    let first = pollster::block_on(model.complete(&prompt(ModelTier::Strong))).expect("scripted");
+    let first =
+        pollster::block_on(model.complete(&prompt(ModelTier::Fast))).expect("per-tier complete");
     assert_eq!(
         first.json.as_ref().and_then(|j| j["severity"].as_str()),
         Some("error")
     );
 
+    // The global mode is what a tier without an override answers with.
     let second = pollster::block_on(model.complete(&prompt(ModelTier::Strong))).unwrap_err();
     assert_eq!(second.retry_after(), Some(Duration::from_secs(30)));
 
-    let third = pollster::block_on(model.complete(&prompt(ModelTier::Strong))).unwrap_err();
-    assert!(matches!(third, TextModelError::Rejected(_)));
-
-    // Every prompt arrived, and carried the tier and schema the caller set.
+    // Only the answered prompts are recorded, each carrying the tier and
+    // schema the caller set.
     let prompts = model.prompts();
-    assert_eq!(prompts.len(), 3);
-    assert!(prompts.iter().all(|p| p.tier == ModelTier::Strong));
+    assert_eq!(prompts.len(), 1, "failed calls are not recorded");
+    assert_eq!(prompts[0].tier, ModelTier::Fast);
     assert_eq!(prompts[0].system.as_deref(), Some("Judge."));
     assert_eq!(prompts[0].json_schema, Some(schema));
 }
 
 #[test]
-fn the_json_convenience_answers_one_structured_completion() {
-    let model = FakeTextModel::json(
-        ModelTier::Fast,
-        serde_json::json!({ "file": true, "title": "x" }),
-    );
+fn the_reply_mode_answers_text_under_a_deterministic_model_name() {
+    let model = FakeTextModel::new(TextModelMode::Reply("hello".to_owned()));
 
     let completion = pollster::block_on(model.complete(&Prompt::new(ModelTier::Fast).user("hi")))
-        .expect("the one scripted response");
+        .expect("reply");
     assert_eq!(completion.model, "fake-fast");
-    assert_eq!(
-        completion.json,
-        Some(serde_json::json!({ "file": true, "title": "x" }))
-    );
-
-    // Off the end of the one-response script: a loud transport error.
-    let error = pollster::block_on(model.complete(&Prompt::new(ModelTier::Fast))).unwrap_err();
-    assert!(
-        format!("{error}").contains("exhausted"),
-        "the exhausted script fails loudly: {error}"
-    );
+    assert_eq!(completion.text, "hello");
+    assert_eq!(completion.json, None, "plain text, not parsed JSON");
 }
 
 #[test]
-fn the_fake_tracker_records_file_calls_so_a_test_can_count_them() {
-    let tracker = FakeTracker::accepting(Filed {
-        external_id: "acme/api#7".to_owned(),
-        url: "https://github.test/acme/api/7".to_owned(),
-    });
+fn the_fake_tracker_records_accepted_files_so_a_test_can_count_them() {
+    let tracker = FakeTracker::new(TrackerMode::FileOk);
     let dest = Destination::GitHub {
         owner: "acme".to_owned(),
         repo: "api".to_owned(),
@@ -93,33 +72,61 @@ fn the_fake_tracker_records_file_calls_so_a_test_can_count_them() {
     let draft = TicketDraft::new("conv-1", "Checkout failing", "500s", Severity::Error);
 
     let filed = pollster::block_on(tracker.file(&dest, &Credential::new("t"), &draft))
-        .expect("the one acceptance");
-    assert_eq!(filed.external_id, "acme/api#7");
+        .expect("the accepted file");
+    assert_eq!(filed.external_id, "fake-0");
 
     // Called exactly once: the retry-after-transient path must not file
     // the ticket a second time.
     assert_eq!(tracker.filed().len(), 1);
-    let (recorded_dest, recorded_draft) = &tracker.filed()[0];
-    assert_eq!(recorded_dest, &dest);
-    assert_eq!(recorded_draft.idempotency_key, "conv-1");
-    assert_eq!(recorded_draft.severity, Severity::Error);
+    let call = &tracker.filed()[0];
+    assert_eq!(call.dest, dest);
+    assert_eq!(call.draft.idempotency_key, "conv-1");
+    assert_eq!(call.draft.severity, Severity::Error);
+    assert!(
+        !call.credential_fingerprint.is_empty(),
+        "the credential arrives as a fingerprint, not the secret"
+    );
 
     // And the status port answers, with its calls recorded too.
-    tracker.status_scripted(vec![TicketStatus {
-        external_id: "acme/api#7".to_owned(),
-        state: TicketState::Resolved,
-        url: None,
-    }]);
-    let status = pollster::block_on(tracker.status(&dest, &Credential::new("t"), "acme/api#7"))
-        .expect("scripted status");
+    tracker.set_state(TicketState::Resolved);
+    let status = pollster::block_on(tracker.status(&dest, &Credential::new("t"), "fake-0"))
+        .expect("status answers");
     assert_eq!(status.state, TicketState::Resolved);
-    assert_eq!(tracker.status_calls(), vec!["acme/api#7".to_owned()]);
+    assert_eq!(tracker.statused().len(), 1);
+    assert_eq!(tracker.statused()[0].external_id, "fake-0");
     assert_eq!(tracker.filed().len(), 1, "status is not a file");
 }
 
 #[test]
+fn the_fake_tracker_modes_name_the_error_vocabulary() {
+    let unauthorized = FakeTracker::new(TrackerMode::Unauthorized);
+    let dest = Destination::GitHub {
+        owner: "acme".to_owned(),
+        repo: "api".to_owned(),
+    };
+    let draft = TicketDraft::new("conv-1", "Checkout failing", "500s", Severity::Error);
+    let error = pollster::block_on(unauthorized.file(&dest, &Credential::new("t"), &draft))
+        .expect_err("the mode answers");
+    assert!(matches!(error, TrackerError::Unauthorized));
+    assert!(
+        unauthorized.filed().is_empty(),
+        "a refused call is not recorded"
+    );
+
+    let custom = FakeTracker::new(TrackerMode::Error(TrackerError::Rejected(
+        "draft title exceeds the tracker limit".to_owned(),
+    )));
+    let error = pollster::block_on(custom.file(&dest, &Credential::new("t"), &draft))
+        .expect_err("the mode answers");
+    assert!(
+        format!("{error}").contains("exceeds the tracker limit"),
+        "the exact error a test asked for: {error}"
+    );
+}
+
+#[test]
 fn a_fresh_fake_tracker_was_never_called() {
-    let tracker = FakeTracker::scripted(vec![]);
+    let tracker = FakeTracker::new(TrackerMode::FileOk);
     assert!(tracker.filed().is_empty(), "no escalation, no file");
-    assert!(tracker.status_calls().is_empty());
+    assert!(tracker.statused().is_empty());
 }

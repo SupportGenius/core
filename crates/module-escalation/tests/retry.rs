@@ -7,12 +7,10 @@ mod support;
 
 use std::time::Duration;
 
-use cratefield_core::{Clock as _, Inbox};
+use cratefield_core::{Clock as _, Inbox, TrackerError};
+use cratefield_testing::{FakeTracker, TrackerMode};
 use module_escalation::RetryPolicy;
 use module_escalation::model::{EventKind, Status};
-use module_escalation::ports::text_model::ModelTier;
-use module_escalation::ports::tracker::TrackerError;
-use module_escalation::testing::{FakeTextModel, FakeTracker};
 use time::format_description::well_known::Rfc3339;
 
 /// Box 4a: a tracker `Transient` is retried once, exactly one policy step
@@ -20,17 +18,10 @@ use time::format_description::well_known::Rfc3339;
 #[pollster::test]
 async fn a_transient_tracker_failure_is_retried_at_the_policy_backoff_and_then_files() {
     let fixture = support::fixture(
-        FakeTextModel::scripted(vec![
-            Ok(support::completion(
-                ModelTier::Fast,
-                support::drafted_json(),
-            )),
-            Ok(support::completion(
-                ModelTier::Strong,
-                support::file_judgment(),
-            )),
-        ]),
-        FakeTracker::scripted(vec![Err(support::transient()), Ok(support::filed())]),
+        support::happy_model(),
+        // The first file attempt answers Transient; the test flips the mode
+        // to `FileOk` past the retry boundary, the way a provider recovers.
+        FakeTracker::new(TrackerMode::Transient),
     );
     // A non-default base, so the assertion below proves the policy the
     // test installed is the one scheduling the retry.
@@ -91,20 +82,24 @@ async fn a_transient_tracker_failure_is_retried_at_the_policy_backoff_and_then_f
     .expect("claim read");
     assert!(claim, "the failed attempt released the ticket:file claim");
 
-    // Past the retry boundary, the next drain files — the second call.
+    // Past the retry boundary — and with the tracker recovered — the next
+    // drain files.
+    fixture.tracker.set_mode(TrackerMode::FileOk);
     fixture.clock.advance_seconds(46);
     support::drain_all(&pipeline);
 
+    // Only the accepted call is recorded: the failed attempt named itself
+    // in the `FileRetryScheduled` event and the row's attempt count above.
     assert_eq!(
         fixture.tracker.filed().len(),
-        2,
-        "one failed attempt plus one success: {:?}",
+        1,
+        "the retry files exactly once: {:?}",
         fixture.tracker.filed()
     );
     assert_eq!(support::ticket(&fixture).status, Status::Filed);
     assert_eq!(
         support::ticket(&fixture).external_id.as_deref(),
-        Some("acme/api#7")
+        Some(support::FILED_EXTERNAL_ID)
     );
 }
 
@@ -113,21 +108,9 @@ async fn a_transient_tracker_failure_is_retried_at_the_policy_backoff_and_then_f
 #[pollster::test]
 async fn transient_failures_past_the_attempt_budget_dead_letter() {
     let fixture = support::fixture(
-        FakeTextModel::scripted(vec![
-            Ok(support::completion(
-                ModelTier::Fast,
-                support::drafted_json(),
-            )),
-            Ok(support::completion(
-                ModelTier::Strong,
-                support::file_judgment(),
-            )),
-        ]),
-        FakeTracker::scripted(vec![
-            Err(support::transient()),
-            Err(support::transient()),
-            Err(support::transient()),
-        ]),
+        support::happy_model(),
+        // Transient for as long as the test runs: both attempts fail it.
+        FakeTracker::new(TrackerMode::Transient),
     );
     let pipeline = fixture.pipeline_with_policy(
         RetryPolicy::new()
@@ -162,10 +145,11 @@ async fn transient_failures_past_the_attempt_budget_dead_letter() {
         "not `{}`",
         ticket.status.as_str()
     );
-    assert_eq!(
-        fixture.tracker.filed().len(),
-        2,
-        "both attempts reached the tracker: {:?}",
+    // No call was accepted — the attempts reached the tracker and failed,
+    // which the row's attempt count and the dead-letter's reason record.
+    assert!(
+        fixture.tracker.filed().is_empty(),
+        "a transient tracker never files: {:?}",
         fixture.tracker.filed()
     );
 
@@ -198,9 +182,8 @@ async fn transient_failures_past_the_attempt_budget_dead_letter() {
     support::drain_all(&pipeline);
     assert_eq!(support::outbox_count(&fixture), 0);
     assert_eq!(support::ticket(&fixture).status, Status::DeadLetter);
-    assert_eq!(
-        fixture.tracker.filed().len(),
-        2,
+    assert!(
+        fixture.tracker.filed().is_empty(),
         "nothing re-files a dead ticket"
     );
 }
@@ -210,27 +193,17 @@ async fn transient_failures_past_the_attempt_budget_dead_letter() {
 #[pollster::test]
 async fn a_rejected_tracker_answer_dead_letters_immediately_with_its_reason() {
     let fixture = support::fixture(
-        FakeTextModel::scripted(vec![
-            Ok(support::completion(
-                ModelTier::Fast,
-                support::drafted_json(),
-            )),
-            Ok(support::completion(
-                ModelTier::Strong,
-                support::file_judgment(),
-            )),
-        ]),
-        FakeTracker::scripted(vec![Err(TrackerError::Rejected(
+        support::happy_model(),
+        FakeTracker::new(TrackerMode::Error(TrackerError::Rejected(
             "draft title exceeds the tracker limit".to_owned(),
-        ))]),
+        ))),
     );
     let pipeline = fixture.pipeline();
     support::drain_all(&pipeline);
 
-    assert_eq!(
-        fixture.tracker.filed().len(),
-        1,
-        "one call, no retry: {:?}",
+    assert!(
+        fixture.tracker.filed().is_empty(),
+        "a rejected draft is never accepted: {:?}",
         fixture.tracker.filed()
     );
     assert_eq!(

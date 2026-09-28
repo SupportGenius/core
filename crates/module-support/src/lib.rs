@@ -43,8 +43,6 @@ pub use chunk::tokenize;
 
 use std::sync::Arc;
 
-use text_model::TextModel;
-
 use cratefield_core::{
     Config, ConfigError, DataKind, Disposition, Migrations, Module, ModuleConfig, ModuleContext,
     PersonalDataSet, Port, SqlMigration, assert_migration_set,
@@ -71,42 +69,24 @@ const MIGRATION_CONVERSATIONS: SqlMigration = SqlMigration::new(
 /// token, API-key-authenticated source ingest, BM25 search and grounded
 /// answers for everything else.
 ///
-/// Knob-free apart from the model. Everything tunable — the revoked-kid
-/// list, the admin token — is deployment configuration read through the
-/// `Config` port, and the answer threshold is per-tenant data
+/// Knob-free. Everything tunable — the revoked-kid list, the admin token —
+/// is deployment configuration read through the `Config` port, and the
+/// answer threshold is per-tenant data
 /// (`PUT /admin/tenants/{tenant_id}/settings`), so a builder setter for
-/// either would be a second place the same setting lived. The one setter,
-/// [`Support::text_model`], exists because the harness has no `TextModel`
-/// port yet: the model is an object, not a setting.
+/// either would be a second place the same setting lived. The text model
+/// is likewise not passed here: it arrives through the runtime's
+/// [`Ports`](cratefield_core::Ports) at route-build time, so one instance
+/// serves a venture with a model and one without.
 #[derive(Default)]
-pub struct Support {
-    text_model: Option<Arc<dyn TextModel>>,
-}
-
-impl std::fmt::Debug for Support {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Support")
-            .field(
-                "text_model",
-                &self.text_model.as_ref().map(|_| "dyn TextModel"),
-            )
-            .finish()
-    }
-}
+pub struct Support;
 
 impl Support {
-    /// A `Support` module with defaults and no text model: every route
-    /// works except `POST /messages`, which answers
-    /// `503 text-model-not-configured` until one is given.
+    /// A `Support` module with defaults. Whether `POST /messages` can
+    /// answer depends on what the runtime provides: with no `TextModel`
+    /// port it answers `503 text-model-not-configured` and every other
+    /// route still works.
     pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// The model `POST /messages` asks for answers.
-    #[must_use]
-    pub fn text_model(mut self, model: Arc<dyn TextModel>) -> Self {
-        self.text_model = Some(model);
-        self
+        Self
     }
 }
 
@@ -124,11 +104,18 @@ impl Module for Support {
     }
 
     /// `HttpClient` for the `{"url"}` ingest form, `RateLimiter` for the
-    /// per-tenant budget on ingest, search and messages. Both degrade honestly
+    /// per-tenant budget on ingest, search and messages, and `TextModel`
+    /// for `POST /messages`' grounded answers. All three degrade honestly
     /// when absent: URL ingest answers `503 not-ready`, the limiter is
-    /// skipped.
+    /// skipped, and messages answer `503 text-model-not-configured`.
+    ///
+    /// Optional, not required, on purpose: retrieval and ingest — the
+    /// parts that make a workspace useful — work without a model, and a
+    /// venture that never wires one should still boot (the escalation
+    /// module is the one that cannot run without it, and it declares the
+    /// port required).
     fn optional(&self) -> &'static [Port] {
-        &[Port::HttpClient, Port::RateLimiter]
+        &[Port::HttpClient, Port::RateLimiter, Port::TextModel]
     }
 
     fn tables(&self) -> &'static [&'static str] {
@@ -307,6 +294,9 @@ impl Module for Support {
     }
 
     fn router(&self, ctx: ModuleContext) -> axum::Router {
-        handlers::router(Arc::new(ctx), self.text_model.clone())
+        // The model `POST /messages` asks: whatever the runtime resolved,
+        // `None` — and the degraded 503 — where it resolved nothing.
+        let text_model = ctx.ports.text_model.clone();
+        handlers::router(Arc::new(ctx), text_model)
     }
 }

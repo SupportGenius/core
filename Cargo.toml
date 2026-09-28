@@ -14,35 +14,39 @@ license = "MIT"
 repository = "https://github.com/SupportGenius/core"
 
 [workspace.dependencies]
-# cratefield-core is pinned to the 0.4 line deliberately, NOT 0.5: every
-# published companion crate this workspace needs —
-# cratefield-runtime-cloudflare 0.1.4, cratefield-module-waitlist 0.1.4,
-# cratefield-adapter-resend 0.2.2, cratefield-adapter-turnstile 0.1.4,
-# cratefield-testing 0.2.2 and cratefield-cli 0.2.2 — still requires
-# core ^0.4. Asking for core 0.5 puts two copies of core in the graph
-# and the waitlist module's `Module` impl (typed against core 0.4) no
-# longer satisfies the harness builder, which is a compile error, not a
-# deprecation. The 0.4.3 -> 0.5.0 API delta is confined to
-# `TenantStatus`, so nothing else in this workspace is affected; revisit
-# the pin when the companions publish against 0.5.
-cratefield-core = "0.4"
-cratefield-runtime-cloudflare = "0.1"
-cratefield-module-waitlist = "0.1"
-cratefield-adapter-resend = "0.2"
-# 0.1.4 is the turnstile adapter line built against core ^0.4.
-cratefield-adapter-turnstile = "0.1"
-cratefield-testing = "0.2"
-cratefield-cli = "0.2"
+# Every cratefield-* dependency is pinned to ONE harness git rev, never
+# split between crates.io and git: mixing sources puts two copies of
+# `cratefield-core` in the graph (the modules' `Module` impls are typed
+# against one of them and fail the harness builder), which is a compile
+# error, not a warning.
+#
+# The rev is b50c1d9, harness main on 2026-09-28, because that is where
+# core 0.5.0 publishes the `TextModel`/`Tracker` ports and
+# cratefield-testing the matching `FakeTextModel`/`FakeTracker` doubles —
+# the two ports this workspace's support and escalation modules are
+# written against, which were mirrored locally until now. No crates.io
+# release carries them (the latest companions still require core ^0.4),
+# so a crates.io pin cannot express this graph at all.
+# Return the whole set to crates.io — core "0.6" and its companions —
+# once Cratefield/harness#558 is published and its crates-io-resolve job
+# is green.
+cratefield-core = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
+cratefield-runtime-cloudflare = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
+cratefield-module-waitlist = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
+cratefield-adapter-resend = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
+cratefield-adapter-turnstile = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
+cratefield-testing = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
+cratefield-cli = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 # Native-only (tokio/reqwest/redis do not compile to wasm): consumed only
 # by `bin/supportgenius`, whose native deps are target-gated so the wasm
 # graph stays clean.
-cratefield-runtime-native = "0.1"
+cratefield-runtime-native = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 # rusqlite with the `bundled` feature: the static musl binary compiles
 # SQLite in, no system lib and no dynamic linking.
-cratefield-adapter-sqlite = "0.1"
+cratefield-adapter-sqlite = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 # Postgres is the operator's opt-in (`--features postgres`), not the
 # default: SQLite is what makes the binary run with zero configuration.
-cratefield-adapter-postgres = "0.1"
+cratefield-adapter-postgres = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 # The `http` feature stays off: with it enabled, D1 writes hang under
 # workerd/miniflare (upstream, worker 0.8.5, verified empirically).
 worker = { version = "0.8", default-features = false, features = ["d1"] }
@@ -61,17 +65,10 @@ sha2 = "0.11"
 tokio = { version = "1.53", default-features = false }
 tracing = "0.1.44"
 bytes = "1.12"
-# The escalation module (issue #4) mirrors the harness `TextModel`/`Tracker`
-# ports locally until core publishes them (see
-# crates/module-escalation/src/ports/mod.rs; `TextModel` lives in the shared
-# crates/text-model so module-support can use it too); those ports need
-# these four.
-# All four already sit in the dependency graph through cratefield-core, so
-# this pins what is there rather than adding anything new.
+# Types the module crates serialise, wrap and classify directly.
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.20"
-zeroize = "1.9.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -32,10 +32,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use cratefield_core::{
-    Clock, Config, Database, Defer, IdGen, Inbox, Mailer, Message, Outbox, OutboxRecord,
-    SendOutcome, Statement,
-};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -45,9 +41,13 @@ use crate::intake::OUTBOX_TABLE;
 use crate::model::{
     Drafted, EventKind, Judgment, Stage, StagePayload, Status, Ticket, Verdict, stage_seq,
 };
-use crate::ports::text_model::{Completion, ModelTier, Prompt, TextModel};
-use crate::ports::tracker::{Credential, Filed, TicketDraft, Tracker};
 use crate::store;
+
+use cratefield_core::{
+    Clock, Completion, Config, Credential, Database, Defer, Filed, IdGen, Inbox, Mailer, Message,
+    ModelTier, Outbox, OutboxRecord, Prompt, SendOutcome, Statement, TextModel, TicketDraft,
+    Tracker,
+};
 
 /// The inbox table the migration creates; the stages' claim keys live in
 /// it, one `ticket:stage` per stage attempt. Reachable as
@@ -202,9 +202,9 @@ impl Pipeline {
     /// tests construct.
     pub const INBOX_TABLE: &str = INBOX_TABLE;
 
-    /// Assembles a runner over one database, the two mirrored ports the
-    /// module was constructed with, and whatever optional ports the
-    /// runtime resolved. `config` is needed by the file stage, which
+    /// Assembles a runner over one database, the `TextModel`/`Tracker`
+    /// ports the module declared, and whatever optional ports the runtime
+    /// resolved. `config` is needed by the file stage, which
     /// resolves the tenant's stored `credential_ref` against it at
     /// file-time (never a secret out of the database).
     ///
@@ -1136,7 +1136,7 @@ fn rfc3339_after(now: OffsetDateTime, wait: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::tracker::Severity;
+    use cratefield_core::Severity;
 
     /// One failure's delay, and the doubling-then-capping shape.
     #[test]

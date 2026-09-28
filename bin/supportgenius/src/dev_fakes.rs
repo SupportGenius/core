@@ -10,8 +10,11 @@
 //! the modules and never in the composition crate — so the module
 //! contracts stay honest in every configuration.
 //!
-//! No `StubTextModel` here yet: published cratefield-core has no
-//! `TextModel` port (see the landing-site comment in `main.rs`).
+//! No `StubTextModel`, on purpose: the `TextModel` port exists (core 0.5)
+//! and the escalation module requires it, but `POST /v1/support/messages`
+//! degrades honestly to `503 text-model-not-configured` without one, so a
+//! dev boot loses nothing worth faking (see the comment at the landing
+//! site in `main.rs`).
 
 use async_trait::async_trait;
 use cratefield_core::{Captcha, CaptchaError, MailError, Mailer, Message, SendOutcome, Verdict};

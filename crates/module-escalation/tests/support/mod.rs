@@ -1,8 +1,8 @@
 //! Shared fixture for the issue #4 acceptance tests: an in-memory SQLite
 //! database with the module's migration applied, a seeded
-//! `sg_destinations` row, and a [`Pipeline`] assembled over the scripted
-//! fakes from `module_escalation::testing` plus
-//! `cratefield_testing::{FakeDefer, FakeMailer}`.
+//! `sg_destinations` row, and a [`Pipeline`] assembled over the published
+//! `cratefield_testing::{FakeTextModel, FakeTracker, FakeDefer}` fakes,
+//! mode-scripted per tier.
 //!
 //! The handoff helper commits [`Intake`]'s statements through
 //! [`Database::batch_atomic`] — that is the real contract: the calling
@@ -14,14 +14,15 @@
 use std::sync::Arc;
 
 use cratefield_adapter_sqlite::SqliteDatabase;
-use cratefield_core::{Clock as _, Database as _, IdGen as _, Inbox, Outbox, Statement, UlidIdGen};
-use cratefield_testing::FakeDefer;
+use cratefield_core::{
+    Clock as _, Completion, Database as _, Destination, IdGen as _, Inbox, ModelTier, Outbox,
+    Statement, UlidIdGen,
+};
+use cratefield_testing::{FakeDefer, FakeTextModel, FakeTracker, TextModelMode};
 use module_escalation::intake::OUTBOX_TABLE;
 use module_escalation::model::{EventKind, Stage, Ticket, TicketEvent};
-use module_escalation::ports::text_model::{Completion, ModelTier};
-use module_escalation::ports::tracker::{Destination, Filed, TrackerError};
 use module_escalation::store;
-use module_escalation::testing::{FakeConfig, FakeTextModel, FakeTracker, SettableClock};
+use module_escalation::testing::{FakeConfig, SettableClock};
 use module_escalation::{Intake, Pipeline, RetryPolicy};
 use time::format_description::well_known::Rfc3339;
 
@@ -58,11 +59,43 @@ pub(crate) const NEEDS_INFO_REASON: &str = "which build number is the customer o
 // ---------------------------------------------------------------------------
 // Fakes' payloads
 
-/// A structured completion like `FakeTextModel::json` builds, for
-/// scripts that need more than one answer.
+/// The external id `FakeTracker` answers its **first** accepted file with.
+pub(crate) const FILED_EXTERNAL_ID: &str = "fake-0";
+/// The url `FakeTracker` answers its **first** accepted file with.
+pub(crate) const FILED_EXTERNAL_URL: &str = "https://tracker.fake.test/browse/fake-0";
+
+/// A structured completion answered under a deterministic `fake-<tier>`
+/// model name — the shape the pipeline's schema validation reads.
 #[must_use]
 pub(crate) fn completion(tier: ModelTier, json: serde_json::Value) -> Completion {
     Completion::new(json.to_string(), format!("fake-{}", tier.name())).json(json)
+}
+
+/// A model whose fast tier answers `draft` and whose strong tier answers
+/// `judgment`, each as a structured completion. The global mode stays
+/// `NotConfigured`, so a stage that asks some third tier fails loudly
+/// instead of reading a neighbour's answer.
+#[must_use]
+pub(crate) fn scripted_model(
+    draft: serde_json::Value,
+    judgment: serde_json::Value,
+) -> FakeTextModel {
+    let model = FakeTextModel::new(TextModelMode::NotConfigured);
+    model.set_mode_for(
+        ModelTier::Fast,
+        TextModelMode::Complete(completion(ModelTier::Fast, draft)),
+    );
+    model.set_mode_for(
+        ModelTier::Strong,
+        TextModelMode::Complete(completion(ModelTier::Strong, judgment)),
+    );
+    model
+}
+
+/// The happy path's model: the drafted JSON, then the `file` judgment.
+#[must_use]
+pub(crate) fn happy_model() -> FakeTextModel {
+    scripted_model(drafted_json(), file_judgment())
 }
 
 /// The `Drafted` the fake drafter writes — schema-shaped, `error`
@@ -119,22 +152,6 @@ pub(crate) fn needs_info_judgment() -> serde_json::Value {
         "verdict": "needs_info",
         "reasons": [NEEDS_INFO_REASON],
     })
-}
-
-/// The reference the fake tracker files under.
-#[must_use]
-pub(crate) fn filed() -> Filed {
-    Filed {
-        external_id: "acme/api#7".to_owned(),
-        url: "https://github.test/acme/api/7".to_owned(),
-    }
-}
-
-/// A transient tracker failure with no provider delay, so the retry time
-/// is the [`RetryPolicy`] schedule alone.
-#[must_use]
-pub(crate) fn transient() -> TrackerError {
-    TrackerError::Transient { retry_after: None }
 }
 
 /// RFC 3339 of a whole-second instant.
@@ -196,8 +213,9 @@ pub(crate) fn commit_handoff(
 // ---------------------------------------------------------------------------
 // Fixture
 
-/// One test's world: the database, the scripted fakes, the settable clock,
-/// the deferred-self-drain collector, and the ticket id the handoff minted.
+/// One test's world: the database, the mode-scripted fakes, the settable
+/// clock, the deferred-self-drain collector, and the ticket id the handoff
+/// minted.
 pub(crate) struct Fixture {
     /// The migrated in-memory database.
     pub(crate) db: Arc<SqliteDatabase>,

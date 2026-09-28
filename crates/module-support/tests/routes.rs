@@ -4,15 +4,18 @@
 //! indistinguishable-401 auth matrix, and the search edge cases.
 //!
 //! Issue #3 acceptance (`POST /messages` and the tenant settings route)
-//! follows, from "Issue #3" below. The model is `text_model`'s
-//! `FakeTextModel`, so every outcome is scripted, not stochastic; content
-//! is seeded through the real `/sources` ingest, so every cited chunk id is
-//! one BM25 genuinely retrieves.
+//! follows, from "Issue #3" below. The model is `cratefield_testing`'s
+//! `FakeTextModel`, so every outcome is mode-scripted, not stochastic;
+//! content is seeded through the real `/sources` ingest, so every cited
+//! chunk id is one BM25 genuinely retrieves.
 
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
-use cratefield_core::{Database, MapConfig, Module, Statement};
-use cratefield_testing::{Dialect, FakeHttpClient, TestHarness};
+use cratefield_core::{
+    Completion, Database, MapConfig, ModelTier, Module, Prompt, Statement, TextModel,
+    TextModelError,
+};
+use cratefield_testing::{Dialect, FakeHttpClient, FakeTextModel, TestHarness, TextModelMode};
 use module_support::Support;
 use module_support::chunk::Chunker;
 use serde_json::{Value, json};
@@ -20,8 +23,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use text_model::testing::FakeTextModel;
-use text_model::{Completion, ModelTier, Prompt, TextModel, TextModelError};
 use tower::ServiceExt;
 
 const ADMIN_TOKEN: &str = "test-admin-token-0123456789abcdef";
@@ -707,17 +708,14 @@ const QUESTION: &str = "How do I reset my password?";
 const RESET_DOC: &str = "Reset your password from the settings page under Security.";
 const BILLING_DOC: &str = "Billing plans are changed on the billing page by an owner.";
 
-/// A kit whose `Support` asks `model`. The fake starts with an empty
-/// script: a test pushes the replies once ingest has minted the chunk ids
-/// they cite.
+/// A kit whose `Support` asks `model`. The fake starts unconfigured: a
+/// test sets its mode once ingest has minted the chunk ids the reply
+/// cites.
 fn kit_with_model(dialect: Dialect, model: &FakeTextModel) -> TestHarness {
-    TestHarness::with_database_and_ports(
-        vec![Box::new(Support::new().text_model(Arc::new(model.clone())))],
-        dialect,
-        |ports| {
-            ports.config = Arc::new(MapConfig::from_pairs([("ADMIN_TOKEN", ADMIN_TOKEN)]));
-        },
-    )
+    TestHarness::with_database_and_ports(vec![Box::new(Support::new())], dialect, |ports| {
+        ports.config = Arc::new(MapConfig::from_pairs([("ADMIN_TOKEN", ADMIN_TOKEN)]));
+        ports.text_model = Some(Arc::new(model.clone()));
+    })
 }
 
 /// One `(kit, model)` pair per available dialect, each with its own fake.
@@ -725,27 +723,22 @@ fn model_kits() -> Vec<(TestHarness, FakeTextModel)> {
     Dialect::available()
         .into_iter()
         .map(|dialect| {
-            let model = FakeTextModel::scripted(Vec::new());
+            let model = FakeTextModel::new(TextModelMode::NotConfigured);
             (kit_with_model(dialect, &model), model)
         })
         .collect()
 }
 
 /// A structured model reply, the way an adapter hands one back: the
-/// parsed value in `json`, the same value as text. A `Result` because that
-/// is what `FakeTextModel::push` scripts.
-#[allow(clippy::unnecessary_wraps)]
-fn reply(
-    answer: &str,
-    citations: &[(&str, &str)],
-    confidence: f64,
-) -> Result<Completion, TextModelError> {
+/// parsed value in `json`, the same value as text. The mode `Complete`
+/// answers it to every turn that asks, until the test switches modes.
+fn reply(answer: &str, citations: &[(&str, &str)], confidence: f64) -> TextModelMode {
     let citations: Vec<Value> = citations
         .iter()
         .map(|(chunk_id, quote)| json!({ "chunk_id": chunk_id, "quote": quote }))
         .collect();
     let value = json!({ "answer": answer, "citations": citations, "confidence": confidence });
-    Ok(Completion::new(value.to_string(), "fake-fast").json(value))
+    TextModelMode::Complete(Completion::new(value.to_string(), "fake-fast").json(value))
 }
 
 /// A tenant with one ingested document, and the id of its only chunk.
@@ -870,7 +863,7 @@ fn conversation_id(body: &Value) -> String {
 async fn an_answered_turn_persists_the_conversation_and_both_messages() {
     for (kit, model) in model_kits() {
         let seeded = seed(&kit, "Answered", RESET_DOC).await;
-        model.push(reply(
+        model.set_mode(reply(
             "Reset it from Settings > Security.",
             &[(
                 &seeded.chunk_id,
@@ -932,7 +925,7 @@ async fn an_answered_turn_persists_the_conversation_and_both_messages() {
 async fn a_low_confidence_reply_clarifies_and_returns_no_citations() {
     for (kit, model) in model_kits() {
         let seeded = seed(&kit, "Low", RESET_DOC).await;
-        model.push(reply(
+        model.set_mode(reply(
             "Have you tried turning it off and on again?",
             &[(&seeded.chunk_id, "Reset your password")],
             0.2,
@@ -956,7 +949,7 @@ async fn a_low_confidence_reply_clarifies_and_returns_no_citations() {
 async fn a_citation_to_an_unretrieved_chunk_downgrades_answered_to_clarify() {
     for (kit, model) in model_kits() {
         let seeded = seed(&kit, "Fabricated", RESET_DOC).await;
-        model.push(reply(
+        model.set_mode(reply(
             "Reset it from Settings > Security.",
             &[
                 (&seeded.chunk_id, "Reset your password"),
@@ -990,7 +983,7 @@ async fn a_citation_to_another_tenants_chunk_is_downgraded() {
 
         // Citing only the foreign chunk, and citing it alongside the
         // asker's own: both are downgraded.
-        model.push(reply(
+        model.set_mode(reply(
             "Reset it from Settings > Security.",
             &[(
                 &owner.chunk_id,
@@ -998,7 +991,11 @@ async fn a_citation_to_another_tenants_chunk_is_downgraded() {
             )],
             0.99,
         ));
-        model.push(reply(
+        let body = turn(&kit, &asker.api_key, QUESTION, None).await;
+        assert_eq!(body["outcome"], "clarify");
+        assert_eq!(citation_count(&body), 0);
+
+        model.set_mode(reply(
             "Reset it from Settings > Security.",
             &[
                 (&asker.chunk_id, "Reset your password"),
@@ -1009,11 +1006,9 @@ async fn a_citation_to_another_tenants_chunk_is_downgraded() {
             ],
             0.99,
         ));
-        for _ in 0..2 {
-            let body = turn(&kit, &asker.api_key, QUESTION, None).await;
-            assert_eq!(body["outcome"], "clarify");
-            assert_eq!(citation_count(&body), 0);
-        }
+        let body = turn(&kit, &asker.api_key, QUESTION, None).await;
+        assert_eq!(body["outcome"], "clarify");
+        assert_eq!(citation_count(&body), 0);
     }
 }
 
@@ -1023,7 +1018,7 @@ async fn a_citation_to_another_tenants_chunk_is_downgraded() {
 async fn a_downgraded_turn_stores_the_models_raw_answer() {
     for (kit, model) in model_kits() {
         let seeded = seed(&kit, "Audit", RESET_DOC).await;
-        model.push(reply(
+        model.set_mode(reply(
             "Reset it from Settings > Security.",
             &[("c-fabricated", "invented")],
             0.99,
@@ -1055,16 +1050,55 @@ async fn a_downgraded_turn_stores_the_models_raw_answer() {
     }
 }
 
+/// `/__health` is where the module's ports surface: `TextModel` is
+/// declared **optional** — retrieval and ingest run without it, and the
+/// messages route degrades to `503 text-model-not-configured` — while the
+/// ports the routes cannot answer without are under `requires`.
+#[pollster::test]
+async fn health_lists_text_model_among_the_optional_ports() {
+    let kit = TestHarness::new(support());
+    let health = send(&kit.router, Method::GET, "/__health", None, None).await;
+    assert_eq!(health.status, StatusCode::OK);
+    let module = health.body["modules"]
+        .as_array()
+        .expect("modules array")
+        .iter()
+        .find(|module| module["name"] == "support")
+        .expect("support is listed");
+    let listed = |field: &str| -> Vec<String> {
+        module[field]
+            .as_array()
+            .unwrap_or_else(|| panic!("{field} is an array"))
+            .iter()
+            .map(|port| port.as_str().expect("a port name").to_owned())
+            .collect()
+    };
+    let optional = listed("optional");
+    assert!(
+        optional.contains(&"TextModel".to_owned()),
+        "the text model is declared optional: {optional:?}"
+    );
+    assert!(
+        optional.contains(&"HttpClient".to_owned()) && optional.contains(&"RateLimiter".to_owned()),
+        "the other degrading ports stay optional too: {optional:?}"
+    );
+    assert!(
+        !listed("requires").contains(&"TextModel".to_owned()),
+        "support boots — degraded — without a model, so it is not required"
+    );
+}
+
 #[pollster::test]
 async fn an_unconfigured_model_answers_503_and_writes_nothing() {
     for dialect in Dialect::available() {
-        // Both shapes of "no model": none given to the builder, and one
-        // that reports NotConfigured.
-        let reporting = FakeTextModel::scripted(vec![Err(TextModelError::NotConfigured)]);
-        for kit in [
-            kit_with(dialect.clone(), &[]),
-            kit_with_model(dialect, &reporting),
-        ] {
+        // Both shapes of "no model": the runtime providing no port at
+        // all, and a configured model that reports NotConfigured.
+        let reporting = FakeTextModel::new(TextModelMode::NotConfigured);
+        let absent = TestHarness::with_database_and_ports(support(), dialect.clone(), |ports| {
+            ports.config = Arc::new(MapConfig::from_pairs([("ADMIN_TOKEN", ADMIN_TOKEN)]));
+            ports.text_model = None;
+        });
+        for kit in [absent, kit_with_model(dialect, &reporting)] {
             let seeded = seed(&kit, "Unconfigured", RESET_DOC).await;
             let reply = post_message(&kit, &seeded.api_key, QUESTION, None).await;
             assert_eq!(
@@ -1090,24 +1124,14 @@ async fn a_transient_failure_is_retryable_writes_nothing_and_a_retry_succeeds() 
         let seeded = seed(&kit, "Transient", RESET_DOC).await;
         // A provider pause is passed through, rounded up to whole seconds
         // and never below 1; no pause is the 2s default.
-        for pause in [
-            Duration::from_secs(7),
-            Duration::from_millis(1500),
-            Duration::from_millis(1),
-            Duration::ZERO,
+        for (pause, expected) in [
+            (Some(Duration::from_secs(7)), "7"),
+            (Some(Duration::from_millis(1500)), "2"),
+            (Some(Duration::from_millis(1)), "1"),
+            (Some(Duration::ZERO), "1"),
+            (None, "2"),
         ] {
-            model.push(Err(TextModelError::Transient {
-                retry_after: Some(pause),
-            }));
-        }
-        model.push(Err(TextModelError::Transient { retry_after: None }));
-        model.push(reply(
-            "From settings.",
-            &[(&seeded.chunk_id, "settings page")],
-            0.9,
-        ));
-
-        for expected in ["7", "2", "1", "1", "2"] {
+            model.set_mode(TextModelMode::Transient { retry_after: pause });
             let reply = post_message(&kit, &seeded.api_key, QUESTION, None).await;
             assert_eq!(
                 reply.status,
@@ -1130,6 +1154,12 @@ async fn a_transient_failure_is_retryable_writes_nothing_and_a_retry_succeeds() 
             assert_eq!(count_of(&kit, "sg_messages"), 0);
         }
 
+        model.set_mode(reply(
+            "From settings.",
+            &[(&seeded.chunk_id, "settings page")],
+            0.9,
+        ));
+
         let body = turn(&kit, &seeded.api_key, QUESTION, None).await;
         assert_eq!(body["outcome"], "answered");
         assert_eq!(count_of(&kit, "sg_conversations"), 1);
@@ -1146,9 +1176,7 @@ async fn a_transient_failure_on_an_existing_conversation_consumes_nothing() {
     for (kit, model) in model_kits() {
         let seeded = seed(&kit, "Budget", RESET_DOC).await;
         let unsure = || reply("Maybe this?", &[(seeded.chunk_id.as_str(), "q")], 0.3);
-        model.push(unsure());
-        model.push(Err(TextModelError::Transient { retry_after: None }));
-        model.push(unsure());
+        model.set_mode(unsure());
 
         let first = turn(&kit, &seeded.api_key, QUESTION, None).await;
         assert_eq!(first["outcome"], "clarify");
@@ -1156,6 +1184,7 @@ async fn a_transient_failure_on_an_existing_conversation_consumes_nothing() {
         let before = conversation_rows(&kit);
         assert_eq!(count_of(&kit, "sg_messages"), 2);
 
+        model.set_mode(TextModelMode::Transient { retry_after: None });
         let failed = post_message(
             &kit,
             &seeded.api_key,
@@ -1165,6 +1194,8 @@ async fn a_transient_failure_on_an_existing_conversation_consumes_nothing() {
         .await;
         assert_eq!(failed.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(failed.headers.contains_key(header::RETRY_AFTER));
+
+        model.set_mode(unsure());
         assert_eq!(
             conversation_rows(&kit),
             before,
@@ -1227,7 +1258,11 @@ async fn unparseable_wrong_shape_and_refused_replies_are_502s_that_write_nothing
     ];
     for dialect in Dialect::available() {
         for (why, scripted) in &unusable {
-            let model = FakeTextModel::scripted(vec![scripted.clone()]);
+            let mode = match scripted {
+                Ok(completion) => TextModelMode::Complete(completion.clone()),
+                Err(error) => TextModelMode::Error(error.clone()),
+            };
+            let model = FakeTextModel::new(mode);
             let kit = kit_with_model(dialect.clone(), &model);
             let seeded = seed(&kit, "Garbage", RESET_DOC).await;
 
@@ -1261,8 +1296,7 @@ async fn the_tenant_threshold_overrides_the_documented_default() {
                 0.7,
             )
         };
-        model.push(confident());
-        model.push(confident());
+        model.set_mode(confident());
 
         // Under the 0.60 default, 0.7 answers.
         let first = turn(&kit, &seeded.api_key, QUESTION, None).await;
@@ -1381,7 +1415,7 @@ async fn nothing_retrieved_hands_off_and_marks_the_conversation_escalated() {
     for (kit, model) in model_kits() {
         // A document that shares no term with the question.
         let seeded = seed(&kit, "Empty", BILLING_DOC).await;
-        model.push(reply("Guessing freely.", &[("nowhere", "nothing")], 0.99));
+        model.set_mode(reply("Guessing freely.", &[("nowhere", "nothing")], 0.99));
 
         let body = turn(&kit, &seeded.api_key, "reset password", None).await;
         assert_eq!(body["outcome"], "handoff");
@@ -1397,13 +1431,17 @@ async fn nothing_retrieved_hands_off_and_marks_the_conversation_escalated() {
 async fn two_clarifies_then_a_handoff() {
     for (kit, model) in model_kits() {
         let seeded = seed(&kit, "Clarify", RESET_DOC).await;
-        for answer in ["Maybe this?", "Or this?", "Still guessing."] {
-            model.push(reply(answer, &[(&seeded.chunk_id, "q")], 0.3));
-        }
+        let mut answers = ["Maybe this?", "Or this?", "Still guessing."].into_iter();
+        let mut next_answer = || {
+            let answer = answers.next().expect("one scripted answer per turn");
+            reply(answer, &[(&seeded.chunk_id, "q")], 0.3)
+        };
+        model.set_mode(next_answer());
 
         let first = turn(&kit, &seeded.api_key, QUESTION, None).await;
         assert_eq!(first["outcome"], "clarify");
         let conversation = conversation_id(&first);
+        model.set_mode(next_answer());
         let second = turn(
             &kit,
             &seeded.api_key,
@@ -1415,6 +1453,7 @@ async fn two_clarifies_then_a_handoff() {
         assert_eq!(second["needs_escalation"], false);
         assert_eq!(conversation_state(&kit), ("open".to_owned(), 0));
 
+        model.set_mode(next_answer());
         let third = turn(
             &kit,
             &seeded.api_key,
@@ -1464,18 +1503,18 @@ async fn two_clarifies_then_a_handoff() {
 async fn escalation_is_sticky_across_an_answered_follow_up() {
     for (kit, model) in model_kits() {
         let seeded = seed(&kit, "Sticky", RESET_DOC).await;
-        model.push(reply("Guessing.", &[("nowhere", "nothing")], 0.99));
-        model.push(reply(
-            "From settings.",
-            &[(&seeded.chunk_id, "settings page")],
-            0.9,
-        ));
+        model.set_mode(reply("Guessing.", &[("nowhere", "nothing")], 0.99));
 
         // Nothing retrieved for this wording: handoff.
         let handoff = turn(&kit, &seeded.api_key, "billing owner", None).await;
         assert_eq!(handoff["outcome"], "handoff");
         let conversation = conversation_id(&handoff);
 
+        model.set_mode(reply(
+            "From settings.",
+            &[(&seeded.chunk_id, "settings page")],
+            0.9,
+        ));
         let follow_up = turn(&kit, &seeded.api_key, QUESTION, Some(&conversation)).await;
         assert_eq!(follow_up["outcome"], "answered");
         assert_eq!(citation_count(&follow_up), 1);
@@ -1528,26 +1567,25 @@ impl TextModel for WritesDuringCall {
 async fn a_concurrent_answered_turn_cannot_clear_an_escalation() {
     for dialect in Dialect::available() {
         let model = Arc::new(WritesDuringCall {
-            inner: FakeTextModel::scripted(Vec::new()),
+            inner: FakeTextModel::new(TextModelMode::NotConfigured),
             db: OnceLock::new(),
             pending: Mutex::new(None),
         });
         let kit = TestHarness::with_database_and_ports(
-            vec![Box::new(Support::new().text_model(model.clone()))],
+            vec![Box::new(Support::new())],
             dialect,
             |ports| {
                 ports.config = Arc::new(MapConfig::from_pairs([("ADMIN_TOKEN", ADMIN_TOKEN)]));
+                ports.text_model = Some(model.clone());
             },
         );
         assert!(model.db.set(kit.db.clone()).is_ok(), "db set once");
         let seeded = seed(&kit, "Race", RESET_DOC).await;
-        for _ in 0..2 {
-            model.inner.push(reply(
-                "From settings.",
-                &[(&seeded.chunk_id, "settings page")],
-                0.9,
-            ));
-        }
+        model.inner.set_mode(reply(
+            "From settings.",
+            &[(&seeded.chunk_id, "settings page")],
+            0.9,
+        ));
 
         let first = turn(&kit, &seeded.api_key, QUESTION, None).await;
         assert_eq!(first["outcome"], "answered");
@@ -1581,7 +1619,7 @@ async fn the_model_is_asked_for_the_fast_tier_and_sees_chunk_ids_and_the_snake_c
             "Password rules: twelve characters minimum.",
         )
         .await;
-        model.push(reply(
+        model.set_mode(reply(
             "From settings.",
             &[(&seeded.chunk_id, "settings page")],
             0.9,
@@ -1630,7 +1668,7 @@ async fn an_unknown_or_foreign_conversation_is_a_404_without_calling_the_model()
     for (kit, model) in model_kits() {
         let owner = seed(&kit, "Owner", RESET_DOC).await;
         let other = seed(&kit, "Other", RESET_DOC).await;
-        model.push(reply(
+        model.set_mode(reply(
             "From settings.",
             &[(&owner.chunk_id, "settings page")],
             0.9,
@@ -1694,7 +1732,7 @@ async fn empty_and_oversized_messages_are_validation_problems() {
 
         // The cap counts characters, not bytes: 4000 two-byte characters
         // are accepted.
-        model.push(reply("Guess.", &[], 0.1));
+        model.set_mode(reply("Guess.", &[], 0.1));
         let reply = post_message(&kit, &seeded.api_key, &at_cap, None).await;
         assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
         assert_eq!(count_of(&kit, "sg_messages"), 2);

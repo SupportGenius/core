@@ -1,12 +1,12 @@
-//! Fake [`TextModel`](crate::ports::TextModel) and
-//! [`Tracker`](crate::ports::Tracker) doubles for module tests, in the
-//! style of `cratefield_testing::fakes`: scriptable response queues that
-//! answer in order and then fail loudly, recorded calls cloned out from
-//! behind a fixture mutex, cheap [`Clone`] handles over shared interiors.
+//! Test doubles the published fakes do not cover: an in-memory
+//! [`Config`](cratefield_core::Config) a test seeds, and a
+//! [`Clock`](cratefield_core::Clock) a test moves forward.
 //!
-//! These mirror the two ports in [`crate::ports`], so they are deleted in
-//! the same pass when core publishes the real ports and this module's use
-//! statements move to `cratefield_core`.
+//! The `TextModel` and `Tracker` doubles are not here: core 0.5 publishes
+//! the two ports beside the pipeline's other inputs, and
+//! [`cratefield_testing`] publishes their fakes in the same crate
+//! (`FakeTextModel`/`FakeTracker`, mode-scripted), so a test imports them
+//! from there instead of this crate mirroring either.
 //!
 //! Behind the `testing` feature: the default build (the one the venture
 //! links into the Worker) never carries test doubles. Integration tests in
@@ -18,13 +18,8 @@
 #![allow(clippy::missing_panics_doc)]
 
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
-
-use crate::ports::tracker::{
-    Destination, Filed, TicketDraft, TicketState, TicketStatus, Tracker, TrackerError,
-};
 
 // ---------------------------------------------------------------------------
 // FakeConfig
@@ -108,151 +103,6 @@ impl SettableClock {
 impl cratefield_core::Clock for SettableClock {
     fn now(&self) -> time::OffsetDateTime {
         *self.now.lock().expect("clock lock")
-    }
-}
-
-// ---------------------------------------------------------------------------
-// FakeTextModel
-
-/// The [`TextModel`](crate::ports::text_model::TextModel) double now lives
-/// beside the port in the shared `text-model` crate (behind its own
-/// `testing` feature, which this crate's `testing` feature turns on); it is
-/// re-exported here so existing `module_escalation::testing::FakeTextModel`
-/// paths keep working.
-pub use text_model::testing::FakeTextModel;
-
-// ---------------------------------------------------------------------------
-// FakeTracker
-
-/// An in-memory [`Tracker`] that files from a scripted queue and records
-/// every call, so a test can assert the tracker was called **exactly
-/// once** (one ticket per escalation, no duplicate on retry) or **never**
-/// (a gate refused, no ticket filed).
-///
-/// [`file`](Tracker::file) answers from its queue in order and then fails
-/// loudly with [`TrackerError::Rejected`] — again, an exhausted script is
-/// a bug in the test, and `Rejected` (not `Transient`) stops a retry loop
-/// from marching on. [`status`](Tracker::status) answers from its own
-/// script, falling through to a fixed `Open` status for the id it was
-/// asked about.
-///
-/// The [`Credential`] is deliberately **not** recorded: it is secret
-/// material (`Zeroizing`-wrapped, deliberately neither `Debug`-printable
-/// nor comparable), and a recorded copy would be a second live buffer of
-/// the secret a test never needs.
-///
-/// [`Credential`]: crate::ports::tracker::Credential
-#[derive(Clone)]
-pub struct FakeTracker {
-    inner: Arc<FakeTrackerInner>,
-}
-
-struct FakeTrackerInner {
-    scripted: Mutex<VecDeque<Result<Filed, TrackerError>>>,
-    files: Mutex<Vec<(Destination, TicketDraft)>>,
-    statuses: Mutex<VecDeque<TicketStatus>>,
-    status_calls: Mutex<Vec<String>>,
-}
-
-impl FakeTracker {
-    /// Files answer with `responses` in order, then with the
-    /// exhausted-script rejection. Statuses answer with a fixed
-    /// [`TicketState::Open`] unless [`FakeTracker::status_scripted`] is
-    /// called.
-    #[must_use]
-    pub fn scripted(responses: Vec<Result<Filed, TrackerError>>) -> Self {
-        Self {
-            inner: Arc::new(FakeTrackerInner {
-                scripted: Mutex::new(responses.into_iter().collect()),
-                files: Mutex::new(Vec::new()),
-                statuses: Mutex::new(VecDeque::new()),
-                status_calls: Mutex::new(Vec::new()),
-            }),
-        }
-    }
-
-    /// One tracker that accepts a single file with this result — the
-    /// happy path, in one line.
-    #[must_use]
-    pub fn accepting(filed: Filed) -> Self {
-        Self::scripted(vec![Ok(filed)])
-    }
-
-    /// Makes [`status`](Tracker::status) answer with `statuses` in order
-    /// (then with the fixed `Open` default), so a follow-up test can walk
-    /// a ticket from `Open` to `Resolved` to `Closed`.
-    pub fn status_scripted(&self, statuses: Vec<TicketStatus>) {
-        *self.inner.statuses.lock().expect("tracker lock") = statuses.into_iter().collect();
-    }
-
-    /// Every `(destination, draft)` this fake was asked to file, in call
-    /// order — including the calls that answered with an error, since
-    /// whether the tracker was *reached* is exactly what a retry test
-    /// asserts on.
-    #[must_use]
-    pub fn filed(&self) -> Vec<(Destination, TicketDraft)> {
-        self.inner.files.lock().expect("tracker lock").clone()
-    }
-
-    /// Every `external_id` a status was asked about, in call order.
-    #[must_use]
-    pub fn status_calls(&self) -> Vec<String> {
-        self.inner
-            .status_calls
-            .lock()
-            .expect("tracker lock")
-            .clone()
-    }
-}
-
-#[async_trait::async_trait]
-impl Tracker for FakeTracker {
-    async fn file(
-        &self,
-        dest: &Destination,
-        _cred: &crate::ports::tracker::Credential,
-        draft: &TicketDraft,
-    ) -> Result<Filed, TrackerError> {
-        self.inner
-            .files
-            .lock()
-            .expect("tracker lock")
-            .push((dest.clone(), draft.clone()));
-        let next = self
-            .inner
-            .scripted
-            .lock()
-            .expect("tracker lock")
-            .pop_front();
-        next.unwrap_or_else(|| {
-            Err(TrackerError::Rejected(
-                "fake tracker script exhausted".to_owned(),
-            ))
-        })
-    }
-
-    async fn status(
-        &self,
-        _dest: &Destination,
-        _cred: &crate::ports::tracker::Credential,
-        external_id: &str,
-    ) -> Result<TicketStatus, TrackerError> {
-        self.inner
-            .status_calls
-            .lock()
-            .expect("tracker lock")
-            .push(external_id.to_owned());
-        let next = self
-            .inner
-            .statuses
-            .lock()
-            .expect("tracker lock")
-            .pop_front();
-        Ok(next.unwrap_or(TicketStatus {
-            external_id: external_id.to_owned(),
-            state: TicketState::Open,
-            url: None,
-        }))
     }
 }
 

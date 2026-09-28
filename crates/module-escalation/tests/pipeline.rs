@@ -9,28 +9,17 @@ mod support;
 
 use std::sync::Arc;
 
-use cratefield_testing::{FakeMailer, MailerMode};
+use cratefield_core::{Destination, ModelTier, Prompt, Severity};
+use cratefield_testing::{FakeMailer, FakeTracker, MailerMode, TrackerMode};
 use module_escalation::model::{Drafted, EventKind, Judgment, Status, Verdict};
-use module_escalation::ports::text_model::ModelTier;
-use module_escalation::ports::tracker::{Destination, Severity};
-use module_escalation::testing::{FakeTextModel, FakeTracker};
 use support::Fixture;
 
-/// The scripted fakes of the happy path: a draft, then a `file` verdict,
-/// then a tracker that accepts once.
+/// The scripted fakes of the happy path: a fast-tier draft, a strong-tier
+/// `file` verdict, then a tracker that accepts.
 fn happy() -> Fixture {
     support::fixture(
-        FakeTextModel::scripted(vec![
-            Ok(support::completion(
-                ModelTier::Fast,
-                support::drafted_json(),
-            )),
-            Ok(support::completion(
-                ModelTier::Strong,
-                support::file_judgment(),
-            )),
-        ]),
-        FakeTracker::accepting(support::filed()),
+        support::happy_model(),
+        FakeTracker::new(TrackerMode::FileOk),
     )
 }
 
@@ -55,10 +44,13 @@ async fn a_handoff_becomes_a_filed_ticket_with_an_external_id() {
         "the ticket filed, not `{}`",
         ticket.status.as_str()
     );
-    assert_eq!(ticket.external_id.as_deref(), Some("acme/api#7"));
+    assert_eq!(
+        ticket.external_id.as_deref(),
+        Some(support::FILED_EXTERNAL_ID)
+    );
     assert_eq!(
         ticket.external_url.as_deref(),
-        Some("https://github.test/acme/api/7")
+        Some(support::FILED_EXTERNAL_URL)
     );
 
     // Exactly one file, under the key derived from the ticket id, with the
@@ -69,18 +61,21 @@ async fn a_handoff_becomes_a_filed_ticket_with_an_external_id() {
         1,
         "one escalation, one tracker file: {filed:?}"
     );
-    let (destination, draft) = &filed[0];
+    let call = &filed[0];
     assert_eq!(
-        draft.idempotency_key,
+        call.draft.idempotency_key,
         format!("escalation:{}", fixture.ticket_id)
     );
-    assert_eq!(draft.title, support::DRAFT_TITLE);
-    assert_eq!(draft.severity, Severity::Error);
-    assert_eq!(draft.labels, ["escalated".to_owned(), "error".to_owned()]);
-    assert_eq!(draft.environment.as_deref(), Some("production"));
+    assert_eq!(call.draft.title, support::DRAFT_TITLE);
+    assert_eq!(call.draft.severity, Severity::Error);
     assert_eq!(
-        destination,
-        &Destination::GitHub {
+        call.draft.labels,
+        ["escalated".to_owned(), "error".to_owned()]
+    );
+    assert_eq!(call.draft.environment.as_deref(), Some("production"));
+    assert_eq!(
+        call.dest,
+        Destination::GitHub {
             owner: "acme".to_owned(),
             repo: "api".to_owned(),
         }
@@ -88,7 +83,7 @@ async fn a_handoff_becomes_a_filed_ticket_with_an_external_id() {
 
     // The right tier asked at each stage, each carrying its own schema,
     // and the draft drafted from the transcript itself.
-    let prompts = fixture.model.prompts();
+    let prompts: Vec<Prompt> = fixture.model.prompts();
     assert_eq!(prompts.len(), 2);
     assert_eq!(prompts[0].tier, ModelTier::Fast);
     assert_eq!(prompts[1].tier, ModelTier::Strong);
@@ -109,20 +104,10 @@ async fn a_handoff_becomes_a_filed_ticket_with_an_external_id() {
 #[pollster::test]
 async fn a_reject_verdict_never_calls_the_tracker_and_records_why() {
     let fixture = support::fixture(
-        FakeTextModel::scripted(vec![
-            Ok(support::completion(
-                ModelTier::Fast,
-                support::drafted_json(),
-            )),
-            Ok(support::completion(
-                ModelTier::Strong,
-                support::reject_judgment(),
-            )),
-        ]),
-        // An empty script answers any tracker call with a loud Rejected —
-        // which would dead-letter the ticket and fail the status assert
-        // below. Only a tracker the pipeline never reaches passes.
-        FakeTracker::scripted(vec![]),
+        support::scripted_model(support::drafted_json(), support::reject_judgment()),
+        // An accepting tracker: if the pipeline wrongly reached it, the
+        // file would succeed and the status assert below would catch it.
+        FakeTracker::new(TrackerMode::FileOk),
     );
     let pipeline = fixture.pipeline();
     support::drain_all(&pipeline);
@@ -176,17 +161,8 @@ async fn a_reject_verdict_never_calls_the_tracker_and_records_why() {
 #[pollster::test]
 async fn a_needs_info_verdict_writes_a_question_instead_of_filing() {
     let fixture = support::fixture(
-        FakeTextModel::scripted(vec![
-            Ok(support::completion(
-                ModelTier::Fast,
-                support::drafted_json(),
-            )),
-            Ok(support::completion(
-                ModelTier::Strong,
-                support::needs_info_judgment(),
-            )),
-        ]),
-        FakeTracker::scripted(vec![]),
+        support::scripted_model(support::drafted_json(), support::needs_info_judgment()),
+        FakeTracker::new(TrackerMode::FileOk),
     );
     let pipeline = fixture.pipeline();
     support::drain_all(&pipeline);
@@ -275,7 +251,7 @@ async fn the_event_trail_reads_as_an_audit_of_every_stage() {
     let filed = support::event_of_kind(&events, EventKind::Filed);
     assert_eq!(
         filed.detail.as_ref().expect("filed carries the reference")["external_id"],
-        serde_json::json!("acme/api#7")
+        serde_json::json!(support::FILED_EXTERNAL_ID)
     );
 
     // The intake row opens the trail and names the conversation.
@@ -311,7 +287,7 @@ async fn notify_skips_with_an_explicit_reason_when_no_mailer_is_wired() {
     assert_eq!(detail["reason"], serde_json::json!("no_mailer"));
     let message = detail["message"].as_str().expect("the message is recorded");
     assert!(
-        message.contains("acme/api#7"),
+        message.contains(support::FILED_EXTERNAL_ID),
         "the recorded message points at the filed ticket: {message}"
     );
 }
