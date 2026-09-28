@@ -17,9 +17,38 @@ the optional `RateLimiter` port.
 | --- | --- | --- |
 | `POST /admin/tenants` | admin token | `{"name"}` → a tenant and its first API key (shown once) |
 | `PUT /admin/tenants/{tenant_id}/settings` | admin token | `{"answer_threshold": 0.9}` → the tenant's answer threshold |
-| `POST /sources` | API key | `{"title"?, "text"}` or `{"title"?, "url"}` → chunked and indexed |
+| `POST /sources` | API key | `{"title"?, "text"}` or `{"title"?, "url"}`, each with an optional `external_id` → chunked and indexed; a repeat `external_id` replaces that source in place (`200`, same id), a fresh one is created (`201`) |
+| `GET /sources?limit=…&after=…` | API key | the tenant's sources, keyset-paginated by id (default 50, 1..=100 per page) |
+| `GET /sources/{source_id}` | API key | one source, in the list's item shape |
+| `PUT /sources/{source_id}` | API key | replace a source's content and metadata, body shaped like `POST /sources` |
+| `DELETE /sources/{source_id}` | API key | remove a source and its whole index; `204`, no body |
 | `GET /search?q=…&limit=…` | API key | BM25 over the tenant's own index |
 | `POST /messages` | API key | `{"message", "conversation_id"?}` → one support turn |
+
+### Sources
+
+Every source answers the same item shape — `{id, title, origin, external_id,
+bytes, chunk_count, updated_at}` — from the list, the single read and a
+replacement. `origin` is `text` or `url`. `updated_at` starts at the
+instant the source was created and moves with every replacement.
+
+`external_id` is the caller's own key for a document (`"handbook"`, or the
+URL the `{"url"}` form fetched it from — that form defaults it to the
+URL). Re-`POST`ing an `external_id` the tenant already has replaces that
+source **in place**: same id, same code path as `PUT`, answered `200`
+instead of `201`. The id is unique per tenant, so two tenants may both say
+`"handbook"`, and omitting it keeps the original behavior — every request
+creates a new source.
+
+`PUT` replaces everything: content, title, `external_id` (a body without
+one clears it) and the window set. Windows are re-derived under the same
+source id, and because chunk ids are content addresses of
+`(tenant, source, text)`, unchanged text keeps its chunk rows —
+`created_at` and postings included; only vanished and added windows are
+written. A body `external_id` another source of the same tenant already
+holds is answered `409` rather than written. Listing, reading, replacing
+and deleting all answer `404` — the same `404` — for an id that is
+missing or another tenant's.
 
 ### `POST /messages`
 
@@ -109,5 +138,5 @@ pinned by the workspace's single `cratefield-*` git rev (see the root
 
 ## Not built yet
 
-Source deletion, and composing module-escalation so that a handoff also
-files an escalation in the same batch.
+Composing module-escalation so that a handoff also files an escalation in
+the same batch.
