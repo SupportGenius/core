@@ -2356,11 +2356,18 @@ async fn sources_list_get_and_foreign_ids_are_tenant_scoped() {
 #[pollster::test]
 async fn every_source_route_rate_limits_before_touching_the_store() {
     for dialect in Dialect::available() {
+        // Minting the tenant goes through the limiter too, so the first
+        // decision lets it through; every source route after it is refused.
         let limiter = FakeRateLimiter::scripted(
-            Vec::new(),
+            vec![Decision {
+                ok: true,
+                retry_after: None,
+                quota: None,
+            }],
             Decision {
                 ok: false,
                 retry_after: Some(Duration::from_secs(3)),
+                quota: None,
             },
         );
         let kit = TestHarness::with_database_and_ports(support(), dialect, |ports| {
@@ -2368,6 +2375,7 @@ async fn every_source_route_rate_limits_before_touching_the_store() {
             ports.rate_limiter = Some(Arc::new(limiter.clone()));
         });
         let tenant = mint_tenant(&kit, "Limited").await;
+        let minted = limiter.calls();
         let api_key = body_str(&tenant, "api_key");
         let missing = source_path("no-such-source");
         let malformed = format!("{SOURCES}?limit=abc");
@@ -2400,7 +2408,7 @@ async fn every_source_route_rate_limits_before_touching_the_store() {
             );
         }
         assert_eq!(
-            limiter.calls(),
+            limiter.calls() - minted,
             6,
             "one limiter check per request, reached every time"
         );
