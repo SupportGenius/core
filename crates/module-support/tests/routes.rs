@@ -2415,3 +2415,328 @@ async fn every_source_route_rate_limits_before_touching_the_store() {
         assert_eq!(count_of(&kit, "sg_sources"), 0, "nothing was written");
     }
 }
+
+// Issue #32: unspaced-script retrieval (overlapping bigrams and the
+// scheduled re-index that re-claims an existing index) and the per-turn
+// language (`respond_in`, the `lang` column, the localized canned texts).
+// ---------------------------------------------------------------------
+
+/// Percent-encodes a query value the way a browser would, so a Japanese
+/// or Thai `q` survives `Request::builder().uri(...)` — the `Query`
+/// extractor on the other side decodes it back.
+fn encoded(query: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for byte in query.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char);
+            }
+            other => {
+                let _ = write!(out, "%{other:02X}");
+            }
+        }
+    }
+    out
+}
+
+#[pollster::test]
+async fn japanese_documents_are_found_by_japanese_queries_in_ranked_order() {
+    for kit in kits() {
+        let tenant = mint_tenant(&kit, "日本語").await;
+        let api_key = body_str(&tenant, "api_key");
+
+        // Two documents that share no bigram with each other's topic:
+        // password reset versus billing.
+        let a = ingest(
+            &kit,
+            &api_key,
+            json!({ "title": "パスワード", "text": "パスワードをリセットするには、設定ページからアカウントにログインしてください。" }),
+        )
+        .await;
+        let b = ingest(
+            &kit,
+            &api_key,
+            json!({ "title": "請求", "text": "請求書の支払い方法は、アカウントの請求セクションで変更できます。" }),
+        )
+        .await;
+        let (a_id, b_id) = (
+            body_str(&a.body, "source_id"),
+            body_str(&b.body, "source_id"),
+        );
+        assert_eq!(a.body["chunks"], 1, "{}", a.body);
+        assert_eq!(b.body["chunks"], 1, "{}", b.body);
+
+        // Each query names one document's bigrams only: that document
+        // ranks first, with strictly ordered scores — bigram retrieval,
+        // end to end, through the one tokenizer both sides share.
+        for (query, expected) in [
+            ("パスワードをリセット", a_id.as_str()),
+            ("請求書の支払い方法", b_id.as_str()),
+        ] {
+            let reply = search(&kit, &api_key, &format!("q={}", encoded(query))).await;
+            assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+            let results = reply.body["results"].as_array().expect("results array");
+            assert_eq!(results.len(), 1, "{query}: {}", reply.body);
+            assert_eq!(results[0]["source_id"], expected, "{query}");
+        }
+    }
+}
+
+#[pollster::test]
+async fn the_scheduled_reindex_reclaims_a_v1_index_for_japanese_queries() {
+    for kit in kits() {
+        let seeded = seed(
+            &kit,
+            "Reindexed",
+            "パスワードのリセットは設定ページから行えます",
+        )
+        .await;
+
+        // Simulate what the v1 tokenizer wrote: one unsegmented token for
+        // the whole run, stamped with version 1. (The text is one
+        // whitespace-delimited word, so v1 indexed exactly this term.)
+        let v1_term = "パスワードのリセットは設定ページから行えます";
+        for sql in [
+            format!(
+                "UPDATE sg_chunks SET tokenizer_version = 1, term_count = 1 \
+                 WHERE id = '{}'",
+                seeded.chunk_id
+            ),
+            format!(
+                "DELETE FROM sg_postings WHERE chunk_id = '{}'",
+                seeded.chunk_id
+            ),
+            format!(
+                "INSERT INTO sg_postings (tenant_id, term, chunk_id, tf) VALUES \
+                 ('{}', '{v1_term}', '{}', 1)",
+                seeded.tenant_id, seeded.chunk_id
+            ),
+        ] {
+            pollster::block_on(kit.db.execute(&Statement::new(sql))).expect("v1 simulation runs");
+        }
+
+        // The natural query misses: v1 matches only the exact full run.
+        let before = search(
+            &kit,
+            &seeded.api_key,
+            "q=%E3%83%91%E3%82%B9%E3%83%AF%E3%83%BC%E3%83%89",
+        )
+        .await;
+        assert_eq!(
+            before.body["results"]
+                .as_array()
+                .expect("results array")
+                .len(),
+            0,
+            "a v1 index does not answer a natural query: {}",
+            before.body
+        );
+
+        // The sweep re-tokenizes the stale chunk from its stored text.
+        let reindexed = module_support::reindex_stale_chunks(kit.db.as_ref(), 100)
+            .await
+            .expect("re-index runs");
+        assert_eq!(reindexed, 1);
+        assert_eq!(
+            count_where(&kit, "sg_chunks", "tokenizer_version = 2"),
+            1,
+            "the chunk is restamped"
+        );
+        // The term count is the re-tokenized corpus length the ranker
+        // reads: the sum of the new postings' frequencies.
+        let (term_count, posting_sum): (i64, i64) = pollster::block_on(async {
+            let rows = kit
+                .db
+                .query(&Statement::new(format!(
+                    "SELECT (SELECT term_count FROM sg_chunks WHERE id = '{}') AS n, \
+                     (SELECT COALESCE(SUM(tf), 0) FROM sg_postings WHERE chunk_id = '{}') AS s",
+                    seeded.chunk_id, seeded.chunk_id
+                )))
+                .await
+                .expect("stats query runs");
+            let row = rows.rows.first().expect("one stats row");
+            (row.get("n").expect("n"), row.get("s").expect("s"))
+        });
+        assert!(term_count > 1, "bigrams were written: {term_count}");
+        assert_eq!(term_count, posting_sum, "term_count matches the postings");
+
+        // And the same query now finds the document.
+        let after = search(
+            &kit,
+            &seeded.api_key,
+            "q=%E3%83%91%E3%82%B9%E3%83%AF%E3%83%BC%E3%83%89",
+        )
+        .await;
+        let results = after.body["results"].as_array().expect("results array");
+        assert_eq!(results.len(), 1, "{}", after.body);
+        assert_eq!(results[0]["chunk_id"], seeded.chunk_id.as_str());
+
+        // A current index is left alone: the sweep answers 0 and a
+        // re-ingest of unchanged text is not churned by the stamp.
+        assert_eq!(
+            module_support::reindex_stale_chunks(kit.db.as_ref(), 100)
+                .await
+                .expect("re-index runs"),
+            0,
+            "nothing is stale any more"
+        );
+    }
+}
+
+#[pollster::test]
+async fn a_german_turn_records_the_language_and_asks_the_model_to_answer_in_it() {
+    for (kit, model) in model_kits() {
+        let seeded = seed(
+            &kit,
+            "Deutsch",
+            "Sie können Ihr Passwort auf der Einstellungsseite unter Sicherheit zurücksetzen.",
+        )
+        .await;
+        let german = "Auf der Einstellungsseite unter Sicherheit.";
+        model.set_mode(reply(
+            german,
+            &[(&seeded.chunk_id, "Passwort auf der Einstellungsseite")],
+            0.9,
+        ));
+
+        // whatlang answers reliably for this question (verified: deu,
+        // confidence ~0.97), so no Accept-Language header is needed.
+        let body = turn(
+            &kit,
+            &seeded.api_key,
+            "Wie kann ich mein Passwort zurücksetzen?",
+            None,
+        )
+        .await;
+        assert_eq!(body["outcome"], "answered");
+        assert_eq!(body["answer"], german);
+
+        let prompts = model.prompts();
+        assert_eq!(prompts.len(), 1);
+        let user: String = prompts[0]
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert!(
+            user.contains("respond_in: de"),
+            "the turn's language is named for the model: {user}"
+        );
+        assert!(
+            prompts[0]
+                .system
+                .as_deref()
+                .is_some_and(|system| system.contains("respond_in")),
+            "the system prompt tells the model what respond_in means"
+        );
+
+        // Both messages of the turn carry the language.
+        assert_eq!(
+            text_column(&kit, "SELECT lang AS v FROM sg_messages ORDER BY seq"),
+            ["de", "de"]
+        );
+    }
+}
+
+#[pollster::test]
+async fn an_undetectable_language_falls_back_to_accept_language_or_none() {
+    for (kit, model) in model_kits() {
+        let seeded = seed(&kit, "Ambiguous", RESET_DOC).await;
+        model.set_mode(reply(
+            "From settings.",
+            &[(&seeded.chunk_id, "settings page")],
+            0.9,
+        ));
+
+        // "How do I reset my password?" is genuinely undecidable from
+        // trigrams alone (whatlang calls it unreliable), so the header
+        // decides — its first entry, quality values respected.
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(MESSAGES)
+            .header(header::AUTHORIZATION, format!("Bearer {}", seeded.api_key))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT_LANGUAGE, "ja, en;q=0.8")
+            .body(Body::from(json!({ "message": QUESTION }).to_string()))
+            .expect("request builds");
+        let replied = Reply::of(
+            kit.router
+                .clone()
+                .oneshot(request)
+                .await
+                .expect("router answers"),
+        )
+        .await;
+        assert_eq!(replied.status, StatusCode::OK, "{}", replied.body);
+        assert!(
+            model
+                .prompts()
+                .last()
+                .expect("one turn")
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<String>()
+                .contains("respond_in: ja"),
+            "Accept-Language's first entry names the language"
+        );
+
+        // With no header either, the turn has no language and the prompt
+        // carries no respond_in line.
+        let bare = turn(&kit, &seeded.api_key, QUESTION, None).await;
+        assert_eq!(bare["outcome"], "answered");
+        assert!(
+            !model
+                .prompts()
+                .last()
+                .expect("second turn")
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<String>()
+                .contains("respond_in"),
+            "no language, no respond_in line"
+        );
+        // Both turns wrote both messages; the first named ja, the second
+        // had no signal at all.
+        assert_eq!(count_where(&kit, "sg_messages", "lang = 'ja'"), 2);
+        assert_eq!(count_where(&kit, "sg_messages", "lang IS NULL"), 2);
+    }
+}
+
+#[pollster::test]
+async fn a_german_clarify_is_rendered_in_german() {
+    for (kit, model) in model_kits() {
+        // A retrieval that finds the document but a model answer below
+        // the threshold: the turn downgrades to the canned clarify, in
+        // the question's language. (An empty retrieval would hand off
+        // instead — see `nothing_retrieved_hands_off…`.)
+        let seeded = seed(
+            &kit,
+            "Klarstellung",
+            "Sie können Ihr Passwort auf der Einstellungsseite unter Sicherheit zurücksetzen.",
+        )
+        .await;
+        model.set_mode(reply(
+            "Rate ich einfach.",
+            &[(&seeded.chunk_id, "Passwort")],
+            0.3,
+        ));
+
+        let body = turn(
+            &kit,
+            &seeded.api_key,
+            "Wie kann ich mein Passwort zurücksetzen?",
+            None,
+        )
+        .await;
+        assert_eq!(body["outcome"], "clarify");
+        assert_eq!(citation_count(&body), 0);
+        assert_eq!(
+            body_str(&body, "answer"),
+            "Ich möchte Ihnen eine fundierte Antwort geben statt einer schnellen falschen — \
+             könnten Sie die Frage umformulieren oder ein paar Einzelheiten ergänzen?"
+        );
+    }
+}

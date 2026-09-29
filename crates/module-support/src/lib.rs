@@ -40,15 +40,29 @@ mod store;
 
 pub use answer::DEFAULT_ANSWER_THRESHOLD;
 pub use chunk::tokenize;
+pub use store::reindex_stale_chunks;
 
 use std::sync::Arc;
 
 use cratefield_core::{
-    Config, ConfigError, DataKind, Disposition, Migrations, Module, ModuleConfig, ModuleContext,
-    PersonalDataSet, Port, SqlMigration, assert_migration_set,
+    AnyError, BoxFuture, Config, ConfigError, DataKind, Disposition, Migrations, Module,
+    ModuleConfig, ModuleContext, PersonalDataSet, Port, SqlMigration, assert_migration_set,
 };
 
 pub(crate) const MODULE_NAME: &str = "support";
+
+/// How many stale-version chunks one sweep of the scheduled re-index
+/// re-tokenizes. Bounded on purpose: the chunker counts words, so
+/// spaceless CJK text can be one very long chunk, and that chunk's
+/// postings rewrite is bounded by its character count — a 48 KiB Han run
+/// is thousands of bigram rows. Each chunk is one `batch_atomic`, so
+/// batching per chunk keeps every rewrite atomic.
+const REINDEX_BATCH: usize = 200;
+
+/// How many sweeps one tick spends before leaving the rest to the next
+/// cron tick — the escalation module's bounded-drain shape, so a large
+/// backlog drains across days rather than in one isolate.
+const REINDEX_MAX_SWEEPS: usize = 10;
 
 /// The v0 schema: five tables of portable SQL (ADR 0004), every one of
 /// them carrying `tenant_id`.
@@ -72,6 +86,15 @@ const MIGRATION_SOURCE_MANAGEMENT: SqlMigration = SqlMigration::new(
     "0003",
     "source_management",
     include_str!("../migrations/sqlite/0003_source_management.sql"),
+);
+
+/// Unspaced-script retrieval and the per-turn language: `tokenizer_version`
+/// on every chunk — the watermark the scheduled re-index drains — and
+/// `lang` on every message.
+const MIGRATION_INTERNATIONALIZATION: SqlMigration = SqlMigration::new(
+    "0004",
+    "internationalization",
+    include_str!("../migrations/sqlite/0004_internationalization.sql"),
 );
 
 /// The support module: tenant provisioning behind the harness admin
@@ -241,7 +264,8 @@ impl Module for Support {
                 "sg_messages",
                 DataKind::Content,
                 "The messages of each support conversation: what the end user wrote, what \
-                 they were shown and what the model answered. The text may mention people.",
+                 they were shown, what the model answered and the language the turn was \
+                 detected to be in. The text may mention people.",
                 "The workspace's end users are anonymous to this module: a message carries \
                  no email, account or other column that identifies its author, so no \
                  erasure predicate can match a person into it. Messages leave when the \
@@ -256,10 +280,11 @@ impl Module for Support {
     }
 
     fn migrations(&self) -> Migrations {
-        const MIGRATIONS: [SqlMigration; 3] = [
+        const MIGRATIONS: [SqlMigration; 4] = [
             MIGRATION_INIT,
             MIGRATION_CONVERSATIONS,
             MIGRATION_SOURCE_MANAGEMENT,
+            MIGRATION_INTERNATIONALIZATION,
         ];
         // Refuses a gap, a duplicate or an out-of-order id at compile
         // time.
@@ -316,5 +341,39 @@ impl Module for Support {
         // `None` — and the degraded 503 — where it resolved nothing.
         let text_model = ctx.ports.text_model.clone();
         handlers::router(Arc::new(ctx), text_model)
+    }
+
+    /// The re-index drain: every chunk whose `tokenizer_version` stamp
+    /// predates [`chunk::TOKENIZER_VERSION`] is re-tokenized from its
+    /// stored text and its postings, `term_count` and stamp rewritten,
+    /// [`REINDEX_BATCH`] at a time, until a sweep comes back short or
+    /// [`REINDEX_MAX_SWEEPS`] are spent — so a tokenizer change re-claims
+    /// the existing index over the cron ticks that follow it, and a chunk
+    /// never sits half-rewritten. The venture's daily Worker cron (and the
+    /// native binary's scheduler, where one runs) fans out here; the
+    /// sweep's body is [`reindex_stale_chunks`], which tests and operators
+    /// can drive directly.
+    fn scheduled<'a>(
+        &'a self,
+        ctx: &'a ModuleContext,
+        _cron: &'a str,
+    ) -> BoxFuture<'a, Result<(), AnyError>> {
+        Box::pin(async move {
+            let Some(db) = ctx.ports.db.clone() else {
+                // `Port::Db` is required, so a composed venture always
+                // resolves it; a hand-rolled context may not, and
+                // sweeping nothing beats panicking a cron tick.
+                return Ok(());
+            };
+            for _ in 0..REINDEX_MAX_SWEEPS {
+                let rewritten = reindex_stale_chunks(db.as_ref(), REINDEX_BATCH)
+                    .await
+                    .map_err(|err| Box::new(err) as AnyError)?;
+                if rewritten < REINDEX_BATCH {
+                    break;
+                }
+            }
+            Ok(())
+        })
     }
 }
