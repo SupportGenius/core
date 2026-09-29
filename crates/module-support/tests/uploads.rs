@@ -998,7 +998,8 @@ fn the_upload_migration_follows_internationalization() {
             ("0003", "source_management"),
             ("0004", "internationalization"),
             ("0005", "uploads"),
+            ("0006", "connectors"),
         ],
-        "uploads is support/0005, after the two migrations main gained"
+        "uploads is support/0005, after the two migrations main gained (connectors follow it)"
     );
 }

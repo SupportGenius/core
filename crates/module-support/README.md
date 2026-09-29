@@ -28,6 +28,7 @@ the optional `RateLimiter` port.
 | `PUT /uploads/{id}/parts/{n}` | API key | raw part bytes (1..=48 KiB), contiguous from 0 |
 | `POST /uploads/{id}/complete` | API key | checks the parts add up, enqueues the `extract` job → `202` |
 | `GET /uploads/{id}` | API key | the upload's status, `received_bytes`, and once extracted its `source_id` |
+| `POST /connectors` | API key | `{"kind": "sitemap" \| "url_prefix", "url"}` or `{"kind": "github", "owner", "repo", "path_glob"?, "ref"?, "credential_ref"?}`, with optional `max_pages`/`max_bytes`/`max_depth` → `201`; the crawl runs asynchronously and re-syncs on cron |
 | `GET /search?q=…&limit=…` | API key | BM25 over the tenant's own index |
 | `POST /messages` | API key | `{"message", "conversation_id"?}` → one support turn |
 
@@ -96,6 +97,40 @@ failed with the reason. An upload that was never completed is
 garbage-collected by the same cron sweep. All of this needs the `Blob`
 port; without one the upload routes answer `503 not-ready`, and every
 other route is unaffected.
+
+### Connectors
+
+A connector keeps part of the index synced from a sitemap (or sitemap
+index), a URL prefix, or a GitHub repository's files. Creating one stores
+the crawl root and its seed fetch in one batch; the fetches are outbox
+jobs, one URL each, run inline where the `Defer` port allows and on every
+cron tick regardless. A re-sync re-fetches every URL the connector knows
+with its stored `ETag`/`Last-Modified`: a `304` writes nothing, a changed
+body replaces the source in place, and a `404`/`410` deletes it.
+
+Every page a connector indexes is an ordinary source: it lists under
+`GET /sources` with `origin` `url`, its `external_id` is the fetched URL
+(`github:{owner}/{repo}:{path}` for a repository file), `bytes` is the
+indexed text's size, and `updated_at` moves on every re-index while the
+first index date is kept. A source the tenant indexed by hand under the
+same `external_id` is the same document, so the connector adopts and
+replaces it. A connector source deleted through `DELETE /sources/{id}`
+stays deleted until the page next changes.
+
+The fetch policy is an allowlist: a sitemap connector fetches only its own
+scheme and host, a URL-prefix connector only URLs under its prefix, and a
+GitHub connector only `api.github.com` under its owner and repo. GitHub
+fetches authenticate with the Config key named by `credential_ref` — the
+key's *name* is stored, never the token. Caps (clamped, not refused):
+
+| Cap | Default | Maximum |
+| --- | --- | --- |
+| `max_pages` (page rows, navigation rows included) | 200 | 2000 |
+| `max_bytes` (per response) | 1 MiB | 4 MiB |
+| `max_depth` (link hops from the seed) | 3 | 5 |
+
+Without the `HttpClient` port `POST /connectors` answers `503 not-ready`
+and the cron re-sync does nothing.
 
 ### `POST /messages`
 
