@@ -4,9 +4,13 @@
 //!
 //! At ingest, a document (up to 48 KiB of text — see
 //! [`handlers::MAX_TEXT_BYTES`] for why) is split into overlapping word
-//! windows by [`chunk::Chunker`] and inverted into `sg_postings` rows.
-//! At query time, the caller fetches the postings for the query's terms
-//! and [`bm25::rank`] scores them in-process with Okapi BM25.
+//! windows by [`chunk::Chunker`] and inverted into `sg_postings` rows,
+//! with the corpus statistics BM25 needs (`sg_terms` document
+//! frequencies, `sg_tenant_stats` chunk counts) maintained in the same
+//! atomic batch. At query time the caller reads those statistics, then
+//! fetches at most [`store::MAX_POSTINGS_PER_TERM`] postings per query
+//! term, and [`bm25::rank`] scores them in-process with Okapi BM25 — so
+//! a query's cost is bounded by the query, not by the corpus.
 //!
 //! [`tokenize`] is shared by both halves, which is the point: a query
 //! tokenised differently from the index it searches finds nothing, so
@@ -36,7 +40,7 @@ pub mod bm25;
 pub mod chunk;
 mod handlers;
 mod messages;
-mod store;
+pub mod store;
 
 pub use answer::DEFAULT_ANSWER_THRESHOLD;
 pub use chunk::tokenize;
@@ -63,6 +67,14 @@ const MIGRATION_CONVERSATIONS: SqlMigration = SqlMigration::new(
     "0002",
     "conversations",
     include_str!("../migrations/sqlite/0002_conversations.sql"),
+);
+
+/// Persisted corpus statistics (`sg_terms`, `sg_tenant_stats`) and the
+/// per-term postings index the bounded query path reads.
+const MIGRATION_SEARCH_STATS: SqlMigration = SqlMigration::new(
+    "0003",
+    "search_stats",
+    include_str!("../migrations/sqlite/0003_search_stats.sql"),
 );
 
 /// The support module: tenant provisioning behind the harness admin
@@ -125,6 +137,8 @@ impl Module for Support {
             "sg_sources",
             "sg_chunks",
             "sg_postings",
+            "sg_terms",
+            "sg_tenant_stats",
             "sg_conversations",
             "sg_messages",
             "sg_tenant_settings",
@@ -218,6 +232,18 @@ impl Module for Support {
                  row. This version ships no source-deletion route.",
             ),
             PersonalDataSet::none(
+                "sg_terms",
+                "One row per indexed word per workspace: how many passages carry it. A word \
+                 count derived from sg_postings, kept so ranking never has to count the index; \
+                 no person is identifiable from it.",
+            ),
+            PersonalDataSet::none(
+                "sg_tenant_stats",
+                "One row per workspace: how many passages it holds and their total word count \
+                 — the two aggregates BM25 normalises with. Numbers only; nothing here names \
+                 anyone.",
+            ),
+            PersonalDataSet::none(
                 "sg_conversations",
                 "One row per support conversation: its status, whether it needs a person, \
                  and timestamps. What was said lives in sg_messages; nothing here names \
@@ -242,7 +268,11 @@ impl Module for Support {
     }
 
     fn migrations(&self) -> Migrations {
-        const MIGRATIONS: [SqlMigration; 2] = [MIGRATION_INIT, MIGRATION_CONVERSATIONS];
+        const MIGRATIONS: [SqlMigration; 3] = [
+            MIGRATION_INIT,
+            MIGRATION_CONVERSATIONS,
+            MIGRATION_SEARCH_STATS,
+        ];
         // Refuses a gap, a duplicate or an out-of-order id at compile
         // time.
         const _: () = assert_migration_set(&MIGRATIONS);

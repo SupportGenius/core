@@ -103,9 +103,16 @@ pinned by the workspace's single `cratefield-*` git rev (see the root
   characters, so scripts written without spaces (Chinese, Japanese,
   Thai) are indexed as long unsegmented runs and search poorly. This is
   a known limitation, not an oversight.
-- **Ranking trusts the caller.** `bm25::rank` computes `df` from the
-  postings it is given, so a `LIMIT` on the SQL that fetches them silently
-  skews every idf. The contract is documented on `rank`.
+- **Ranking is exact on a truncated fetch.** Corpus statistics (N, average
+  length, each term's df) live in the `sg_tenant_stats` and `sg_terms`
+  tables, written by the same batch as the postings they describe, so
+  `bm25::rank` never derives them from the rows it is handed. That is what
+  makes the per-term fetch safe to bound: `df` and `idf` stay exact even
+  though only each term's top rows by tf are read. The query path costs a
+  fixed budget of rows — one stats row, at most 32 df rows, at most 32
+  bounded postings fetches, the result's chunk rows — regardless of how
+  large the tenant's corpus grows. The contract is documented on `rank`
+  and `postings_for`.
 
 ## Not built yet
 
