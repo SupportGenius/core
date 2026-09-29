@@ -22,8 +22,9 @@ use cratefield_core::{
 
 use crate::bm25;
 use crate::chunk::{Chunker, tokenize};
+use crate::connectors::{self, ConnectorConfig, Kind};
 use crate::messages;
-use crate::store::{self, ApiKeyRow, ChunkRow, STATUS_ACTIVE, SourceRow, TenantRow};
+use crate::store::{self, ApiKeyRow, ChunkRow, ConnectorRow, STATUS_ACTIVE, SourceRow, TenantRow};
 use crate::uploads;
 
 /// The inline `text` ceiling for `POST /sources`, and one part's ceiling
@@ -110,6 +111,7 @@ pub(crate) fn router(
             post(uploads::complete_upload),
         )
         .route("/uploads/{upload_id}", get(uploads::get_upload))
+        .route("/connectors", post(create_connector))
         .route("/search", get(search))
         .route("/messages", post(messages::post_message))
         .with_state(state)
@@ -511,6 +513,271 @@ async fn ingest_source(
     }
 }
 
+/// One `POST /connectors` body. The kind decides which fields are
+/// required; the rest are optional with the documented defaults.
+#[derive(Deserialize)]
+struct ConnectorBody {
+    kind: String,
+    url: Option<String>,
+    owner: Option<String>,
+    repo: Option<String>,
+    path_glob: Option<String>,
+    r#ref: Option<String>,
+    credential_ref: Option<String>,
+    max_pages: Option<i64>,
+    max_bytes: Option<i64>,
+    max_depth: Option<i64>,
+}
+
+/// Validates a connector body's kind-specific fields into the
+/// [`ConnectorConfig`] stored with the row. Every problem is a 400 naming
+/// the field; this is the shape the route documents, and the only place a
+/// body field is interpreted.
+fn connector_kind_config(
+    body: &ConnectorBody,
+    request_id: &str,
+) -> Result<(Kind, ConnectorConfig), Problem> {
+    let kind = Kind::parse(body.kind.trim()).ok_or_else(|| {
+        Problem::validation_failed(format!(
+            "kind: expected \"sitemap\", \"url_prefix\" or \"github\", got {:?}",
+            body.kind
+        ))
+        .instance(request_id)
+    })?;
+    let config = match kind {
+        Kind::Sitemap | Kind::UrlPrefix => {
+            let url = body.url.clone().unwrap_or_default();
+            let usable = url.parse::<http::Uri>().is_ok_and(|uri| {
+                matches!(uri.scheme_str(), Some("http" | "https")) && uri.authority().is_some()
+            });
+            if !usable {
+                return Err(Problem::validation_failed(
+                    "url: required, an absolute http(s) URL — the sitemap's address, or the \
+                     prefix's seed page",
+                )
+                .instance(request_id));
+            }
+            ConnectorConfig::Web { url }
+        }
+        Kind::Github => {
+            let clean = |raw: Option<&str>| -> Option<String> {
+                let trimmed = raw?.trim();
+                (!trimmed.is_empty()
+                    && !trimmed.contains('/')
+                    && !trimmed.chars().any(char::is_whitespace))
+                .then(|| trimmed.to_owned())
+            };
+            let Some(owner) = clean(body.owner.as_deref()) else {
+                return Err(Problem::validation_failed(
+                    "owner: required for a github connector, the repository's owner with no \
+                     slashes or spaces",
+                )
+                .instance(request_id));
+            };
+            let Some(repo) = clean(body.repo.as_deref()) else {
+                return Err(Problem::validation_failed(
+                    "repo: required for a github connector, the repository's name with no \
+                     slashes or spaces",
+                )
+                .instance(request_id));
+            };
+            let optional = |raw: Option<&str>| -> Option<String> {
+                let trimmed = raw?.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_owned())
+            };
+            // `ref` defaults to the repository's default branch when
+            // absent; when present it must be one usable git ref — no
+            // empty value, whitespace, `?`/`#` (they would splice a query
+            // or fragment into the API URLs), `..` (git's own range
+            // separator) or control characters.
+            let bad_ref = || {
+                Problem::validation_failed(
+                    "ref: when present, a git ref — no empty value, whitespace, \"?\", \
+                     \"#\", \"..\" or control characters",
+                )
+                .instance(request_id)
+            };
+            let r#ref = match body.r#ref.as_deref().map(str::trim) {
+                None => None,
+                Some("") => return Err(bad_ref()),
+                Some(git_ref)
+                    if git_ref.contains(['?', '#'])
+                        || git_ref.contains("..")
+                        || git_ref.chars().any(|c| c.is_whitespace() || c.is_control()) =>
+                {
+                    return Err(bad_ref());
+                }
+                Some(git_ref) => Some(git_ref.to_owned()),
+            };
+            ConnectorConfig::Github {
+                owner,
+                repo,
+                path_glob: optional(body.path_glob.as_deref()),
+                r#ref,
+            }
+        }
+    };
+    Ok((kind, config))
+}
+
+/// The ports `POST /connectors` runs on, in [`connector_ports`]' order.
+type ConnectorPorts = (
+    Arc<dyn HttpClient>,
+    Arc<dyn Database>,
+    Arc<dyn Clock>,
+    Arc<dyn IdGen>,
+);
+
+/// Collects those ports, or says which one is missing. The `HttpClient`
+/// check doubles as the route's not-ready answer and comes before any
+/// validation output and before any write: a connector row without an
+/// `HttpClient` is a crawl that can never start, and the caller should
+/// hear that from the platform shape, not from a job that silently does
+/// nothing.
+fn connector_ports(ctx: &ModuleContext) -> Result<ConnectorPorts, Problem> {
+    let http: Arc<dyn HttpClient> = ctx.ports.http.clone().ok_or_else(|| {
+        Problem::not_ready(
+            "connectors need the HttpClient port; this deployment did not configure one. \
+             Use the {\"text\"} form of POST /sources instead.",
+        )
+    })?;
+    let db: Arc<dyn Database> = ctx
+        .ports
+        .db
+        .clone()
+        .ok_or_else(|| Problem::internal().with_detail("required port Db is missing"))?;
+    let clock: Arc<dyn Clock> = ctx
+        .ports
+        .clock
+        .clone()
+        .ok_or_else(|| Problem::internal().with_detail("required port Clock is missing"))?;
+    let id_gen: Arc<dyn IdGen> = ctx
+        .ports
+        .id_gen
+        .clone()
+        .ok_or_else(|| Problem::internal().with_detail("required port IdGen is missing"))?;
+    Ok((http, db, clock, id_gen))
+}
+
+/// The effective caps a connector row stores: absent fields take the
+/// documented defaults, and nothing may exceed the hard maxima (or fall
+/// below the minimum of 1 — a cap of zero would be a connector that
+/// cannot run at all, which the caller should say with a deletion, not
+/// a typo).
+fn clamped_caps(body: &ConnectorBody) -> (i64, i64, i64) {
+    (
+        body.max_pages
+            .unwrap_or(connectors::DEFAULT_MAX_PAGES)
+            .clamp(1, connectors::MAX_MAX_PAGES),
+        body.max_bytes
+            .unwrap_or(connectors::DEFAULT_MAX_BYTES)
+            .clamp(1, connectors::MAX_MAX_BYTES),
+        body.max_depth
+            .unwrap_or(connectors::DEFAULT_MAX_DEPTH)
+            .clamp(1, connectors::MAX_MAX_DEPTH),
+    )
+}
+
+/// `POST /connectors` — register a crawl root (issue #29): a sitemap, a
+/// URL prefix, or a GitHub repository. The row and its seed fetch job
+/// land in one atomic batch, so a connector that exists always has work
+/// queued; the fetches then run on the module's `scheduled` hook (cron),
+/// with the `Defer` port pulling the first sweep into this request where
+/// the platform allows it.
+///
+/// Caps are clamped, not rejected — a caller asking for a million pages
+/// gets the maximum, which keeps one tenant's typo from being a
+/// deployment incident. The response is the created connector's id and
+/// effective caps; the crawl itself is asynchronous from here.
+async fn create_connector(
+    scope: Scope,
+    State(state): State<Arc<ModuleState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Problem> {
+    let ctx = &state.ctx;
+    // Guards before body parsing, as everywhere above: a 4xx from an
+    // extractor would tell an unauthenticated caller the route's shape.
+    let tenant_id = authenticate(ctx, &headers).await?;
+    if let Some(rate_limited) = guard_rate_limit(ctx, &tenant_id).await {
+        return Ok(rate_limited);
+    }
+    let body: ConnectorBody = serde_json::from_slice(&body).map_err(|_| {
+        Problem::validation_failed(
+            "body: expected a JSON object with a \"kind\" of \"sitemap\", \"url_prefix\" \
+             or \"github\"",
+        )
+        .instance(&scope.request_id)
+    })?;
+
+    let (http, db, clock, id_gen) = connector_ports(ctx)?;
+    let (kind, config) = connector_kind_config(&body, &scope.request_id)?;
+    // The credential is a *reference* to a Config key (the escalation
+    // module's rule): the secret itself never appears in a request, a
+    // row or a response.
+    let credential_ref = body
+        .credential_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+    let (max_pages, max_bytes, max_depth) = clamped_caps(&body);
+
+    let now = store::iso_now(clock.as_ref());
+    let connector = ConnectorRow {
+        id: id_gen.ulid(),
+        tenant_id: tenant_id.clone(),
+        kind: kind.as_str().to_owned(),
+        config: serde_json::to_string(&config)
+            .map_err(|_| Problem::internal().with_detail("connector config did not serialize"))?,
+        credential_ref,
+        max_pages,
+        max_bytes,
+        max_depth,
+        created_at: now.clone(),
+    };
+    let runner = connectors::Runner::new(
+        db.clone(),
+        http,
+        ctx.ports.config.clone(),
+        clock,
+        id_gen.clone(),
+        Some(scope.defer.clone()),
+    );
+    let job = connectors::seed_job(&connector, &config);
+    let payload = serde_json::to_string(&job)
+        .map_err(|_| Problem::internal().with_detail("seed job did not serialize"))?;
+    // The row and its first job: one batch, so the connector cannot
+    // exist for even a moment without work queued.
+    db.batch_atomic(&[
+        store::insert_connector_stmt(&connector),
+        store::enqueue_fetch_stmt(
+            runner.outbox(),
+            &id_gen.ulid(),
+            &payload,
+            &connector.id,
+            &now,
+        ),
+    ])
+    .await?;
+    // An execution opportunity for the seed (and whatever it discovers),
+    // durable either way: the scheduled re-sync is the backstop.
+    runner.defer_sweep();
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "connector_id": connector.id,
+            "kind": kind.as_str(),
+            "seed_url": config.seed_url(),
+            "max_pages": connector.max_pages,
+            "max_bytes": connector.max_bytes,
+            "max_depth": connector.max_depth,
+        })),
+    )
+        .into_response())
+}
+
 /// Title fallback: an absent or whitespace title becomes `Untitled`,
 /// which is what a result list should say rather than an empty string.
 pub(crate) fn clean_title(raw: Option<String>) -> String {
@@ -608,8 +875,10 @@ fn strip_tags(html: &str) -> String {
 }
 
 /// The five entities a prose corpus actually contains; the rest are
-/// dropped with their markup and were noise anyway.
-fn decode_entities(text: &str) -> String {
+/// dropped with their markup and were noise anyway. `pub(crate)` for the
+/// connectors' sitemap parser, whose `<loc>` values are escaped the same
+/// way.
+pub(crate) fn decode_entities(text: &str) -> String {
     text.replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")

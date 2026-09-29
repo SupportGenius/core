@@ -30,11 +30,52 @@
 //! `handoff`: a citation naming any chunk not retrieved for *this* request
 //! can never be `answered`, and neither can a confidence below the
 //! tenant's threshold ([`DEFAULT_ANSWER_THRESHOLD`] unless the tenant set
-//! one).
+//! one).//!
+//! **Connectors keep the index fresh on a schedule** (issue #29).
+//! `POST /v1/support/connectors` registers a crawl root — a sitemap, a
+//! URL prefix, or a GitHub repository — and from then on the module's
+//! `Module::scheduled` hook (cron) re-syncs it: every fetch job takes one
+//! URL, conditional-GETs it (`If-None-Match`/`If-Modified-Since`; a 304
+//! writes nothing), replaces the source it indexed if the body changed,
+//! deletes the source if the page answers 404/410, and discovers the
+//! URLs the page legitimately leads to. Every effect is an upsert or
+//! delete keyed by the URL, so the outbox's at-least-once delivery needs
+//! no inbox. The caps, clamped at connector creation: `max_pages` rows in
+//! `sg_ingest_pages` per connector — sources *and* navigation rows
+//! (sitemaps, GitHub trees) alike, which is what bounds a sitemap index's
+//! breadth — default 200, at most 2000; `max_bytes` per response
+//! (default 1 MiB, at most the `HttpClient` port's 4 MiB ceiling);
+//! `max_depth` link hops from the seed (default 3, at most 5). Each URL
+//! holds at most one un-retired outbox row at a time (the row's `subject`
+//! is the dedup key), so a re-sync tick never stacks retries.
+//!
+//! **The allowlist is the fetch policy.** A sitemap connector fetches
+//! only URLs on the sitemap's own scheme and authority; a URL-prefix
+//! connector, only URLs under its prefix; a GitHub connector, only
+//! `api.github.com` under the configured owner and repo. Anything else a
+//! page links to — or a sitemap names — is skipped before any network
+//! call. On Cloudflare Workers, platform `fetch` additionally cannot
+//! reach private networks at all, which together with the allowlist is
+//! the SSRF story; the self-hosted binary runs the same fetches through
+//! the hardened `ReqwestClient` vetting (loopback and link-local
+//! destinations refused). One accepted residual there: the `HttpClient`
+//! port exposes neither a no-redirect policy nor a response's final URL,
+//! so a 3xx onto a *public* host outside the allowlist would be followed
+//! and its body indexed under the URL the connector did name. GitHub
+//! fetches authenticate with
+//! `Authorization: Bearer …` resolved from the Config port by the
+//! connector's stored `credential_ref` — a config key *name*, never the
+//! token itself.
+//!
+//! The scheduled hook runs wherever the venture is deployed: the
+//! Cloudflare Worker wires `[triggers] crons` in `wrangler.toml`, and the
+//! native binary takes a comma-separated `CRONS` environment variable of
+//! standard five-field cron expressions.
 
 mod answer;
 pub mod bm25;
 pub mod chunk;
+mod connectors;
 mod extract;
 mod handlers;
 mod messages;
@@ -49,7 +90,8 @@ use std::sync::Arc;
 
 use cratefield_core::{
     AnyError, BoxFuture, Config, ConfigError, DataKind, Disposition, Migrations, Module,
-    ModuleConfig, ModuleContext, PersonalDataSet, Port, SqlMigration, assert_migration_set,
+    ModuleConfig, ModuleContext, PersonalDataSet, Port, SqlMigration, SystemClock, UlidIdGen,
+    assert_migration_set,
 };
 
 pub(crate) const MODULE_NAME: &str = "support";
@@ -108,9 +150,23 @@ const MIGRATION_UPLOADS: SqlMigration = SqlMigration::new(
     include_str!("../migrations/sqlite/0005_uploads.sql"),
 );
 
+/// Connectors (issue #29): the crawl roots, their per-URL fetch state and
+/// the ingest outbox. The outbox block inside is generated from core's
+/// `Outbox::create_table_sql` — see the migration file's header before
+/// touching it. Connector pages index into `sg_sources` under the
+/// `external_id` column 0003 added, so this migration leaves that table
+/// alone.
+const MIGRATION_CONNECTORS: SqlMigration = SqlMigration::new(
+    "0006",
+    "connectors",
+    include_str!("../migrations/sqlite/0006_connectors.sql"),
+);
+
 /// The support module: tenant provisioning behind the harness admin
 /// token, API-key-authenticated source ingest, BM25 search and grounded
-/// answers for everything else.
+/// answers, and the cron-driven connectors that keep a workspace's index
+/// synced from a sitemap, a URL prefix or a GitHub repository
+/// (`POST /connectors`, issue #29).
 ///
 /// Knob-free. Everything tunable — the revoked-kid list, the admin token —
 /// is deployment configuration read through the `Config` port, and the
@@ -146,17 +202,22 @@ impl Module for Support {
         &[Port::Db, Port::Signer, Port::Clock, Port::IdGen]
     }
 
-    /// `HttpClient` for the `{"url"}` ingest form, `RateLimiter` for the
-    /// per-tenant budget on ingest, search and messages, and `TextModel`
-    /// for `POST /messages`' grounded answers. All three degrade honestly
-    /// when absent: URL ingest answers `503 not-ready`, the limiter is
-    /// skipped, and messages answer `503 text-model-not-configured`.
+    /// `HttpClient` for the `{"url"}` ingest form, for `POST /connectors`
+    /// and for every fetch job the connectors enqueue; `RateLimiter` for
+    /// the per-tenant budget on ingest, search and messages; and
+    /// `TextModel` for `POST /messages`' grounded answers. All three
+    /// degrade honestly when absent: URL ingest and connector creation
+    /// answer `503 not-ready` (and the connector re-sync is a silent
+    /// no-op), the limiter is skipped, and messages answer `503
+    /// text-model-not-configured`.
     ///
     /// `Blob` and `Defer` serve the chunked-upload routes. `Blob` is
     /// where upload parts land (`503 not-ready` on the upload routes when
     /// absent — ingest, search and answers never touch it); `Defer`
     /// drains the `extract` job inline after `complete`, and cron is the
-    /// backstop that runs it regardless. Neither is required because a
+    /// backstop that runs it regardless. `Defer` likewise pulls a new
+    /// connector's first crawl sweep (and each fetch's discoveries) into
+    /// the request that caused them. Neither is required because a
     /// deployment without object storage still gets the whole retrieval
     /// core through the inline `POST /sources` form.
     ///
@@ -188,6 +249,9 @@ impl Module for Support {
             "sg_uploads",
             "sg_upload_parts",
             "sg_support_outbox",
+            "sg_connectors",
+            "sg_ingest_pages",
+            "sg_ingest_outbox",
         ]
     }
 
@@ -230,113 +294,25 @@ impl Module for Support {
     /// account id — so their words are content without a subject column.
     /// `sg_conversations` and `sg_tenant_settings` hold flags, a
     /// threshold and timestamps, and are `none`.
+    ///
+    /// **The connector tables follow their elders.** `sg_connectors` is
+    /// `none` — configuration about the workspace, and a credential
+    /// *reference* rather than a credential. `sg_ingest_pages` and
+    /// `sg_ingest_outbox` hold crawled addresses, which are content the
+    /// workspace pointed a connector at: no column identifies a person,
+    /// so both are `unreachable`, same as the index tables they feed.
     fn personal_data(&self) -> &'static [PersonalDataSet] {
-        const SETS: &[PersonalDataSet] = &[
-            PersonalDataSet {
-                table: "sg_tenants",
-                subject: "id",
-                kind: DataKind::Identifier,
-                disposition: Disposition::Retain(
-                    "The row is the customer account itself. It is removed by closing the \
-                     account, which deletes the tenant's whole index with it — not by a \
-                     data-subject erasure request.",
-                ),
-                description: "The support workspace itself: its name, its status and when it \
-                              was created.",
-                redacted: &[],
-                subject_via: None,
-            },
-            PersonalDataSet::none(
-                "sg_api_keys",
-                "A list of the workspace's API key ids: a random key id, a label and a \
-                 timestamp per key. The key material is never stored and nothing here names \
-                 a person.",
-            ),
-            PersonalDataSet::unreachable(
-                "sg_sources",
-                DataKind::Content,
-                "Documents the workspace added — a title, an optional source URL, the \
-                 caller's optional external id for it and the size of what was indexed. \
-                 The document text itself may mention people.",
-                "The rows belong to the workspace, not to any person the rows can name, so \
-                 no erasure predicate can match them. `DELETE /v1/support/sources/{id}` \
-                 removes a source the workspace indexed — but a deletion names a document, \
-                 not a person; content leaves for good when the workspace's account is \
-                 closed.",
-            ),
-            PersonalDataSet::unreachable(
-                "sg_chunks",
-                DataKind::Content,
-                "Passages of the workspace's documents, kept verbatim so an answer can \
-                 quote them. They may quote people.",
-                "Same as sg_sources: the text is reachable only through the workspace. \
-                 Chunks leave when their source is deleted or replaced, and when the \
-                 workspace's account is closed.",
-            ),
-            PersonalDataSet::unreachable(
-                "sg_postings",
-                DataKind::Content,
-                "The search index over the workspace's documents: which word occurs in \
-                 which passage and how often.",
-                "The index is a projection of sg_chunks and leaves with them — on source \
-                 deletion or replacement, or when the workspace's account is closed; no \
-                 person is identifiable from a word-count row.",
-            ),
-            PersonalDataSet::none(
-                "sg_conversations",
-                "One row per support conversation: its status, whether it needs a person, \
-                 and timestamps. What was said lives in sg_messages; nothing here names \
-                 anyone.",
-            ),
-            PersonalDataSet::unreachable(
-                "sg_messages",
-                DataKind::Content,
-                "The messages of each support conversation: what the end user wrote, what \
-                 they were shown, what the model answered and the language the turn was \
-                 detected to be in. The text may mention people.",
-                "The workspace's end users are anonymous to this module: a message carries \
-                 no email, account or other column that identifies its author, so no \
-                 erasure predicate can match a person into it. Messages leave when the \
-                 workspace's account is closed.",
-            ),
-            PersonalDataSet::none(
-                "sg_tenant_settings",
-                "The workspace's answer threshold and when it was last set.",
-            ),
-            PersonalDataSet::unreachable(
-                "sg_uploads",
-                DataKind::Content,
-                "The workspace's uploaded documents as bookkeeping: filename, content type, \
-                 sizes, status and the ids of the source each was indexed into. The document \
-                 bytes live in the Blob port and the indexed text in sg_sources; a filename \
-                 or a PDF's words may mention people.",
-                "The rows belong to the workspace, not to any person the rows can name. An \
-                 upload past its status change keeps no bytes anywhere (part blobs are deleted \
-                 the moment the upload turns extracted, failed or collected), so there is no \
-                 content here to erase beyond what account closure removes.",
-            ),
-            PersonalDataSet::none(
-                "sg_upload_parts",
-                "One size row per uploaded part: the part's ordinal and its byte count. The \
-                 bytes themselves live in the Blob port and are deleted with the upload; \
-                 nothing here names a person.",
-            ),
-            PersonalDataSet::none(
-                "sg_support_outbox",
-                "The module's durable work queue: an extract job per completed upload, \
-                 carrying two ids (upload and tenant) and timestamps. No content, no person.",
-            ),
-        ];
-        SETS
+        PERSONAL_DATA
     }
 
     fn migrations(&self) -> Migrations {
-        const MIGRATIONS: [SqlMigration; 5] = [
+        const MIGRATIONS: [SqlMigration; 6] = [
             MIGRATION_INIT,
             MIGRATION_CONVERSATIONS,
             MIGRATION_SOURCE_MANAGEMENT,
             MIGRATION_INTERNATIONALIZATION,
             MIGRATION_UPLOADS,
+            MIGRATION_CONNECTORS,
         ];
         // Refuses a gap, a duplicate or an out-of-order id at compile
         // time.
@@ -421,10 +397,19 @@ impl Module for Support {
     ///
     /// The same tick is the cron half of `uploads`: it drains leftover
     /// `extract` jobs (a deployment without `Defer`, or one whose deferred
-    /// drain crashed) and collects the uploads nobody finished. The two
-    /// sweeps are independent, so both always run — a failing re-index
-    /// must not strand an upload at `complete`, nor the other way round —
-    /// and the first error is what the tick reports.
+    /// drain crashed) and collects the uploads nobody finished.
+    ///
+    /// It is also the connectors' re-sync (issue #29): every known page
+    /// of every connector, plus its seed, is re-enqueued and the ingest
+    /// outbox drained in bounded sweeps. Each re-enqueued fetch runs its
+    /// conditional GET, so an unchanged page costs a 304 and writes
+    /// nothing, a vanished page deletes its source and a changed one
+    /// re-indexes.
+    ///
+    /// The three sweeps are independent, so all of them always run — a
+    /// failing re-index must not strand an upload at `complete` or skip a
+    /// connector re-sync, nor any other way round — and the first error,
+    /// in that order, is what the tick reports.
     fn scheduled<'a>(
         &'a self,
         ctx: &'a ModuleContext,
@@ -433,12 +418,175 @@ impl Module for Support {
         Box::pin(async move {
             let reindexed = reindex_sweep(ctx).await;
             let uploads = uploads::scheduled(ctx, cron).await;
-            reindexed.and(uploads)
+            let connectors = connector_resync(ctx).await;
+            reindexed.and(uploads).and(connectors)
         })
     }
 }
 
-/// The re-index half of [`Support::scheduled`]: bounded sweeps of
+/// The connector third of [`Support::scheduled`]. With no database or no
+/// `HttpClient` there is nothing this tick can fetch; both are silent
+/// no-ops rather than cron noise, the same reading the other sweeps give
+/// their ports.
+async fn connector_resync(ctx: &ModuleContext) -> Result<(), AnyError> {
+    let (Some(db), Some(http)) = (ctx.ports.db.clone(), ctx.ports.http.clone()) else {
+        return Ok(());
+    };
+    let clock = ctx
+        .ports
+        .clock
+        .clone()
+        .unwrap_or_else(|| Arc::new(SystemClock));
+    let id_gen = ctx
+        .ports
+        .id_gen
+        .clone()
+        .unwrap_or_else(|| Arc::new(UlidIdGen));
+    let runner = connectors::Runner::new(
+        db,
+        http,
+        ctx.ports.config.clone(),
+        clock,
+        id_gen,
+        ctx.ports.defer.clone(),
+    );
+    runner
+        .resync()
+        .await
+        .map(|_| ())
+        .map_err(|err| Box::new(err) as AnyError)
+}
+
+/// [`Support::personal_data`]'s declarations, one per table — kept out
+/// of the method body so the list can grow with the tables.
+const PERSONAL_DATA: &[PersonalDataSet] = &[
+    PersonalDataSet {
+        table: "sg_tenants",
+        subject: "id",
+        kind: DataKind::Identifier,
+        disposition: Disposition::Retain(
+            "The row is the customer account itself. It is removed by closing the \
+                 account, which deletes the tenant's whole index with it — not by a \
+                 data-subject erasure request.",
+        ),
+        description: "The support workspace itself: its name, its status and when it \
+                          was created.",
+        redacted: &[],
+        subject_via: None,
+    },
+    PersonalDataSet::none(
+        "sg_api_keys",
+        "A list of the workspace's API key ids: a random key id, a label and a \
+             timestamp per key. The key material is never stored and nothing here names \
+             a person.",
+    ),
+    PersonalDataSet::unreachable(
+        "sg_sources",
+        DataKind::Content,
+        "Documents the workspace added — a title, an optional source URL, the \
+             caller's optional external id for it and the size of what was indexed. \
+             The document text itself may mention people.",
+        "The rows belong to the workspace, not to any person the rows can name, so \
+             no erasure predicate can match them. `DELETE /v1/support/sources/{id}` \
+             removes a source the workspace indexed — but a deletion names a document, \
+             not a person; content leaves for good when the workspace's account is \
+             closed.",
+    ),
+    PersonalDataSet::unreachable(
+        "sg_chunks",
+        DataKind::Content,
+        "Passages of the workspace's documents, kept verbatim so an answer can \
+             quote them. They may quote people.",
+        "Same as sg_sources: the text is reachable only through the workspace. \
+             Chunks leave when their source is deleted or replaced, and when the \
+             workspace's account is closed.",
+    ),
+    PersonalDataSet::unreachable(
+        "sg_postings",
+        DataKind::Content,
+        "The search index over the workspace's documents: which word occurs in \
+             which passage and how often.",
+        "The index is a projection of sg_chunks and leaves with them — on source \
+             deletion or replacement, or when the workspace's account is closed; no \
+             person is identifiable from a word-count row.",
+    ),
+    PersonalDataSet::none(
+        "sg_conversations",
+        "One row per support conversation: its status, whether it needs a person, \
+             and timestamps. What was said lives in sg_messages; nothing here names \
+             anyone.",
+    ),
+    PersonalDataSet::unreachable(
+        "sg_messages",
+        DataKind::Content,
+        "The messages of each support conversation: what the end user wrote, what \
+             they were shown, what the model answered and the language the turn was \
+             detected to be in. The text may mention people.",
+        "The workspace's end users are anonymous to this module: a message carries \
+             no email, account or other column that identifies its author, so no \
+             erasure predicate can match a person into it. Messages leave when the \
+             workspace's account is closed.",
+    ),
+    PersonalDataSet::none(
+        "sg_tenant_settings",
+        "The workspace's answer threshold and when it was last set.",
+    ),
+    PersonalDataSet::unreachable(
+        "sg_uploads",
+        DataKind::Content,
+        "The workspace's uploaded documents as bookkeeping: filename, content type, \
+             sizes, status and the ids of the source each was indexed into. The document \
+             bytes live in the Blob port and the indexed text in sg_sources; a filename \
+             or a PDF's words may mention people.",
+        "The rows belong to the workspace, not to any person the rows can name. An \
+             upload past its status change keeps no bytes anywhere (part blobs are deleted \
+             the moment the upload turns extracted, failed or collected), so there is no \
+             content here to erase beyond what account closure removes.",
+    ),
+    PersonalDataSet::none(
+        "sg_upload_parts",
+        "One size row per uploaded part: the part's ordinal and its byte count. The \
+             bytes themselves live in the Blob port and are deleted with the upload; \
+             nothing here names a person.",
+    ),
+    PersonalDataSet::none(
+        "sg_support_outbox",
+        "The module's durable work queue: an extract job per completed upload, \
+             carrying two ids (upload and tenant) and timestamps. No content, no person.",
+    ),
+    PersonalDataSet::none(
+        "sg_connectors",
+        "The workspace's content connectors: which kind of source they sync (a \
+             sitemap, a URL prefix or a GitHub repository), the addresses they sync \
+             from, per-sync caps, and a *reference* to the credential (a config key \
+             name, never the secret). Configuration about the workspace, not about a \
+             person.",
+    ),
+    PersonalDataSet::unreachable(
+        "sg_ingest_pages",
+        DataKind::Content,
+        "The addresses a connector has synced, with the fetch validators and the \
+             indexed document each maps to. A page address can name a person (an \
+             about page, a profile path).",
+        "The rows belong to the workspace's connectors, not to any person the rows \
+             can name — the address is indexed content, the same status as a synced \
+             document. Deleting a connector's content is connector deletion, not a \
+             subject erasure; the content leaves when the workspace's account is \
+             closed.",
+    ),
+    PersonalDataSet::unreachable(
+        "sg_ingest_outbox",
+        DataKind::Content,
+        "The queue of fetches a connector's sync has pending: which connector, \
+             which address, at what crawl depth. A queued address can name a person.",
+        "The address in a pending fetch is content the connector was pointed at, \
+             with no column identifying a person, so no erasure predicate can match \
+             one into the queue. The queue drains to the same page rows (above) and \
+             leaves when the workspace's account is closed.",
+    ),
+];
+
+/// The re-index third of [`Support::scheduled`]: bounded sweeps of
 /// [`reindex_stale_chunks`] until one comes back short.
 async fn reindex_sweep(ctx: &ModuleContext) -> Result<(), AnyError> {
     let Some(db) = ctx.ports.db.clone() else {

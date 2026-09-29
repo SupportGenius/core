@@ -7,12 +7,17 @@
 //! The isolation boundary is [`tenant_id`]: every statement in this file
 //! filters on it, whatever credential was verified upstream. Nothing here
 //! is reachable without a tenant id, and nothing here ignores one — the
-//! one deliberate exception is the scheduled re-index's stale-chunk
-//! select ([`stale_chunks`]), which is the module's own sweep over every
-//! tenant it holds, not a tenant's request.
+//! deliberate exceptions are the module's own cron sweeps over every
+//! tenant it holds, never a tenant's request: the re-index's stale-chunk
+//! select ([`stale_chunks`]) and the connector re-sync's listing
+//! ([`list_connectors`], [`pending_subjects`], and the per-connector page
+//! reads keyed by a connector id), whose rows each carry the tenant into
+//! every job they produce.
 
-use cratefield_core::{Database, DbError, Statement};
-use sea_query::{Alias, Expr, Func, OnConflict, Query};
+use std::collections::HashSet;
+
+use cratefield_core::{Database, DbError, Row, Statement};
+use sea_query::{Alias, Expr, Func, OnConflict, Order, Query};
 use time::format_description::well_known::Rfc3339;
 
 use crate::bm25::{Corpus, Posting};
@@ -454,7 +459,7 @@ pub(crate) struct StoredChunk {
 
 /// The stored chunk ids and ordinals of one source, in ordinal order —
 /// the old side of the replace diff.
-async fn chunk_index(
+pub(crate) async fn chunk_index(
     db: &dyn Database,
     tenant_id: &str,
     source_id: &str,
@@ -519,6 +524,40 @@ pub(crate) async fn replace_source_chunks(
     chunks: &[Chunk],
 ) -> Result<(), DbError> {
     let stored = chunk_index(db, &source.tenant_id, &source.id).await?;
+    let statements = replace_source_statements(source, &stored, chunks);
+    db.batch_atomic(&statements).await?;
+
+    // The re-check the doc above promises: if a DELETE committed between
+    // the caller's existence read and this batch, the row is gone but the
+    // windows written above are not — sweep them with the same
+    // delete-by-source batch. (A DELETE committing after this check also
+    // wins: it deletes by source, so it takes whatever this batch wrote.)
+    sweep_if_deleted(db, &source.tenant_id, &source.id).await
+}
+
+/// The post-batch half of a replace: when the source row turned out to be
+/// gone (a concurrent DELETE won), the windows a replace just wrote are
+/// swept with the delete-by-source batch.
+pub(crate) async fn sweep_if_deleted(
+    db: &dyn Database,
+    tenant_id: &str,
+    source_id: &str,
+) -> Result<(), DbError> {
+    if find_source(db, tenant_id, source_id).await?.is_none() {
+        delete_source(db, tenant_id, source_id).await?;
+    }
+    Ok(())
+}
+
+/// The statements [`replace_source_chunks`] executes, given the stored
+/// side of the diff ([`chunk_index`]) — exposed so a connector re-sync can
+/// land the replacement, its page row and its outbox completion in one
+/// batch of its own.
+pub(crate) fn replace_source_statements(
+    source: &SourceRow,
+    stored: &[StoredChunk],
+    chunks: &[Chunk],
+) -> Vec<Statement> {
     let new_ids: std::collections::HashSet<&str> =
         chunks.iter().map(|chunk| chunk.id.as_str()).collect();
     let vanished: Vec<String> = stored
@@ -596,20 +635,7 @@ pub(crate) async fn replace_source_chunks(
     ));
     statements.extend(posting_insert_statements(&source.tenant_id, &added));
 
-    db.batch_atomic(&statements).await?;
-
-    // The re-check the doc above promises: if a DELETE committed between
-    // the caller's existence read and this batch, the row is gone but the
-    // windows written above are not — sweep them with the same
-    // delete-by-source batch. (A DELETE committing after this check also
-    // wins: it deletes by source, so it takes whatever this batch wrote.)
-    if find_source(db, &source.tenant_id, &source.id)
-        .await?
-        .is_none()
-    {
-        delete_source(db, &source.tenant_id, &source.id).await?;
-    }
-    Ok(())
+    statements
 }
 
 /// Deletes one source and its whole index in **one** `batch_atomic`: the
@@ -623,6 +649,13 @@ pub(crate) async fn delete_source(
     tenant_id: &str,
     source_id: &str,
 ) -> Result<(), DbError> {
+    db.batch_atomic(&delete_source_statements(tenant_id, source_id))
+        .await
+}
+
+/// The statements [`delete_source`] executes, exposed so a connector page
+/// that answered 404/410 can drop its source together with its page row.
+pub(crate) fn delete_source_statements(tenant_id: &str, source_id: &str) -> Vec<Statement> {
     let mut delete_postings = Query::delete();
     delete_postings
         .from_table(iden("sg_postings"))
@@ -650,12 +683,11 @@ pub(crate) async fn delete_source(
         .and_where(Expr::col(iden("id")).eq(source_id))
         .and_where(Expr::col(iden("tenant_id")).eq(tenant_id));
 
-    db.batch_atomic(&[
+    vec![
         Statement::render(&delete_postings),
         Statement::render(&delete_chunks),
         Statement::render(&delete_row),
-    ])
-    .await
+    ]
 }
 
 /// One chunk the re-index sweep must rewrite: who owns it, and the
@@ -1539,4 +1571,325 @@ pub(crate) fn iso_now(clock: &dyn cratefield_core::Clock) -> String {
         .unwrap_or_else(|_| clock.now())
         .format(&Rfc3339)
         .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Connectors (issue #29): persistence for the crawl roots, their per-URL
+// fetch state, and the ingest outbox. Same two shapes as above: pure
+// statement builders that compose into the fetch job's **one**
+// `batch_atomic`, and async readers over `&dyn Database`.
+// ---------------------------------------------------------------------------
+
+/// One crawl root: what `sg_connectors` stores. `config` is the
+/// connector kind's own JSON (`{"url": …}`, or the GitHub owner/repo
+/// triple — see `crate::connectors::ConnectorConfig`); `credential_ref`
+/// names the Config key the GitHub token lives under, never the token.
+pub(crate) struct ConnectorRow {
+    pub id: String,
+    pub tenant_id: String,
+    pub kind: String,
+    pub config: String,
+    pub credential_ref: Option<String>,
+    pub max_pages: i64,
+    pub max_bytes: i64,
+    pub max_depth: i64,
+    pub created_at: String,
+}
+
+/// Per-URL fetch state: one `sg_ingest_pages` row per URL a connector has
+/// ever fetched, carrying the conditional-GET validators and the source
+/// the URL currently indexes (`None` for fetches that index nothing — a
+/// sitemap or a GitHub tree listing).
+pub(crate) struct PageRow {
+    pub connector_id: String,
+    pub url: String,
+    pub tenant_id: String,
+    pub role: String,
+    pub depth: i64,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub source_id: Option<String>,
+}
+
+/// The `insert_connector` statement, so a connector row and its seed fetch
+/// job can land in one `batch_atomic` (a connector that exists but has no
+/// seed job is exactly the half-state the batch exists to prevent).
+#[must_use]
+pub(crate) fn insert_connector_stmt(connector: &ConnectorRow) -> Statement {
+    let mut insert = Query::insert();
+    insert
+        .into_table(iden("sg_connectors"))
+        .columns([
+            "id",
+            "tenant_id",
+            "kind",
+            "config",
+            "credential_ref",
+            "max_pages",
+            "max_bytes",
+            "max_depth",
+            "created_at",
+        ])
+        .values_panic([
+            connector.id.clone().into(),
+            connector.tenant_id.clone().into(),
+            connector.kind.clone().into(),
+            connector.config.clone().into(),
+            connector.credential_ref.clone().into(),
+            connector.max_pages.into(),
+            connector.max_bytes.into(),
+            connector.max_depth.into(),
+            connector.created_at.clone().into(),
+        ]);
+    Statement::render(&insert)
+}
+
+/// The `sg_connectors` row shape, mapped in one place for every reader
+/// (the find-by-id and the re-sync's listing).
+fn connector_row(row: &Row) -> ConnectorRow {
+    ConnectorRow {
+        id: row.get("id").unwrap_or_default(),
+        tenant_id: row.get("tenant_id").unwrap_or_default(),
+        kind: row.get("kind").unwrap_or_default(),
+        config: row.get("config").unwrap_or_default(),
+        credential_ref: row.get("credential_ref"),
+        max_pages: row.get("max_pages").unwrap_or_default(),
+        max_bytes: row.get("max_bytes").unwrap_or_default(),
+        max_depth: row.get("max_depth").unwrap_or_default(),
+        created_at: row.get("created_at").unwrap_or_default(),
+    }
+}
+
+const CONNECTOR_COLUMNS: [&str; 9] = [
+    "id",
+    "tenant_id",
+    "kind",
+    "config",
+    "credential_ref",
+    "max_pages",
+    "max_bytes",
+    "max_depth",
+    "created_at",
+];
+
+pub(crate) async fn find_connector(
+    db: &dyn Database,
+    id: &str,
+) -> Result<Option<ConnectorRow>, DbError> {
+    let mut select = Query::select();
+    select
+        .columns(CONNECTOR_COLUMNS)
+        .from(iden("sg_connectors"))
+        .and_where(Expr::col(iden("id")).eq(id));
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows.rows.first().map(connector_row))
+}
+
+/// Every connector in the deployment. The scheduled re-sync sweeps all of
+/// them; tenancy applies per row (`tenant_id` travels in every row and in
+/// every fetch job it produces), not by pre-filtering the sweep.
+pub(crate) async fn list_connectors(db: &dyn Database) -> Result<Vec<ConnectorRow>, DbError> {
+    let mut select = Query::select();
+    select
+        .columns(CONNECTOR_COLUMNS)
+        .from(iden("sg_connectors"))
+        .order_by(iden("created_at"), Order::Asc);
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows.rows.iter().map(connector_row).collect())
+}
+
+/// The `sg_ingest_pages` upsert statement — the page row's validators and
+/// source link land in the fetch job's batch, composed with the other
+/// statements the same fetch needs.
+#[must_use]
+pub(crate) fn upsert_page_stmt(page: &PageRow) -> Statement {
+    let mut insert = Query::insert();
+    insert
+        .into_table(iden("sg_ingest_pages"))
+        .columns([
+            "connector_id",
+            "url",
+            "tenant_id",
+            "role",
+            "depth",
+            "etag",
+            "last_modified",
+            "source_id",
+        ])
+        .values_panic([
+            page.connector_id.clone().into(),
+            page.url.clone().into(),
+            page.tenant_id.clone().into(),
+            page.role.clone().into(),
+            page.depth.into(),
+            page.etag.clone().into(),
+            page.last_modified.clone().into(),
+            page.source_id.clone().into(),
+        ])
+        .on_conflict(
+            OnConflict::columns([iden("connector_id"), iden("url")])
+                .update_columns([
+                    iden("role"),
+                    iden("depth"),
+                    iden("etag"),
+                    iden("last_modified"),
+                    iden("source_id"),
+                ])
+                .to_owned(),
+        );
+    Statement::render(&insert)
+}
+
+/// The `sg_ingest_pages` row shape, mapped in one place for every reader
+/// (the find-by-url, the re-sync frontier and the row count).
+fn page_row(row: &Row) -> PageRow {
+    PageRow {
+        connector_id: row.get("connector_id").unwrap_or_default(),
+        url: row.get("url").unwrap_or_default(),
+        tenant_id: row.get("tenant_id").unwrap_or_default(),
+        role: row.get("role").unwrap_or_default(),
+        depth: row.get("depth").unwrap_or_default(),
+        etag: row.get("etag"),
+        last_modified: row.get("last_modified"),
+        source_id: row.get("source_id"),
+    }
+}
+
+const PAGE_COLUMNS: [&str; 8] = [
+    "connector_id",
+    "url",
+    "tenant_id",
+    "role",
+    "depth",
+    "etag",
+    "last_modified",
+    "source_id",
+];
+
+pub(crate) async fn find_page(
+    db: &dyn Database,
+    connector_id: &str,
+    url: &str,
+) -> Result<Option<PageRow>, DbError> {
+    let mut select = Query::select();
+    select
+        .columns(PAGE_COLUMNS)
+        .from(iden("sg_ingest_pages"))
+        .and_where(Expr::col(iden("connector_id")).eq(connector_id))
+        .and_where(Expr::col(iden("url")).eq(url));
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows.rows.first().map(page_row))
+}
+
+/// Every URL the connector has fetched, with the role it was fetched as —
+/// the re-sync frontier.
+pub(crate) async fn page_rows(
+    db: &dyn Database,
+    connector_id: &str,
+) -> Result<Vec<PageRow>, DbError> {
+    let mut select = Query::select();
+    select
+        .columns(PAGE_COLUMNS)
+        .from(iden("sg_ingest_pages"))
+        .and_where(Expr::col(iden("connector_id")).eq(connector_id))
+        .order_by(iden("url"), Order::Asc);
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows.rows.iter().map(page_row).collect())
+}
+
+/// How many rows the connector holds in `sg_ingest_pages` — the count the
+/// page cap is measured against. **Every** row spends the cap, sources
+/// and navigation rows (sitemaps, GitHub trees) alike: that is what bounds
+/// a sitemap index's breadth, which no per-source count could.
+pub(crate) async fn count_page_rows(db: &dyn Database, connector_id: &str) -> Result<i64, DbError> {
+    let mut select = Query::select();
+    select
+        .expr_as(Func::count(Expr::col(iden("url"))), Alias::new("n"))
+        .from(iden("sg_ingest_pages"))
+        .and_where(Expr::col(iden("connector_id")).eq(connector_id));
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows
+        .rows
+        .first()
+        .and_then(|row| row.get::<i64>("n"))
+        .unwrap_or(0))
+}
+
+/// The `subject` of every un-retired outbox row — the key the enqueue
+/// paths dedup against, so a re-sync tick (or two pages linking the same
+/// URL) cannot stack duplicate rows, each with a fresh retry budget.
+/// Completed rows are deleted, so this stays small: the in-flight and
+/// backoff rows only.
+pub(crate) async fn pending_subjects(db: &dyn Database) -> Result<HashSet<String>, DbError> {
+    let mut select = Query::select();
+    select
+        .column(iden("subject"))
+        .from(iden(crate::connectors::OUTBOX_TABLE))
+        .and_where(Expr::col(iden("subject")).is_not_null());
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows
+        .rows
+        .iter()
+        .filter_map(|row| row.get::<String>("subject"))
+        .collect())
+}
+
+/// Deletes one fetched URL's page row — the companion of
+/// [`delete_source_statements`] when a page answers 404/410.
+#[must_use]
+pub(crate) fn delete_page_stmt(connector_id: &str, url: &str) -> Statement {
+    let mut delete = Query::delete();
+    delete
+        .from_table(iden("sg_ingest_pages"))
+        .and_where(Expr::col(iden("connector_id")).eq(connector_id))
+        .and_where(Expr::col(iden("url")).eq(url));
+    Statement::render(&delete)
+}
+
+/// The ingest outbox's `enqueue_statement`, wrapped so fetch jobs cannot
+/// mistype the topic. The subject is the job's dedup key —
+/// `{connector_id} {url}`, from [`FetchJob::subject`]: one un-retired row
+/// per connector and URL. (This table is declared `unreachable` for
+/// erasure, so the subject carries no person here.)
+#[must_use]
+pub(crate) fn enqueue_fetch_stmt(
+    outbox: &cratefield_core::Outbox,
+    job_id: &str,
+    payload_json: &str,
+    subject: &str,
+    at: &str,
+) -> Statement {
+    outbox.enqueue_statement(
+        job_id,
+        crate::connectors::TOPIC_FETCH,
+        payload_json,
+        Some(subject),
+        at,
+    )
+}
+
+/// The rendered equivalent of `Outbox::complete(db, id)` — see
+/// `module-escalation`'s store for why this statement form exists (core
+/// has no `complete_statement` at the rev this workspace pins).
+#[must_use]
+pub(crate) fn ingest_outbox_complete_stmt(id: &str) -> Statement {
+    let mut delete = Query::delete();
+    delete
+        .from_table(iden(crate::connectors::OUTBOX_TABLE))
+        .and_where(Expr::col(iden("id")).eq(id));
+    Statement::render(&delete)
+}
+
+/// The rendered equivalent of `Outbox::retry_later(db, id, next_at)` —
+/// same provenance as [`ingest_outbox_complete_stmt`].
+#[must_use]
+pub(crate) fn ingest_outbox_retry_later_stmt(id: &str, next_attempt_at: &str) -> Statement {
+    let mut update = Query::update();
+    update
+        .table(iden(crate::connectors::OUTBOX_TABLE))
+        .value(iden("attempts"), Expr::col(iden("attempts")).add(1))
+        .value(iden("next_attempt_at"), next_attempt_at)
+        .value(iden("locked_until"), Option::<String>::None)
+        .and_where(Expr::col(iden("id")).eq(id));
+    Statement::render(&update)
 }
