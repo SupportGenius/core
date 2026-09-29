@@ -6,7 +6,10 @@
 //!
 //! The isolation boundary is [`tenant_id`]: every statement in this file
 //! filters on it, whatever credential was verified upstream. Nothing here
-//! is reachable without a tenant id, and nothing here ignores one.
+//! is reachable without a tenant id, and nothing here ignores one — the
+//! one deliberate exception is the scheduled re-index's stale-chunk
+//! select ([`stale_chunks`]), which is the module's own sweep over every
+//! tenant it holds, not a tenant's request.
 
 use cratefield_core::{Database, DbError, Statement};
 use sea_query::{Alias, Expr, Func, OnConflict, Query};
@@ -123,8 +126,9 @@ pub(crate) async fn insert_api_key(db: &dyn Database, key: &ApiKeyRow) -> Result
 }
 
 /// The `sg_chunks` insert statements for `chunks` — the source's windows,
-/// stamped with the tenant, the source and its `created_at`, batched
-/// [`ROWS_PER_STATEMENT`] rows per statement (seven values per row).
+/// stamped with the tenant, the source, its `created_at` and the
+/// tokenizer that produced their terms, batched
+/// [`ROWS_PER_STATEMENT`] rows per statement (eight values per row).
 fn chunk_insert_statements(
     tenant_id: &str,
     source_id: &str,
@@ -142,6 +146,7 @@ fn chunk_insert_statements(
                 "ordinal",
                 "body",
                 "term_count",
+                "tokenizer_version",
                 "created_at",
             ]);
             for chunk in group {
@@ -152,6 +157,7 @@ fn chunk_insert_statements(
                     chunk.ordinal.into(),
                     chunk.text.clone().into(),
                     chunk.length.into(),
+                    crate::chunk::TOKENIZER_VERSION.into(),
                     created_at.into(),
                 ]);
             }
@@ -174,6 +180,13 @@ fn posting_insert_statements(tenant_id: &str, chunks: &[&Chunk]) -> Vec<Statemen
                 .map(move |(term, tf)| (tenant_id, term.as_str(), chunk.id.as_str(), *tf))
         })
         .collect();
+    posting_rows_statements(&postings)
+}
+
+/// The `(tenant_id, term, chunk_id, tf)` rows as insert statements, one
+/// batch per [`ROWS_PER_STATEMENT`] rows — the shape both ingest and the
+/// re-index write the index in.
+fn posting_rows_statements(postings: &[(&str, &str, &str, u32)]) -> Vec<Statement> {
     postings
         .chunks(ROWS_PER_STATEMENT)
         .map(|group| {
@@ -633,6 +646,121 @@ pub(crate) async fn delete_source(
     .await
 }
 
+/// One chunk the re-index sweep must rewrite: who owns it, and the
+/// verbatim text its terms are re-derived from.
+pub(crate) struct StaleChunk {
+    pub id: String,
+    pub tenant_id: String,
+    pub body: String,
+}
+
+/// The next `limit` chunks stamped with a `tokenizer_version` older than
+/// [`crate::chunk::TOKENIZER_VERSION`], in id order. The one select in
+/// this file with no `tenant_id` filter (see the module docs): the sweep
+/// is module-owned maintenance over the whole index, not a tenant's
+/// request, and a chunk's stamp is not readable without naming its
+/// tenant anyway.
+pub(crate) async fn stale_chunks(
+    db: &dyn Database,
+    version: u32,
+    limit: u64,
+) -> Result<Vec<StaleChunk>, DbError> {
+    let mut select = Query::select();
+    select
+        .columns(["id", "tenant_id", "body"])
+        .from(iden("sg_chunks"))
+        .and_where(Expr::col(iden("tokenizer_version")).lt(version))
+        .order_by(iden("id"), sea_query::Order::Asc)
+        .limit(limit);
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows
+        .rows
+        .iter()
+        .filter_map(|row| {
+            Some(StaleChunk {
+                id: row.get("id")?,
+                tenant_id: row.get("tenant_id")?,
+                body: row.get("body")?,
+            })
+        })
+        .collect())
+}
+
+/// Re-tokenizes one stale chunk from its stored text and rewrites its
+/// index rows in **one** `batch_atomic`: the chunk's postings replaced
+/// wholesale, then `term_count` and the `tokenizer_version` stamp
+/// updated. The chunk's row itself is not touched — its id is a content
+/// address of (tenant, source, text) and its text a verbatim slice, and
+/// neither depends on the tokenizer — so a re-indexed chunk stays exactly
+/// the chunk it was, searchable by the terms the current tokenizer
+/// produces.
+async fn reindex_chunk(db: &dyn Database, stale: &StaleChunk) -> Result<(), DbError> {
+    let (terms, length) = crate::chunk::term_frequencies(&stale.body);
+    let postings: Vec<(&str, &str, &str, u32)> = terms
+        .iter()
+        .map(|(term, tf)| {
+            (
+                stale.tenant_id.as_str(),
+                term.as_str(),
+                stale.id.as_str(),
+                *tf,
+            )
+        })
+        .collect();
+
+    let mut delete_postings = Query::delete();
+    delete_postings
+        .from_table(iden("sg_postings"))
+        .and_where(Expr::col(iden("tenant_id")).eq(stale.tenant_id.as_str()))
+        .and_where(Expr::col(iden("chunk_id")).eq(stale.id.as_str()));
+
+    let mut restamp = Query::update();
+    restamp
+        .table(iden("sg_chunks"))
+        .values([
+            (iden("term_count"), length.into()),
+            (
+                iden("tokenizer_version"),
+                crate::chunk::TOKENIZER_VERSION.into(),
+            ),
+        ])
+        .and_where(Expr::col(iden("id")).eq(stale.id.as_str()))
+        .and_where(Expr::col(iden("tenant_id")).eq(stale.tenant_id.as_str()));
+
+    let mut statements = vec![
+        Statement::render(&delete_postings),
+        Statement::render(&restamp),
+    ];
+    // Postings before the restamp, matching ingest's order: the index is
+    // a projection of the rows, never the other way round.
+    statements.extend(posting_rows_statements(&postings));
+    db.batch_atomic(&statements).await
+}
+
+/// The scheduled re-index body: re-tokenizes up to `limit` chunks whose
+/// `tokenizer_version` stamp predates the current tokenizer and returns
+/// how many it rewrote — fewer than `limit` means the index is current.
+/// Public at the crate root (`pub use` in `lib.rs`) because the
+/// `scheduled` hook drives it and the tests drive the same path directly:
+/// a test context has no [`cratefield_core::ModuleContext`] to hand a
+/// hook.
+///
+/// # Errors
+///
+/// The [`DbError`] of whichever statement failed, left uncommitted — a
+/// chunk whose batch rolled back keeps its old postings and its old
+/// version stamp, and the next sweep picks it again.
+pub async fn reindex_stale_chunks(db: &dyn Database, limit: usize) -> Result<usize, DbError> {
+    // A page bound widens losslessly: `usize` fits `u64` on every target
+    // this crate compiles for.
+    let limit = u64::try_from(limit).unwrap_or(u64::MAX);
+    let stale = stale_chunks(db, crate::chunk::TOKENIZER_VERSION, limit).await?;
+    for chunk in &stale {
+        reindex_chunk(db, chunk).await?;
+    }
+    Ok(stale.len())
+}
+
 /// Chunk count and mean document length for one tenant's index — the two
 /// numbers Okapi BM25 needs before it can score anything. An empty index
 /// is `Corpus { chunk_count: 0, avg_length: 0.0 }`, not an error.
@@ -920,6 +1048,12 @@ pub(crate) struct Turn {
     /// The model's raw citations as a JSON string, persisted whatever the
     /// outcome — the response may hide them, the row does not.
     pub citations_json: String,
+    /// The language the turn was conducted in, as a BCP-47 primary tag —
+    /// what the prompt's `respond_in` named, what a canned body was
+    /// rendered in, and the `lang` column of *both* messages of the turn:
+    /// the turn is the unit, and the user's question and the answer shown
+    /// for it share one language by construction.
+    pub lang: Option<String>,
 }
 
 /// The statements for one turn: the conversation (insert or update) plus
@@ -984,6 +1118,7 @@ pub(crate) fn turn_statements(turn: &Turn) -> Vec<Statement> {
             "outcome",
             "confidence_pct",
             "citations",
+            "lang",
             "created_at",
         ])
         .values_panic([
@@ -997,6 +1132,7 @@ pub(crate) fn turn_statements(turn: &Turn) -> Vec<Statement> {
             Option::<String>::None.into(),
             Option::<i64>::None.into(),
             Option::<String>::None.into(),
+            turn.lang.clone().into(),
             turn.now.clone().into(),
         ])
         .values_panic([
@@ -1010,6 +1146,7 @@ pub(crate) fn turn_statements(turn: &Turn) -> Vec<Statement> {
             turn.outcome.clone().into(),
             turn.confidence_pct.into(),
             turn.citations_json.clone().into(),
+            turn.lang.clone().into(),
             turn.now.clone().into(),
         ]);
 

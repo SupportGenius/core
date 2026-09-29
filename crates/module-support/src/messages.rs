@@ -8,7 +8,7 @@
 //! a decided turn reaches the single `batch_atomic` at the end.
 
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use axum::extract::{Path, State};
@@ -22,6 +22,7 @@ use cratefield_core::{
     Clock, Completion, Database, IdGen, Json, ModelTier, Problem, ProblemDef, Prompt, Scope,
     TextModel, TextModelError, require_admin,
 };
+use cratefield_i18n::{Args, Catalog, FluentCatalog, localize};
 
 use crate::answer::{self, DEFAULT_ANSWER_THRESHOLD, ModelReply, Outcome};
 use crate::handlers::{
@@ -46,10 +47,110 @@ const MAX_OUTPUT_TOKENS: u32 = 1024;
 /// seconds, and an exact number would be a promise nobody can keep.
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(2);
 
-const CLARIFY_MESSAGE: &str = "I want to give you an accurate answer rather than a fast wrong \
-     one — could you rephrase the question or add a little more detail?";
-const HANDOFF_MESSAGE: &str = "I could not answer this confidently, so I have passed your \
-     question to a person who can. You will hear back here.";
+/// The canned texts a turn can be shown instead of a model answer, in the
+/// three languages the module can answer in. Built once — a catalog
+/// parses its `.ftl` on first use and is then only ever read — and
+/// rendered through [`localize`], which falls back to the default locale
+/// for a turn in any other language.
+static CANNED: LazyLock<FluentCatalog> = LazyLock::new(|| {
+    FluentCatalog::builder()
+        .default_locale("en")
+        .locale("en", include_str!("../locales/en.ftl"))
+        .locale("de", include_str!("../locales/de.ftl"))
+        .locale("ja", include_str!("../locales/ja.ftl"))
+        .build()
+        .expect("the canned-text catalog parses")
+});
+
+/// One canned message (`clarify` or `handoff`), rendered in `lang` — a
+/// BCP-47 primary tag from [`turn_language`] — or in English when the
+/// turn had no language at all.
+fn canned(key: &str, lang: Option<&str>) -> String {
+    let requested = lang
+        .and_then(cratefield_i18n::parse_locale)
+        .unwrap_or_else(|| CANNED.default_locale().clone());
+    localize(
+        &*CANNED,
+        &requested,
+        key,
+        cratefield_i18n::BODY,
+        &Args::new(),
+    )
+    .text
+}
+
+/// The clarify prompt: shown when the module would not stand behind an
+/// answer.
+pub(crate) fn clarify_message(lang: Option<&str>) -> String {
+    canned("clarify", lang)
+}
+
+/// The handoff notice: shown when the turn was escalated to a person.
+pub(crate) fn handoff_message(lang: Option<&str>) -> String {
+    canned("handoff", lang)
+}
+
+/// The languages whose BCP-47 primary tag is not whatlang's ISO 639-3
+/// code: everything a support desk is likely to answer in has a
+/// two-letter 639-1 tag, and the catalogs are keyed by those. Unmapped
+/// languages fall back to the three-letter code, which is itself a valid
+/// primary tag — a worse catalog key beats no detection.
+const LANG_TAGS: &[(whatlang::Lang, &str)] = &[
+    (whatlang::Lang::Eng, "en"),
+    (whatlang::Lang::Deu, "de"),
+    (whatlang::Lang::Fra, "fr"),
+    (whatlang::Lang::Spa, "es"),
+    (whatlang::Lang::Ita, "it"),
+    (whatlang::Lang::Por, "pt"),
+    (whatlang::Lang::Nld, "nl"),
+    (whatlang::Lang::Swe, "sv"),
+    (whatlang::Lang::Dan, "da"),
+    (whatlang::Lang::Nob, "nb"),
+    (whatlang::Lang::Fin, "fi"),
+    (whatlang::Lang::Pol, "pl"),
+    (whatlang::Lang::Ces, "cs"),
+    (whatlang::Lang::Rus, "ru"),
+    (whatlang::Lang::Ukr, "uk"),
+    (whatlang::Lang::Tur, "tr"),
+    (whatlang::Lang::Ell, "el"),
+    (whatlang::Lang::Heb, "he"),
+    (whatlang::Lang::Ara, "ar"),
+    (whatlang::Lang::Hin, "hi"),
+    (whatlang::Lang::Tha, "th"),
+    (whatlang::Lang::Cmn, "zh"),
+    (whatlang::Lang::Jpn, "ja"),
+    (whatlang::Lang::Kor, "ko"),
+];
+
+/// The language one support turn is conducted in, as a BCP-47 primary
+/// tag, or `None` when nothing reliable says.
+///
+/// whatlang's script-and-trigram detection answers for the message
+/// itself, but only when it calls itself reliable — a short or ambiguous
+/// text ("How do I reset my password?" is genuinely undecidable from
+/// trigrams alone) must not pick a language on a guess. Below that floor
+/// the request's own `Accept-Language` answers, first entry wins; with
+/// neither signal, the turn has no language and every language-dependent
+/// choice falls back to English.
+fn turn_language(message: &str, accept_language: Option<&str>) -> Option<String> {
+    if let Some(info) = whatlang::detect(message)
+        && info.is_reliable()
+    {
+        return Some(
+            LANG_TAGS
+                .iter()
+                .find(|(detected, _)| *detected == info.lang())
+                .map_or_else(
+                    || info.lang().code().to_owned(),
+                    |(_, tag)| (*tag).to_owned(),
+                ),
+        );
+    }
+    accept_language
+        .map(cratefield_i18n::accept_language)
+        .and_then(|locales| locales.first().cloned())
+        .map(|locale| locale.language.to_string())
+}
 
 /// 503: no model is wired into this deployment at all. Permanent until
 /// the operator acts — retrying without changing anything will not help,
@@ -85,14 +186,16 @@ const TEXT_MODEL_BAD_ANSWER: ProblemDef = ProblemDef {
 };
 
 /// The system prompt: what the model may ground on, what it must cite,
-/// and the shape it must answer in.
+/// which language it must answer in, and the shape it must answer in.
 const SYSTEM_PROMPT: &str = "You answer customer-support questions using only the retrieved \
      context you are given. Each context passage starts with its chunk id in square brackets. \
      Cite only chunk ids that appear in the retrieved context, quoting the exact span that \
      grounds each claim — never invent a chunk id. If the context does not contain the answer, \
-     say so instead of guessing. Answer with JSON matching the provided schema: `answer` (your \
-     reply), `citations` (chunk_id + quote pairs), and `confidence` in 0.0..=1.0, your own \
-     confidence that the answer is correct and fully grounded.";
+     say so instead of guessing. Answer in the language named by `respond_in`, or in the \
+     question's own language when there is no `respond_in` line. Answer with JSON matching the \
+     provided schema: `answer` (your reply), `citations` (chunk_id + quote pairs), and \
+     `confidence` in 0.0..=1.0, your own confidence that the answer is correct and fully \
+     grounded.";
 
 #[derive(Deserialize)]
 struct MessageBody {
@@ -124,6 +227,16 @@ pub(crate) async fn post_message(
     }
     let body = parse_message(&body).map_err(|problem| problem.instance(&scope.request_id))?;
     let message = body.message.as_str();
+    // The turn's language, from the message's own words first and the
+    // caller's Accept-Language below that. Decided here, before anything
+    // can fail, so the prompt, the canned texts and both stored messages
+    // of the turn speak one language.
+    let lang = turn_language(
+        message,
+        headers
+            .get(header::ACCEPT_LANGUAGE)
+            .and_then(|value| value.to_str().ok()),
+    );
 
     let clock: &dyn Clock = required_port(ctx.ports.clock.as_deref(), "Clock")?;
     let id_gen: &dyn IdGen = required_port(ctx.ports.id_gen.as_deref(), "IdGen")?;
@@ -160,7 +273,7 @@ pub(crate) async fn post_message(
 
     // 5. Ask the model. Nothing has been written yet, which is what makes
     //    every failure here consume nothing.
-    let prompt = build_prompt(&chunks, message);
+    let prompt = build_prompt(&chunks, message, lang.as_deref());
     let completion = match ask(state.text_model.as_deref(), &prompt, &scope).await {
         Ok(completion) => completion,
         Err(response) => return Ok(*response),
@@ -203,8 +316,8 @@ pub(crate) async fn post_message(
         // module would not stand behind. The model's own words still go to
         // `model_answer` below — what the user saw and what the model said
         // deliberately differ on a downgraded turn.
-        Outcome::Clarify => (CLARIFY_MESSAGE.to_owned(), Vec::new()),
-        Outcome::Handoff => (HANDOFF_MESSAGE.to_owned(), Vec::new()),
+        Outcome::Clarify => (clarify_message(lang.as_deref()), Vec::new()),
+        Outcome::Handoff => (handoff_message(lang.as_deref()), Vec::new()),
     };
     let turn = store::Turn {
         conversation_id: conversation_id.clone(),
@@ -221,6 +334,7 @@ pub(crate) async fn post_message(
         outcome: decision.outcome.as_str().to_owned(),
         confidence_pct,
         citations_json: citations_json(&reply),
+        lang: lang.clone(),
     };
     // A handoff's `Escalation::intake().handoff(...)` statements belong in
     // this same batch once module-escalation is composed alongside.
@@ -294,8 +408,10 @@ async fn ask(
 
 /// The model request: every retrieved chunk as `[chunk_id] body`, so each
 /// citation can be checked against exactly what the model was shown, and
-/// the hand-written reply schema.
-fn build_prompt(chunks: &[Retrieved], question: &str) -> Prompt {
+/// the hand-written reply schema. A turn with a known language adds the
+/// one-line `respond_in: <lang>` the system prompt names, so the model
+/// answers in the language the question was asked in.
+fn build_prompt(chunks: &[Retrieved], question: &str, lang: Option<&str>) -> Prompt {
     let mut context = String::new();
     for hit in chunks {
         // Writing into a `String` cannot fail.
@@ -304,10 +420,12 @@ fn build_prompt(chunks: &[Retrieved], question: &str) -> Prompt {
     if context.is_empty() {
         context.push_str("(nothing was retrieved for this question)\n");
     }
+    let respond_in = lang.map_or_else(String::new, |lang| format!("respond_in: {lang}\n"));
     Prompt::new(ModelTier::Fast)
         .system(SYSTEM_PROMPT)
         .user(format!(
-            "Question:\n{question}\n\nRetrieved context — cite only these chunk ids:\n{context}"
+            "Question:\n{question}\n{respond_in}\nRetrieved context — cite only these chunk \
+             ids:\n{context}"
         ))
         .json_schema(answer::reply_schema())
         .max_tokens(MAX_OUTPUT_TOKENS)
@@ -376,4 +494,65 @@ pub(crate) async fn put_settings(
         "answer_threshold": answer::pct_confidence_f64(pct),
     }))
     .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clarify_message, handoff_message, turn_language};
+
+    /// The wording these messages have always had. The English catalog
+    /// must render exactly this: the routes' long-standing texts, not a
+    /// fresh translation of them.
+    const CLARIFY_EN: &str = "I want to give you an accurate answer rather than a fast wrong \
+         one — could you rephrase the question or add a little more detail?";
+    const HANDOFF_EN: &str = "I could not answer this confidently, so I have passed your \
+         question to a person who can. You will hear back here.";
+
+    #[test]
+    fn english_is_the_wording_the_canned_texts_always_had() {
+        assert_eq!(clarify_message(None), CLARIFY_EN);
+        assert_eq!(handoff_message(None), HANDOFF_EN);
+        // A turn in a language the catalog does not carry falls back to
+        // the default locale, never to a missing key.
+        assert_eq!(clarify_message(Some("fr")), CLARIFY_EN);
+    }
+
+    #[test]
+    fn every_catalog_locale_renders_both_canned_texts() {
+        // Whatever a locale's clarify says, its handoff says something
+        // different — a copy-paste across keys would show one of them to
+        // the wrong turn.
+        for lang in ["de", "ja"] {
+            let clarify = clarify_message(Some(lang));
+            let handoff = handoff_message(Some(lang));
+            assert_ne!(clarify, CLARIFY_EN, "{lang} clarify fell back to en");
+            assert_ne!(handoff, HANDOFF_EN, "{lang} handoff fell back to en");
+            assert_ne!(clarify, handoff, "{lang} renders one text for both keys");
+        }
+    }
+
+    #[test]
+    fn detection_maps_to_primary_tags_and_the_header_covers_the_rest() {
+        // Reliable detections map to the two-letter tags the catalogs are
+        // keyed by; both verified empirically against whatlang.
+        assert_eq!(
+            turn_language("Wie kann ich mein Passwort zurücksetzen?", None),
+            Some("de".to_owned())
+        );
+        assert_eq!(
+            turn_language("パスワードをリセットするにはどうすればよいですか？", None),
+            Some("ja".to_owned())
+        );
+
+        // A short English question is genuinely undecidable from
+        // trigrams alone: unreliable, so the header answers, first entry
+        // first — and with no header, there is no language.
+        let ambiguous = "How do I reset my password?";
+        assert_eq!(
+            turn_language(ambiguous, Some("ja, en;q=0.8")),
+            Some("ja".to_owned())
+        );
+        assert_eq!(turn_language(ambiguous, None), None);
+        assert_eq!(turn_language(ambiguous, Some("not a language")), None);
+    }
 }

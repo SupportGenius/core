@@ -128,10 +128,32 @@ pinned by the workspace's single `cratefield-*` git rev (see the root
   no reranking.
 - **≤ 48 KiB of text per ingest.** The `/v1/*` body cap leaves no room
   for more, and URL ingest truncates to the same ceiling.
-- **No CJK segmentation.** `tokenize` splits on non-alphanumeric
-  characters, so scripts written without spaces (Chinese, Japanese,
-  Thai) are indexed as long unsegmented runs and search poorly. This is
-  a known limitation, not an oversight.
+- **Unspaced scripts search by bigram.** `tokenize` still splits
+  space-delimited text on non-alphanumeric characters, but runs of
+  Chinese, Japanese (kanji, hiragana, katakana), Korean and Thai are
+  emitted as overlapping character bigrams instead of one long
+  unsegmented token, so a Japanese or Thai question matches the chunks
+  that contain its words. That is a retrieval fallback, not
+  segmentation: a bigram matches any text sharing two adjacent
+  characters, so ranking leans on BM25's idf to keep the common ones
+  quiet. The tokenizer's behaviour version is stamped on every chunk
+  (`sg_chunks.tokenizer_version`), and the module's `scheduled` hook —
+  the venture's daily Worker cron — re-tokenizes a bounded batch of
+  chunks whose stamp is older, rewriting their postings and
+  `term_count`, so a tokenizer change re-claims an existing index over
+  the following ticks instead of waiting for re-ingest. The sweep's body
+  is `module_support::reindex_stale_chunks`, callable directly.
+- **Answers know their language.** Each turn's language is detected from
+  the message itself (`whatlang`, trusted only when it calls itself
+  reliable), falling back to the request's first `Accept-Language`
+  entry, else to none; it is stored as `sg_messages.lang` on both
+  messages of the turn, named to the model as a `respond_in: <lang>`
+  line, and used to render the canned clarify/handoff texts from the
+  Fluent catalogs in `locales/{en,de,ja}.ftl` — English is the fallback
+  for any other language. Cross-language *retrieval* (a German question
+  over English documents) is out of scope until hybrid retrieval exists:
+  it needs embeddings, i.e. an upstream `VectorIndex` port, and BM25
+  over translated terms is not a substitute.
 - **Ranking trusts the caller.** `bm25::rank` computes `df` from the
   postings it is given, so a `LIMIT` on the SQL that fetches them silently
   skews every idf. The contract is documented on `rank`.
