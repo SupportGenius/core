@@ -19,6 +19,9 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use tower::ServiceExt;
 
+mod stats_check;
+use stats_check::{assert_stats_exact, df_of};
+
 const ADMIN_TOKEN: &str = "test-admin-token-0123456789abcdef";
 const ADMIN: &str = "/v1/support/admin/tenants";
 const SEARCH: &str = "/v1/support/search";
@@ -286,6 +289,15 @@ fn long_document(min_bytes: usize, marker: &str) -> Vec<u8> {
     }
     text.extend_from_slice(marker.as_bytes());
     text
+}
+
+/// The single text column `v` of the first row of `sql`.
+fn text_of(kit: &TestHarness, sql: &str) -> String {
+    let rows = pollster::block_on(kit.db.query(&Statement::new(sql))).expect("query runs");
+    rows.rows
+        .first()
+        .and_then(|row| row.get::<String>("v"))
+        .expect("one text row")
 }
 
 /// A one-page PDF whose page shows `text`, built with the same lopdf
@@ -863,6 +875,15 @@ async fn an_extracted_upload_is_an_ordinary_managed_source() {
         assert!(item["chunk_count"].as_i64().expect("chunk_count") > 1);
         assert!(item["updated_at"].is_string(), "{item}");
 
+        // The extract job's batch wrote the search statistics with the
+        // source it produced (issue #31).
+        assert!(assert_stats_exact(&kit, "after the upload was extracted") > 1);
+        let tenant_id = text_of(
+            &kit,
+            &format!("SELECT tenant_id AS v FROM sg_sources WHERE id = '{source_id}'"),
+        );
+        assert_eq!(df_of(&kit, &tenant_id, "warranty"), Some(1));
+
         // Every chunk it wrote carries the current tokenizer stamp, so the
         // scheduled re-index has nothing to redo for it.
         assert_eq!(
@@ -899,6 +920,11 @@ async fn an_extracted_upload_is_an_ordinary_managed_source() {
             count_where(&kit, "sg_chunks", &format!("source_id = '{source_id}'")),
             0
         );
+        assert_eq!(
+            assert_stats_exact(&kit, "after the extracted source was deleted"),
+            0,
+            "the tenant's only source is gone, and its statistics with it"
+        );
         let after = get_upload(&kit, &key, &upload_id).await;
         assert_eq!(after.str_field("status"), "extracted", "{}", after.body);
         assert_eq!(after.str_field("source_id"), source_id);
@@ -929,6 +955,7 @@ async fn a_japanese_upload_is_found_by_a_japanese_query() {
         let results = hits.body["results"].as_array().expect("results");
         assert!(!results.is_empty(), "{}", hits.body);
         assert_eq!(results[0]["source_id"], source_id.as_str(), "{}", hits.body);
+        assert!(assert_stats_exact(&kit, "after a Japanese upload") > 1);
     }
 }
 
@@ -979,6 +1006,10 @@ async fn one_cron_tick_runs_both_the_reindex_and_the_upload_sweeps() {
             status.body
         );
         assert_eq!(count_where(&kit, "sg_support_outbox", "1 = 1"), 0);
+        // Both sweeps of the tick kept the statistics exact: the re-index
+        // rewrote the stale chunk's contribution, the extract added the
+        // upload's.
+        assert!(assert_stats_exact(&kit, "after one cron tick of both sweeps") > 1);
     }
 }
 
@@ -999,6 +1030,7 @@ fn the_upload_migration_follows_internationalization() {
             ("0004", "internationalization"),
             ("0005", "uploads"),
             ("0006", "connectors"),
+            ("0007", "search_stats"),
         ],
         "uploads is support/0005, after the two migrations main gained (connectors follow it)"
     );
