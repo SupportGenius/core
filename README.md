@@ -12,8 +12,8 @@ The rest of the list below is still scaffolding and an ordered backlog.
 
 The plan, in order, is the issue list. Two modules, not five:
 
-- `crates/module-support` — tenants, sources, retrieval, conversations,
-  answers with citations
+- `crates/module-support` — tenants, sources, chunked uploads (text and
+  PDF), retrieval, conversations, answers with citations
 - `crates/module-escalation` — a conversation becomes a ticket: drafted by one
   model, checked by an independent one, filed by a router, followed up until
   it closes

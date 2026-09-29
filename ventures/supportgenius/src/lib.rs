@@ -40,6 +40,11 @@
 //! in wrangler.toml; the waitlist path keys on IP and normalized email and
 //! the support path on tenant id, all through the one shared port.
 //!
+//! **Uploads.** The same shape, an R2 bucket: `BLOB` (issue #30) backs
+//! the `Blob` port the chunked-upload routes store parts in. The daily
+//! cron that already runs here is also what drains any leftover
+//! `extract` job and collects uploads abandoned before completion.
+//!
 //! **One runtime, twice used.** The `Cloudflare` runtime is built exactly
 //! once per composition and then handed to both `Harness::builder` and
 //! `serve`/`serve_scheduled`; see `compose`.
@@ -86,7 +91,13 @@ pub fn compose(
     let mut runtime = Cloudflare::new()
         .db("DB")
         .mailer_arc(mailer)
-        .rate_limiter("RATE_LIMITER");
+        .rate_limiter("RATE_LIMITER")
+        // The R2 bucket the chunked-upload routes store parts in
+        // (issue #30). Mounted unconditionally like the rate limiter —
+        // it is a binding in wrangler.toml, not an option: without it
+        // the upload routes answer `503 not-ready` and a manual or PDF
+        // can only arrive through the 48 KiB inline form.
+        .blob("BLOB");
     if let Some(captcha) = captcha {
         runtime = runtime.captcha(captcha);
     }

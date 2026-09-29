@@ -2,11 +2,12 @@
 //! chunking and BM25 ranking, as pure Rust with no I/O of any kind, so
 //! the same code runs in a Cloudflare Worker isolate and in `cargo test`.
 //!
-//! At ingest, a document (up to 48 KiB of text — see
-//! [`handlers::MAX_TEXT_BYTES`] for why) is split into overlapping word
-//! windows by [`chunk::Chunker`] and inverted into `sg_postings` rows.
-//! At query time, the caller fetches the postings for the query's terms
-//! and [`bm25::rank`] scores them in-process with Okapi BM25.
+//! At ingest, a document — up to 48 KiB of text inline (see
+//! [`handlers::MAX_TEXT_BYTES`] for why), or up to 4 MiB in chunks
+//! through the upload routes (`uploads`) — is split into overlapping
+//! word windows by [`chunk::Chunker`] and inverted into `sg_postings`
+//! rows. At query time, the caller fetches the postings for the query's
+//! terms and [`bm25::rank`] scores them in-process with Okapi BM25.
 //!
 //! [`tokenize`] is shared by both halves, which is the point: a query
 //! tokenised differently from the index it searches finds nothing, so
@@ -34,9 +35,11 @@
 mod answer;
 pub mod bm25;
 pub mod chunk;
+mod extract;
 mod handlers;
 mod messages;
 mod store;
+mod uploads;
 
 pub use answer::DEFAULT_ANSWER_THRESHOLD;
 pub use chunk::tokenize;
@@ -97,6 +100,14 @@ const MIGRATION_INTERNATIONALIZATION: SqlMigration = SqlMigration::new(
     include_str!("../migrations/sqlite/0004_internationalization.sql"),
 );
 
+/// Chunked uploads: upload and part rows, plus the module's outbox (the
+/// `extract` job lives in), created from `Outbox::new(…).create_table_sql()`.
+const MIGRATION_UPLOADS: SqlMigration = SqlMigration::new(
+    "0005",
+    "uploads",
+    include_str!("../migrations/sqlite/0005_uploads.sql"),
+);
+
 /// The support module: tenant provisioning behind the harness admin
 /// token, API-key-authenticated source ingest, BM25 search and grounded
 /// answers for everything else.
@@ -141,13 +152,27 @@ impl Module for Support {
     /// when absent: URL ingest answers `503 not-ready`, the limiter is
     /// skipped, and messages answer `503 text-model-not-configured`.
     ///
+    /// `Blob` and `Defer` serve the chunked-upload routes. `Blob` is
+    /// where upload parts land (`503 not-ready` on the upload routes when
+    /// absent — ingest, search and answers never touch it); `Defer`
+    /// drains the `extract` job inline after `complete`, and cron is the
+    /// backstop that runs it regardless. Neither is required because a
+    /// deployment without object storage still gets the whole retrieval
+    /// core through the inline `POST /sources` form.
+    ///
     /// Optional, not required, on purpose: retrieval and ingest — the
     /// parts that make a workspace useful — work without a model, and a
     /// venture that never wires one should still boot (the escalation
     /// module is the one that cannot run without it, and it declares the
     /// port required).
     fn optional(&self) -> &'static [Port] {
-        &[Port::HttpClient, Port::RateLimiter, Port::TextModel]
+        &[
+            Port::HttpClient,
+            Port::RateLimiter,
+            Port::TextModel,
+            Port::Blob,
+            Port::Defer,
+        ]
     }
 
     fn tables(&self) -> &'static [&'static str] {
@@ -160,6 +185,9 @@ impl Module for Support {
             "sg_conversations",
             "sg_messages",
             "sg_tenant_settings",
+            "sg_uploads",
+            "sg_upload_parts",
+            "sg_support_outbox",
         ]
     }
 
@@ -275,16 +303,40 @@ impl Module for Support {
                 "sg_tenant_settings",
                 "The workspace's answer threshold and when it was last set.",
             ),
+            PersonalDataSet::unreachable(
+                "sg_uploads",
+                DataKind::Content,
+                "The workspace's uploaded documents as bookkeeping: filename, content type, \
+                 sizes, status and the ids of the source each was indexed into. The document \
+                 bytes live in the Blob port and the indexed text in sg_sources; a filename \
+                 or a PDF's words may mention people.",
+                "The rows belong to the workspace, not to any person the rows can name. An \
+                 upload past its status change keeps no bytes anywhere (part blobs are deleted \
+                 the moment the upload turns extracted, failed or collected), so there is no \
+                 content here to erase beyond what account closure removes.",
+            ),
+            PersonalDataSet::none(
+                "sg_upload_parts",
+                "One size row per uploaded part: the part's ordinal and its byte count. The \
+                 bytes themselves live in the Blob port and are deleted with the upload; \
+                 nothing here names a person.",
+            ),
+            PersonalDataSet::none(
+                "sg_support_outbox",
+                "The module's durable work queue: an extract job per completed upload, \
+                 carrying two ids (upload and tenant) and timestamps. No content, no person.",
+            ),
         ];
         SETS
     }
 
     fn migrations(&self) -> Migrations {
-        const MIGRATIONS: [SqlMigration; 4] = [
+        const MIGRATIONS: [SqlMigration; 5] = [
             MIGRATION_INIT,
             MIGRATION_CONVERSATIONS,
             MIGRATION_SOURCE_MANAGEMENT,
             MIGRATION_INTERNATIONALIZATION,
+            MIGRATION_UPLOADS,
         ];
         // Refuses a gap, a duplicate or an out-of-order id at compile
         // time.
@@ -297,15 +349,18 @@ impl Module for Support {
         }
     }
 
-    /// The only module-owned setting is `REVOKED_KIDS` (config key
-    /// `SUPPORT_REVOKED_KIDS`): a comma-separated list of key ids whose
-    /// credentials must stop working immediately. It is parsed the same
+    /// Two module-owned settings. `REVOKED_KIDS` (config key
+    /// `SUPPORT_REVOKED_KIDS`) is a comma-separated list of key ids whose
+    /// credentials must stop working immediately; it is parsed the same
     /// way at verification time (`tenancy::parse_revoked_kids` trims,
     /// drops empties, lowercases), so validation rejects exactly what
     /// verification would silently ignore: an entry that could never
     /// equal a real kid — empty after trimming is already dropped, so
     /// what is left to reject is an entry with the wrong characters or
-    /// the wrong length.
+    /// the wrong length. `UPLOAD_QUOTA_BYTES`
+    /// (`SUPPORT_UPLOAD_QUOTA_BYTES`) is the per-tenant retained-upload
+    /// budget; a value that does not parse would silently read as the
+    /// default, which is the one failure mode a budget must not have.
     fn validate_config(&self, cfg: &dyn Config) -> Result<(), ConfigError> {
         let module = ModuleConfig::new(MODULE_NAME, cfg);
         let mut errors = ConfigError::default();
@@ -333,6 +388,16 @@ impl Module for Support {
             }
         }
 
+        if let Some(raw) = module.get_opt(uploads::QUOTA_KEY)
+            && raw.parse::<u32>().is_err()
+        {
+            errors.push(format!(
+                "{}: {raw:?} is not a byte count (a whole number of bytes; the default is {})",
+                module.key(uploads::QUOTA_KEY),
+                uploads::DEFAULT_QUOTA_BYTES
+            ));
+        }
+
         errors.into_result()
     }
 
@@ -353,27 +418,42 @@ impl Module for Support {
     /// native binary's scheduler, where one runs) fans out here; the
     /// sweep's body is [`reindex_stale_chunks`], which tests and operators
     /// can drive directly.
+    ///
+    /// The same tick is the cron half of `uploads`: it drains leftover
+    /// `extract` jobs (a deployment without `Defer`, or one whose deferred
+    /// drain crashed) and collects the uploads nobody finished. The two
+    /// sweeps are independent, so both always run — a failing re-index
+    /// must not strand an upload at `complete`, nor the other way round —
+    /// and the first error is what the tick reports.
     fn scheduled<'a>(
         &'a self,
         ctx: &'a ModuleContext,
-        _cron: &'a str,
+        cron: &'a str,
     ) -> BoxFuture<'a, Result<(), AnyError>> {
         Box::pin(async move {
-            let Some(db) = ctx.ports.db.clone() else {
-                // `Port::Db` is required, so a composed venture always
-                // resolves it; a hand-rolled context may not, and
-                // sweeping nothing beats panicking a cron tick.
-                return Ok(());
-            };
-            for _ in 0..REINDEX_MAX_SWEEPS {
-                let rewritten = reindex_stale_chunks(db.as_ref(), REINDEX_BATCH)
-                    .await
-                    .map_err(|err| Box::new(err) as AnyError)?;
-                if rewritten < REINDEX_BATCH {
-                    break;
-                }
-            }
-            Ok(())
+            let reindexed = reindex_sweep(ctx).await;
+            let uploads = uploads::scheduled(ctx, cron).await;
+            reindexed.and(uploads)
         })
     }
+}
+
+/// The re-index half of [`Support::scheduled`]: bounded sweeps of
+/// [`reindex_stale_chunks`] until one comes back short.
+async fn reindex_sweep(ctx: &ModuleContext) -> Result<(), AnyError> {
+    let Some(db) = ctx.ports.db.clone() else {
+        // `Port::Db` is required, so a composed venture always resolves
+        // it; a hand-rolled context may not, and sweeping nothing beats
+        // panicking a cron tick.
+        return Ok(());
+    };
+    for _ in 0..REINDEX_MAX_SWEEPS {
+        let rewritten = reindex_stale_chunks(db.as_ref(), REINDEX_BATCH)
+            .await
+            .map_err(|err| Box::new(err) as AnyError)?;
+        if rewritten < REINDEX_BATCH {
+            break;
+        }
+    }
+    Ok(())
 }

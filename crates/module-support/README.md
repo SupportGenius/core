@@ -2,7 +2,9 @@
 
 The SupportGenius support module: a Cratefield `Module` named `support`,
 mounted at `/v1/support`. Tenants, sources, BM25 retrieval, and
-conversations answered with citations.
+conversations answered with citations. Documents larger than the inline
+ceiling arrive through the chunked-upload routes (issue #30), which turn
+a manual or PDF into a searchable source.
 
 ## Routes
 
@@ -22,6 +24,10 @@ the optional `RateLimiter` port.
 | `GET /sources/{source_id}` | API key | one source, in the list's item shape |
 | `PUT /sources/{source_id}` | API key | replace a source's content and metadata, body shaped like `POST /sources` |
 | `DELETE /sources/{source_id}` | API key | remove a source and its whole index; `204`, no body |
+| `POST /uploads` | API key | `{"filename", "content_type", "bytes"}` → `201 {id, part_bytes, …}` |
+| `PUT /uploads/{id}/parts/{n}` | API key | raw part bytes (1..=48 KiB), contiguous from 0 |
+| `POST /uploads/{id}/complete` | API key | checks the parts add up, enqueues the `extract` job → `202` |
+| `GET /uploads/{id}` | API key | the upload's status, `received_bytes`, and once extracted its `source_id` |
 | `GET /search?q=…&limit=…` | API key | BM25 over the tenant's own index |
 | `POST /messages` | API key | `{"message", "conversation_id"?}` → one support turn |
 
@@ -49,6 +55,47 @@ written. A body `external_id` another source of the same tenant already
 holds is answered `409` rather than written. Listing, reading, replacing
 and deleting all answer `404` — the same `404` — for an id that is
 missing or another tenant's.
+
+### Chunked uploads
+
+A manual or policy PDF is bigger than any `/v1/*` request body, so it
+arrives in parts. Open an upload with the filename, content type and
+declared size; `PUT` the bytes one part at a time into the `Blob` port
+(R2 on Workers, a directory when self-hosted); then complete. The parts
+are checked for contiguity against the declaration, the upload flips to
+`complete`, and the `extract` job is enqueued in the same batch — the
+job reads the parts back, turns the document into text (`text/plain`,
+`text/markdown`, `text/html`, `application/pdf`), and indexes it through
+the same path as `POST /sources`. `GET /uploads/{id}` reports
+`extracted` with the `source_id` once that has run, or `failed` with the
+reason a document could not be read.
+
+The source an upload produces is an ordinary text source: it lists under
+`GET /sources` with `origin` `text`, no `external_id`, the upload's
+filename as its title and the extracted text's size as `bytes`, and it is
+replaced or deleted through `PUT`/`DELETE /sources/{id}` like any other.
+`GET /uploads/{id}` keeps reporting the `source_id` it produced even after
+that source is deleted — the upload row is bookkeeping, not a live link.
+
+Limits, and why:
+
+| Limit | Value | Why |
+| --- | --- | --- |
+| Part size | ≤ 48 KiB (`part_bytes` in the open response) | the same per-request ceiling the inline form has; a part must fit the 64 KiB body cap |
+| Document size | ≤ 4 MiB | far past any manual that belongs in a support index; 86 parts maximum |
+| Per-tenant upload storage | 50 MiB default, `SUPPORT_UPLOAD_QUOTA_BYTES` | counts `open` and `complete` uploads only — extraction returns the bytes |
+| Extracted text | ≤ 2 MiB | the index is sized for manuals; a document whose text expands past this fails the upload |
+| Abandoned-upload lifetime | 24 h, then cron deletes it | an `open` upload nobody completed is storage nobody is coming back for |
+
+The `extract` job runs inline as soon as the `202` is on its way (the
+`Defer` port) and, durably, from cron either way — a deployment that
+never drains it inline still gets the document indexed at the next tick.
+A run that fails on infrastructure (not on the document) is retried with
+the outbox's own attempt counter, five tries, and then the upload is
+failed with the reason. An upload that was never completed is
+garbage-collected by the same cron sweep. All of this needs the `Blob`
+port; without one the upload routes answer `503 not-ready`, and every
+other route is unaffected.
 
 ### `POST /messages`
 
@@ -126,8 +173,10 @@ pinned by the workspace's single `cratefield-*` git rev (see the root
   (ADR 0004, linted by `fz doctor`), and Cloudflare D1 has no vector
   type. Retrieval is lexical only: no embeddings, no semantic matching,
   no reranking.
-- **≤ 48 KiB of text per ingest.** The `/v1/*` body cap leaves no room
-  for more, and URL ingest truncates to the same ceiling.
+- **≤ 48 KiB of text per ingest; 4 MiB per uploaded document.** The
+  `/v1/*` body cap leaves no room for more inline, and URL ingest
+  truncates to the same ceiling. A larger manual or PDF arrives through
+  the upload routes above, in parts.
 - **Unspaced scripts search by bigram.** `tokenize` still splits
   space-delimited text on non-alphanumeric characters, but runs of
   Chinese, Japanese (kanji, hiragana, katakana), Korean and Thai are
