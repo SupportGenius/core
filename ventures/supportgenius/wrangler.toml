@@ -14,6 +14,12 @@ enabled = true
 # instead of serving (see src/lib.rs).
 [vars]
 ENV = "production"
+# Per-tier model ids for the `TextModel` port (issue #22), read by
+# `build_text_model` in src/lib.rs. Overridable; these are the defaults
+# the code falls back to when a var is absent — spelled out here so an
+# operator sees the knobs next to the secret that turns the port on.
+SUPPORTGENIUS_MODEL_FAST = "claude-haiku-4-5"
+SUPPORTGENIUS_MODEL_STRONG = "claude-sonnet-5"
 
 # Secrets a human must set before this Worker can do its job
 # (`wrangler secret put <NAME>`):
@@ -38,6 +44,13 @@ ENV = "production"
 #   ADMIN_TOKEN      optional. Gates `GET /v1/waitlist/admin/export.csv`
 #                    (Bearer auth, constant-time compared). Without it the
 #                    export answers 401.
+#   ANTHROPIC_API_KEY optional. Mounts the `TextModel` port (issue #22):
+#                    one Anthropic adapter per tier behind a
+#                    `RoutingTextModel`, model ids from the
+#                    SUPPORTGENIUS_MODEL_* vars above. Without it no port
+#                    is mounted, `POST /v1/support/messages` answers
+#                    `503 text-model-not-configured`, and `/__ready`
+#                    reports `"text_model":"missing"`.
 
 # The Workers Rate Limiting binding backing the harness `RateLimiter`
 # port, mounted unconditionally in src/lib.rs so the public

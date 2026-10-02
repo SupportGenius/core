@@ -16,7 +16,7 @@ Resend; a Cloudflare Turnstile widget gates the site's form.
 | `GET /v1/waitlist/status` | The entry's status as JSON (position, referrals, referral code), addressed by the status token the confirm redirect and the confirmation mail carry. |
 | `GET /v1/waitlist/admin/export.csv` | The list as CSV, gated by `ADMIN_TOKEN` (Bearer auth). |
 | `GET /__health` | Liveness: lists the composed modules. |
-| `GET /__ready` | Readiness: reports ports that are not effectively configured. |
+| `GET /__ready` | Readiness (the harness's DB probe), with this venture's `text_model` field added by the Worker itself: `"configured"` when `ANTHROPIC_API_KEY` is set, `"missing"` otherwise. A missing model is a degradation, not unreadiness — the status code stays the harness's. |
 | `GET /__surface` | UI surface metadata for the mounted modules. |
 
 The Worker also answers the daily cron (`23 4 * * *`, `[triggers]` in
@@ -37,6 +37,10 @@ handler in `src/lib.rs` is the other half.
      it — there is deliberately no no-op mailer here),
    - `TURNSTILE_SECRET` (required for production traffic; without it no
      captcha is mounted),
+   - `ANTHROPIC_API_KEY` (optional; mounts the `TextModel` port — see
+     [Model tiers](#model-tiers-and-judging) below. Without it
+     `POST /v1/support/messages` answers
+     `503 text-model-not-configured` and everything else works),
    - `ADMIN_TOKEN` (optional; gates the admin CSV export).
 4. `npx worker-build --release` (or let `wrangler deploy` run it via
    `[build]`) and confirm `build/worker/shim.mjs` appears.
@@ -51,23 +55,70 @@ products. Flip `data-open="true"` on the form only after the secrets are
 set (step 3): without the Resend key the API intentionally fails joins
 rather than silently dropping the confirmation mail.
 
-## Model tiers and judging (not wired yet)
+## Model tiers and judging
 
-The planned escalation flow drafts with one model and judges with a
-second, selected by tier — `fast` and `strong`, the two tiers the
-harness's `RoutingTextModel` defines. `fast` drafts; `strong` judges.
-Neither tier is wired today, to any vendor: the `TextModel` and
-`Tracker` ports live only on the harness's main branch (no published
-`cratefield-core` release carries them, 0.5.0 included), and no
-`TextModel` adapter for any vendor — Anthropic's included — is
-published at all.
+Both link targets mount the `TextModel` port (issue #22) the same way:
+the `ANTHROPIC_API_KEY` secret (a blank value — empty or whitespace-only —
+counts as unset) buys one [Anthropic] adapter per tier behind the
+harness's `RoutingTextModel`. No key, no port — the port is not mounted
+at all (there is no keyless adapter pretending), and
+`POST /v1/support/messages` answers `503 text-model-not-configured` while
+every other route works; the dev-fakes binary below mounts its stub
+instead. `/__ready` reports the port as
+`"text_model": "configured"` or `"missing"` (the Worker decorates the
+harness's own body; the binary's `/__ready` is the harness's unchanged —
+the native runtime offers no hook for the venture to annotate it).
 
-The plan is to point both tiers at Anthropic once the wiring exists.
-One vendor on both tiers is not an independent judge: the judge would be
-reviewing the work of the same vendor's model that drafted it. Until a
-second `TextModel` adapter exists to take one of the tiers, the
-independent-judge property is unmet, and this caveat stays in this
-README.
+[Anthropic]: https://docs.anthropic.com/en/api/messages
+
+| Target | Tier | Vendor | Model id | Configured with | Default |
+| --- | --- | --- | --- | --- | --- |
+| Cloudflare Worker | fast | Anthropic | `claude-haiku-4-5` | `SUPPORTGENIUS_MODEL_FAST` var (`wrangler.toml` `[vars]`, overridable at deploy) | `claude-haiku-4-5` |
+| Cloudflare Worker | strong | Anthropic | `claude-sonnet-5` | `SUPPORTGENIUS_MODEL_STRONG` var (`wrangler.toml` `[vars]`, overridable at deploy) | `claude-sonnet-5` |
+| Self-hosted binary | fast | Anthropic | `claude-haiku-4-5` | `SUPPORTGENIUS_MODEL_FAST` env var | `claude-haiku-4-5` |
+| Self-hosted binary | strong | Anthropic | `claude-sonnet-5` | `SUPPORTGENIUS_MODEL_STRONG` env var | `claude-sonnet-5` |
+| Dev-fakes binary | both | none (stub) | — | `SUPPORTGENIUS_DEV_FAKES=1` on a `--features dev-fakes` build, **and** no `ANTHROPIC_API_KEY` | — |
+
+The single secret `ANTHROPIC_API_KEY` — a Worker secret or the binary's
+environment — turns the port on for both tiers at once; there is no
+per-tier key. On a dev-fakes build a real key beats the stub: the stub
+answers only when no key is set. The stub (`bin/supportgenius`
+`src/dev_fakes.rs`) cites whatever the turn actually retrieved, so it
+exercises the module's real citation check and threshold decision — and
+it is labelled `stub` in every completion.
+
+**Which stage uses which tier today.** The support answer is one
+fast-tier prompt: retrieve, ask, decide (`crates/module-support`
+`messages.rs`). The escalation module drafts with the fast tier and
+judges with the strong tier (`crates/module-escalation` `pipeline.rs`),
+but it is **not composed** into either link target yet — the module list
+(`crates/composition`) carries the waitlist and support modules only — so
+today the strong tier is wired but idle.
+
+**The judge is not independent, and that is a gap, not a choice.** Both
+tiers are the same vendor (Anthropic), so the strong-tier judge would be
+reviewing the work of the same vendor's model that drafted it. A second
+vendor needs a second `TextModel` adapter, which does not exist in the
+harness's pin set — an upstream adapter gap, not a task this repo can
+close — so the caveat stands until one is published and the tiers are
+split across vendors.
+
+### Cost ceiling
+
+Each stage carries an explicit output ceiling in its own prompt:
+
+| Stage | Tier | `Prompt::max_tokens` | Where |
+| --- | --- | --- | --- |
+| Support answer | fast | `1024` (`MAX_OUTPUT_TOKENS`) | `crates/module-support/src/messages.rs` |
+| Escalation draft | fast | `1024` (the harness `Prompt` default) | `crates/module-escalation/src/pipeline.rs` |
+| Escalation judge | strong | `1024` (the harness `Prompt` default) | `crates/module-escalation/src/pipeline.rs` |
+
+The input side is bounded by construction: a support turn retrieves at
+most 6 chunks (`TOP_K` in `messages.rs`), each from a source capped at
+48 KiB, into a message capped at 4000 characters. There is **no**
+per-tenant spend budget yet: the per-tenant cost/budget ceiling is issue
+#20, which has not landed on `main` — the only levers today are the
+per-route rate limit and the token ceilings above.
 
 ## Adding a module later
 

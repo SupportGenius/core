@@ -23,7 +23,9 @@ cargo build --release --target x86_64-unknown-linux-musl -p supportgenius-bin --
 ```
 
 Smoke-test the result end to end (boots it on a scratch SQLite file, probes
-health, joins the waitlist):
+health, joins the waitlist, and exercises the support module's
+tenant/source/message chain — `outcome: "answered"` on a dev-fakes build,
+`503 text-model-not-configured` on the plain one):
 
 ```sh
 scripts/smoke.sh target/x86_64-unknown-linux-musl/release/supportgenius
@@ -38,17 +40,25 @@ scripts/smoke.sh target/x86_64-unknown-linux-musl/release/supportgenius
 | `DATABASE_URL` | unset → SQLite at `./supportgenius.db` | `sqlite://<path>` or `sqlite::memory:` opens SQLite; `postgres://`/`postgresql://` opens Postgres **only in a `postgres`-feature build** (a clear error names the rebuild otherwise). The chosen path is logged at boot. |
 | `REDIS_URL` | unset | When set, Redis backs the `RateLimiter` and `KeyValue` ports. **Unset in dev/staging, rate limiting fails open by design**: the ports stay unmounted, core resolves no limiter to "allowed", and the degradation is logged exactly once at boot — never per request. **Unset with `ENV=production` the binary refuses to boot** (issues #16/#17): the public mail path and support search/sources routes must not run without a volume ceiling. |
 | `RESEND_API_KEY` | unset | Production mailer (Resend). Unset, Resend answers `NotConfigured` and sends nothing — reported, never faked. |
+| `ANTHROPIC_API_KEY` | unset | Production text model (issue #22): one Anthropic adapter per tier behind the harness `RoutingTextModel`. A blank value — empty or whitespace-only — counts as unset: the `TextModel` port is not mounted and `POST /v1/support/messages` answers `503 text-model-not-configured` while every other route works. On a dev-fakes build no key mounts `StubTextModel` instead, and a real key there wins over the stub. |
+| `SUPPORTGENIUS_MODEL_FAST` | `claude-haiku-4-5` | Model id the fast tier calls (the support answer). Same variable name the Worker uses. |
+| `SUPPORTGENIUS_MODEL_STRONG` | `claude-sonnet-5` | Model id the strong tier calls (the escalation judge, once that module is composed). Same variable name the Worker uses. |
 | `MAIL_FROM` | compiled venture default | From address for outgoing mail. |
 | `MAIL_REPLY_TO` | unset | Reply-To for outgoing mail. |
 | `SUPPORTGENIUS_DOMAIN` | compiled venture default | Overrides the venture's domain. |
 | `SUPPORTGENIUS_PUBLIC_URL` | compiled venture default | Overrides the venture's public URL. |
 | `SUPPORTGENIUS_CORS_ORIGINS` | compiled venture default | Comma-separated CORS allowlist. |
-| `SUPPORTGENIUS_DEV_FAKES` | unset | Set at boot, selects the dev fakes (stub mailer/captcha). Requires the `dev-fakes` feature; a non-`dev-fakes` build warns and wires the real adapters. Never serve production traffic from a dev-fakes process. |
+| `SUPPORTGENIUS_DEV_FAKES` | unset | Set at boot, selects the dev fakes (stub mailer/captcha/text model). Requires the `dev-fakes` feature; a non-`dev-fakes` build warns and wires the real adapters. A real `ANTHROPIC_API_KEY` beats `StubTextModel` — the stub answers only when no key is set. Never serve production traffic from a dev-fakes process. |
 | `FZ_APPLY_MIGRATIONS` | migrations run on boot | Set to `0`/`false`/`no`/`off` to skip the idempotent boot-time migration run (e.g. when your deploy pipeline applies them). |
 
 The Turnstile captcha port mounts only when a Turnstile secret is present in
 the environment (read by the adapter itself); without one, no port and the
-module decides per request.
+module decides per request. The `TextModel` port follows the same rule with
+`ANTHROPIC_API_KEY` (see the table above): one adapter per tier mounts only
+when a non-blank key is present; with no key a dev-fakes build mounts
+`StubTextModel` instead and a plain build mounts nothing. The model ids —
+and the caveat that both tiers are one vendor — are documented in the
+[Worker README](../../ventures/supportgenius/README.md#model-tiers-and-judging).
 
 ## Docker
 

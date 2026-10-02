@@ -38,6 +38,10 @@ cratefield-runtime-cloudflare = { git = "https://github.com/Cratefield/harness",
 cratefield-module-waitlist = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 cratefield-adapter-resend = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 cratefield-adapter-turnstile = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
+# The Anthropic `TextModel` adapter (issue #22): wasm-safe, because it
+# runs over the `HttpClient` port rather than reqwest — the same adapter
+# serves the Worker and the static binary, one instance per tier.
+cratefield-adapter-anthropic = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 cratefield-testing = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 cratefield-cli = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 # Native-only (tokio/reqwest/redis do not compile to wasm): consumed only

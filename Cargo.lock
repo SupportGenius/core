@@ -502,6 +502,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cratefield-adapter-anthropic"
+version = "0.1.0"
+source = "git+https://github.com/Cratefield/harness?rev=b50c1d99b6f29e11a9fd5f116a8cd31275f735c6#b50c1d99b6f29e11a9fd5f116a8cd31275f735c6"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "cratefield-core",
+ "getrandom 0.4.3",
+ "http",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "cratefield-adapter-apns"
 version = "0.1.5"
 source = "git+https://github.com/Cratefield/harness?rev=b50c1d99b6f29e11a9fd5f116a8cd31275f735c6#b50c1d99b6f29e11a9fd5f116a8cd31275f735c6"
@@ -3238,6 +3253,7 @@ name = "supportgenius"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "cratefield-adapter-anthropic",
  "cratefield-adapter-resend",
  "cratefield-adapter-turnstile",
  "cratefield-cli",
@@ -3249,6 +3265,7 @@ dependencies = [
  "http",
  "module-support",
  "pollster",
+ "serde_json",
  "supportgenius-composition",
  "worker",
 ]
@@ -3259,6 +3276,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "cratefield-adapter-anthropic",
  "cratefield-adapter-postgres",
  "cratefield-adapter-resend",
  "cratefield-adapter-sqlite",
@@ -3266,6 +3284,7 @@ dependencies = [
  "cratefield-core",
  "cratefield-runtime-native",
  "http",
+ "serde_json",
  "supportgenius-composition",
  "tokio",
  "tracing",
