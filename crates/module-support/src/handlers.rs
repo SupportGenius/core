@@ -23,6 +23,7 @@ use cratefield_core::{
 use crate::bm25;
 use crate::chunk::{Chunker, tokenize};
 use crate::connectors::{self, ConnectorConfig, Kind};
+use crate::handoff::HandoffSink;
 use crate::messages;
 use crate::store::{self, ApiKeyRow, ChunkRow, ConnectorRow, STATUS_ACTIVE, SourceRow, TenantRow};
 use crate::uploads;
@@ -87,6 +88,10 @@ pub(crate) struct ModuleState {
     /// not given one: the route answers `503 text-model-not-configured`
     /// rather than pretending to answer.
     pub text_model: Option<Arc<dyn TextModel>>,
+    /// The handoff sink a handoff turn writes through and kicks. `None` is
+    /// `Support::new()` with nothing composed: the turn still marks
+    /// `needs_escalation`, and no ticket is filed.
+    pub handoff: Option<Arc<dyn HandoffSink>>,
     /// The module-owned limiter the widget's per-visitor buckets run on
     /// (`crate::widget`), wired by the composition so a deployment can
     /// bound one anonymous browser separately from the tenant's own
@@ -99,11 +104,13 @@ pub(crate) struct ModuleState {
 pub(crate) fn router(
     ctx: Arc<ModuleContext>,
     text_model: Option<Arc<dyn TextModel>>,
+    handoff: Option<Arc<dyn HandoffSink>>,
     visitor_rate_limiter: Option<Arc<dyn RateLimiter>>,
 ) -> axum::Router {
     let state = Arc::new(ModuleState {
         ctx,
         text_model,
+        handoff,
         visitor_rate_limiter,
     });
     axum::Router::new()

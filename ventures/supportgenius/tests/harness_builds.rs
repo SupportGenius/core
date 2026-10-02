@@ -1,12 +1,11 @@
 //! The composition compiles into a valid harness (with no secrets, the
-//! state `fz` and CI see), the harness itself reports the `waitlist`
-//! module, and the served surface lists it on `GET /__health`.
+//! state `fz` and CI see), the harness itself reports every venture
+//! module, and the served surface lists them on `GET /__health`.
 
 use std::sync::Arc;
 
 use cratefield_adapter_resend::Resend;
 use cratefield_core::Mailer;
-use cratefield_module_waitlist::Waitlist;
 use cratefield_runtime_cloudflare::{FetchClient, WorkersClock};
 use supportgenius::compose;
 
@@ -38,28 +37,32 @@ fn harness_builds() {
 }
 
 #[test]
-fn harness_reports_waitlist_module() {
+fn harness_reports_every_module() {
     let (harness, _runtime) = compose(keyless_mailer(), None, None, None).expect("harness builds");
     let names: Vec<&str> = harness
         .modules()
         .iter()
         .map(|module| module.name())
         .collect();
-    assert!(
-        names.contains(&"waitlist"),
-        "waitlist missing from harness modules: {names:?}"
-    );
+    for module in ["waitlist", "support", "escalation"] {
+        assert!(
+            names.contains(&module),
+            "{module} missing from harness modules: {names:?}"
+        );
+    }
 }
 
 /// The served surface, through the test harness standing in for the
-/// Worker runtime with the same `Waitlist` configuration.
+/// Worker runtime with the same modules the composition registers.
 #[pollster::test]
-async fn health_lists_waitlist() {
-    let kit = cratefield_testing::TestHarness::new(vec![Box::new(
-        Waitlist::new()
-            .products(["supportgenius"])
-            .status_redirect("https://supportgeni.us/"),
-    )]);
+async fn health_lists_every_module() {
+    let kit = cratefield_testing::TestHarness::new(vec![
+        // The wrapped waitlist the composition registers, so this exercises
+        // the module list the Worker actually serves.
+        Box::new(supportgenius_composition::waitlist()),
+        Box::new(supportgenius_composition::support()),
+        Box::new(supportgenius_composition::escalation()),
+    ]);
     let response =
         cratefield_testing::request(&kit.router, http::Method::GET, "/__health", None).await;
     assert_eq!(response.status, http::StatusCode::OK);
@@ -67,8 +70,10 @@ async fn health_lists_waitlist() {
     let modules = health["modules"]
         .as_array()
         .expect("health carries a modules array");
-    assert!(
-        modules.iter().any(|module| module["name"] == "waitlist"),
-        "waitlist missing from /__health modules: {modules:?}"
-    );
+    for module in ["waitlist", "support", "escalation"] {
+        assert!(
+            modules.iter().any(|entry| entry["name"] == module),
+            "{module} missing from /__health modules: {modules:?}"
+        );
+    }
 }

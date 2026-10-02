@@ -66,7 +66,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cratefield_core::{
-    AnyError, BoxFuture, Config, ConfigError, DataKind, Disposition, Migrations, Module,
+    AnyError, BoxFuture, Config, ConfigError, DataKind, Defer, Disposition, Migrations, Module,
     ModuleConfig, ModuleContext, PersonalDataSet, Port, SqlMigration, SystemClock, UlidIdGen,
 };
 
@@ -326,6 +326,15 @@ impl Module for Escalation {
     /// re-enqueueing work cannot spin one cron tick forever; the rest
     /// waits for the next tick, which is what cron is for.
     ///
+    /// **Every** cron drains, deliberately: the venture schedules this on a
+    /// five-minute tick (the recovery path for whatever a handoff's
+    /// best-effort [`kick`](Escalation::kick) left staged) and a daily one
+    /// (the backstop), but the drain is idempotent — each stage is claimed
+    /// through an [`Inbox`](cratefield_core::Inbox) — so draining on a
+    /// trigger the module did not specifically anticipate is harmless,
+    /// while a module that drained on only one of its crons would silently
+    /// stall the moment the schedule changed. `cron` is therefore unused.
+    ///
     /// A stage that just finished re-drains immediately through the
     /// `Defer` port (see [`Pipeline`]), so this sweep is the backstop that
     /// makes the work durable even where there is no defer port and
@@ -336,60 +345,14 @@ impl Module for Escalation {
         _cron: &'a str,
     ) -> BoxFuture<'a, Result<(), AnyError>> {
         Box::pin(async move {
-            let Some(db) = ctx.ports.db.clone() else {
-                // No database, no outbox, nothing to drain. The module
-                // declares `Port::Db` as required, so a composed venture
-                // always resolves it; a test harness may not.
+            let Some(pipeline) = Self::pipeline(ctx, ctx.ports.defer.clone()) else {
+                // Whatever is missing, there is nothing to drain: no
+                // database is no outbox, and the two ports `build()`
+                // refuses to compose without are ones a hand-rolled
+                // context skipped. Draining nothing beats panicking a cron
+                // tick.
                 return Ok(());
             };
-            // Same for the two ports build() also refuses to compose
-            // without. `None` here means a hand-rolled context skipped
-            // them; draining nothing beats panicking a cron tick.
-            let (Some(model), Some(tracker)) =
-                (ctx.ports.text_model.clone(), ctx.ports.tracker.clone())
-            else {
-                return Ok(());
-            };
-            let clock = ctx
-                .ports
-                .clock
-                .clone()
-                .unwrap_or_else(|| Arc::new(SystemClock));
-            let idgen = ctx
-                .ports
-                .id_gen
-                .clone()
-                .unwrap_or_else(|| Arc::new(UlidIdGen));
-            let cfg = ModuleConfig::new(Self::NAME, &*ctx.ports.config);
-            let policy = RetryPolicy::new()
-                .base(Duration::from_secs(u64::from(
-                    cfg.get_u32("RETRY_BASE_SECS", RetryPolicy::DEFAULT_BASE_SECS),
-                )))
-                .cap(Duration::from_secs(u64::from(
-                    cfg.get_u32("RETRY_CAP_SECS", RetryPolicy::DEFAULT_CAP_SECS),
-                )))
-                .max_attempts(cfg.get_u32("RETRY_MAX_ATTEMPTS", RetryPolicy::DEFAULT_MAX_ATTEMPTS));
-
-            let pipeline = Pipeline::new(
-                db,
-                model,
-                tracker,
-                ctx.ports.mailer.clone(),
-                ctx.ports.config.clone(),
-                clock,
-                idgen,
-                ctx.ports.defer.clone(),
-            )
-            .with_retry_policy(policy)
-            // Every stage that changes a ticket's life — filed,
-            // dead-lettered, parked for a human — also publishes the
-            // matching `escalation.*` event, in the stage's own atomic
-            // batch (see [`Pipeline`]). The publish is fail-safe: a
-            // venture that mounts this module without `Webhooks` has no
-            // webhook tables, and the fan-out is skipped rather than
-            // allowed to break every filing (see [`Pipeline::webhook_stmts`]).
-            .with_webhooks(Webhooks::new());
-
             for _ in 0..Pipeline::MAX_SWEEPS {
                 let processed = pipeline
                     .drain(Pipeline::SWEEP_LIMIT)
@@ -401,6 +364,96 @@ impl Module for Escalation {
             }
             Ok(())
         })
+    }
+}
+
+impl Escalation {
+    /// Runs the escalation pipeline now, on the given [`Defer`], instead of
+    /// waiting for the next scheduled drain.
+    ///
+    /// This is the second half of a handoff: `module-support` commits the
+    /// statements [`Escalation::intake`] built in the same batch as the
+    /// turn (see [`Intake::enqueue`]), then calls this so the staged
+    /// outbox row is driven draft → judge → file → notify immediately.
+    /// A failure here is only a delay — the row is already durable and
+    /// [`Module::scheduled`] is the backstop — so nothing is returned.
+    ///
+    /// `defer` is the caller's own port (the request's, when support calls
+    /// it), so the work rides the runtime's background execution rather
+    /// than the caller's response.
+    pub fn kick(ctx: &ModuleContext, defer: Arc<dyn Defer>) {
+        // The pipeline's finished stages re-drain through `defer` (see
+        // [`Pipeline::defer_next`]); `wake` is the same port for this first
+        // kick, so the staged run and everything it enqueues behind it all
+        // land on the caller's background execution.
+        let wake = Arc::clone(&defer);
+        let Some(pipeline) = Self::pipeline(ctx, Some(defer)) else {
+            // Missing ports mean the row cannot be driven now; the
+            // scheduled drain will find it if the composition ever gains
+            // them. Nothing to report and nothing to do.
+            return;
+        };
+        wake.wait_until(Box::pin(async move {
+            let _ = pipeline.drain(1).await;
+        }));
+    }
+
+    /// Builds the durable stage runner from whatever ports a context
+    /// resolved, with `defer` overriding the context's own for the
+    /// self-re-drain a finished stage hands back (see
+    /// [`Pipeline::defer_next`]). `None` means the context is missing a
+    /// port the pipeline cannot run without — the caller decides whether
+    /// that is an empty scheduled tick or a kick with nothing to drive.
+    ///
+    /// Shared by [`Module::scheduled`] and [`Escalation::kick`] so the two
+    /// entry points cannot drift: a change to how the pipeline is
+    /// configured lands in both.
+    fn pipeline(ctx: &ModuleContext, defer: Option<Arc<dyn Defer>>) -> Option<Pipeline> {
+        let db = ctx.ports.db.clone()?;
+        let model = ctx.ports.text_model.clone()?;
+        let tracker = ctx.ports.tracker.clone()?;
+        let clock = ctx
+            .ports
+            .clock
+            .clone()
+            .unwrap_or_else(|| Arc::new(SystemClock));
+        let idgen = ctx
+            .ports
+            .id_gen
+            .clone()
+            .unwrap_or_else(|| Arc::new(UlidIdGen));
+        let cfg = ModuleConfig::new(Self::NAME, &*ctx.ports.config);
+        let policy = RetryPolicy::new()
+            .base(Duration::from_secs(u64::from(
+                cfg.get_u32("RETRY_BASE_SECS", RetryPolicy::DEFAULT_BASE_SECS),
+            )))
+            .cap(Duration::from_secs(u64::from(
+                cfg.get_u32("RETRY_CAP_SECS", RetryPolicy::DEFAULT_CAP_SECS),
+            )))
+            .max_attempts(cfg.get_u32("RETRY_MAX_ATTEMPTS", RetryPolicy::DEFAULT_MAX_ATTEMPTS));
+
+        Some(
+            Pipeline::new(
+                db,
+                model,
+                tracker,
+                ctx.ports.mailer.clone(),
+                ctx.ports.config.clone(),
+                clock,
+                idgen,
+                defer,
+            )
+            .with_retry_policy(policy)
+            // Every stage that changes a ticket's life — filed,
+            // dead-lettered, parked for a human — also publishes the
+            // matching `escalation.*` event, in the stage's own atomic
+            // batch (see [`Pipeline`]). The publish is fail-safe: a
+            // venture that mounts this module without `Webhooks` has no
+            // webhook tables, and the fan-out is skipped rather than
+            // allowed to break every filing (see [`Pipeline::webhook_stmts`]).
+            // Shared by `scheduled` and `kick`, so both publish alike.
+            .with_webhooks(Webhooks::new()),
+        )
     }
 }
 

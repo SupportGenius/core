@@ -114,10 +114,19 @@ pub fn compose(
     // wrangler.toml; if that binding is missing from a deployment the
     // runtime logs once and leaves the port unmounted (fail-open), so the
     // binding is part of the deploy, not an option.
+    // The escalation module requires `TextModel` and `Tracker`, and no
+    // adapter for either is in this venture's graph yet, so the
+    // composition's unconfigured ports stand in: they answer
+    // `NotConfigured`, and a request that needs a real one fails loudly
+    // (`POST /v1/support/messages` answers `503 text-model-not-configured`)
+    // rather than the whole harness refusing to build. Replace them when a
+    // model/tracker adapter is wired.
     let mut runtime = Cloudflare::new()
         .db("DB")
         .mailer_arc(mailer)
         .rate_limiter("RATE_LIMITER")
+        .text_model(supportgenius_composition::UnconfiguredTextModel)
+        .tracker(supportgenius_composition::UnconfiguredTracker)
         // The R2 bucket the chunked-upload routes store parts in
         // (issue #30). Mounted unconditionally like the rate limiter —
         // it is a binding in wrangler.toml, not an option: without it
@@ -389,10 +398,14 @@ async fn report_text_model(
         .map(|rebuilt| rebuilt.with_status(status).with_headers(headers))
 }
 
-/// The other half of wrangler.toml's `[triggers]` cron (`23 4 * * *`
-/// daily): fans the event out to every module's `scheduled` hook. For the
-/// waitlist module that purges pending entries past the retention window
-/// and prunes expired mail-cooldown claims.
+/// The other half of wrangler.toml's `[triggers]` crons: fans each event
+/// out to every module's `scheduled` hook, passing that trigger's
+/// expression. The five-minute tick drains the escalation outbox (whatever
+/// a handoff's best-effort kick left staged); the daily tick purges stale
+/// waitlist entries and prunes expired mail-cooldown claims. Both
+/// expressions reach every module, so a module that must not run on one of
+/// them is wrapped in `OnCron` (the waitlist purge is — see
+/// `crates/composition`).
 #[event(scheduled)]
 pub async fn scheduled(event: worker::ScheduledEvent, env: Env, ctx: worker::ScheduleContext) {
     let (harness, runtime, _) = instance(&env);

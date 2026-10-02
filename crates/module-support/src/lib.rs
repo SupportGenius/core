@@ -82,6 +82,7 @@ pub mod chunk;
 mod connectors;
 mod extract;
 mod handlers;
+mod handoff;
 mod messages;
 pub mod store;
 mod uploads;
@@ -89,6 +90,7 @@ mod widget;
 
 pub use answer::DEFAULT_ANSWER_THRESHOLD;
 pub use chunk::tokenize;
+pub use handoff::HandoffSink;
 // The tokenizer and BM25 ranker now live in the shared `lexical` crate
 // (escalation's duplicate scoring tokenizes with the same rules); this
 // re-export keeps `module_support::bm25` — and `crate::bm25` inside the
@@ -206,29 +208,51 @@ const MIGRATION_WIDGET_SETTINGS: SqlMigration = SqlMigration::new(
 /// [`Ports`](cratefield_core::Ports) at route-build time, so one instance
 /// serves a venture with a model and one without.
 ///
-/// The one builder argument is [`Support::visitor_rate_limiter`]: the
-/// widget's per-visitor and per-IP buckets want a limiter *separate* from
-/// the port a runtime fills for the whole process (on Workers, a second
-/// Rate Limiting binding), so one anonymous browser's ceiling is not the
-/// tenant's own budget. `None` — the default — falls back to the shared
-/// `RateLimiter` port, and to no visitor limiting where that is absent
-/// too.
+/// Two pieces of builder state, both optional:
+///
+/// - The [`HandoffSink`]: a handoff turn appends the sink's statements to
+///   its own atomic batch and kicks it to run. `Support::new()` carries no
+///   sink, so the module composes exactly as it did before one existed
+///   (see [`handoff`](self) for why the seam is a trait and not a
+///   dependency on `module-escalation`).
+/// - [`Support::visitor_rate_limiter`]: the widget's per-visitor and
+///   per-IP buckets want a limiter *separate* from the port a runtime
+///   fills for the whole process (on Workers, a second Rate Limiting
+///   binding), so one anonymous browser's ceiling is not the tenant's own
+///   budget. `None` — the default — falls back to the shared
+///   `RateLimiter` port, and to no visitor limiting where that is absent
+///   too.
 #[derive(Default)]
 pub struct Support {
+    /// `None` is the unwired module: a handoff still marks
+    /// `needs_escalation` and nothing files a ticket.
+    handoff: Option<Arc<dyn HandoffSink>>,
     visitor_rate_limiter: Option<Arc<dyn cratefield_core::RateLimiter>>,
 }
 
 impl Support {
-    /// A `Support` module with defaults. Whether `POST /messages` can
-    /// answer depends on what the runtime provides: with no `TextModel`
-    /// port it answers `503 text-model-not-configured` and every other
-    /// route still works.
+    /// A `Support` module with defaults and no handoff sink. Whether
+    /// `POST /messages` can answer depends on what the runtime provides:
+    /// with no `TextModel` port it answers `503 text-model-not-configured`
+    /// and every other route still works.
+    #[must_use]
     pub fn new() -> Self {
         Self {
+            handoff: None,
             visitor_rate_limiter: None,
         }
     }
 
+    /// A `Support` that hands an escalating turn to `handoff`: the sink's
+    /// statements join the turn's atomic write, and it is kicked once that
+    /// write commits. This is the one thing a builder needs to set by
+    /// hand, because the sink is the module's own seam and not a core
+    /// port.
+    #[must_use]
+    pub fn with_handoff(mut self, handoff: Arc<dyn HandoffSink>) -> Self {
+        self.handoff = Some(handoff);
+        self
+    }
     /// Gives the widget routes their own limiter, for the per-visitor and
     /// per-IP buckets (`support-widget:{tenant}:v:{vid}` and
     /// `…:ip:{ip}`). On Workers this is a second Rate Limiting binding
@@ -279,6 +303,16 @@ impl Module for Support {
     /// deployment without object storage still gets the whole retrieval
     /// core through the inline `POST /sources` form.
     ///
+    /// `Tracker` and `Mailer` are here for the handoff sink, not for a
+    /// route: they are the ports the escalation pipeline reads when a
+    /// handoff kicks it, and support's [`ModuleContext`] is a filtered
+    /// view, so a port it does not declare is `None` in the sink's
+    /// pipeline. `Tracker` is what files the ticket; `Mailer` is what
+    /// sends the notify stage's message — dropping either would make a
+    /// kicked run behave differently from the scheduled one. The
+    /// escalation module's own `requires()` is where they are load-bearing;
+    /// a deployment with no handoff sink never touches them.
+    ///
     /// Optional, not required, on purpose: retrieval and ingest — the
     /// parts that make a workspace useful — work without a model, and a
     /// venture that never wires one should still boot (the escalation
@@ -289,6 +323,8 @@ impl Module for Support {
             Port::HttpClient,
             Port::RateLimiter,
             Port::TextModel,
+            Port::Tracker,
+            Port::Mailer,
             Port::Captcha,
             Port::Blob,
             Port::Defer,
@@ -452,7 +488,12 @@ impl Module for Support {
         // The widget's own limiter, as given to the builder (`None`
         // falls back to the shared port inside the widget routes).
         let visitor_rate_limiter = self.visitor_rate_limiter.clone();
-        handlers::router(Arc::new(ctx), text_model, visitor_rate_limiter)
+        handlers::router(
+            Arc::new(ctx),
+            text_model,
+            self.handoff.clone(),
+            visitor_rate_limiter,
+        )
     }
 
     /// The re-index drain: every chunk whose `tokenizer_version` stamp
