@@ -78,7 +78,6 @@
 //! standard five-field cron expressions.
 
 mod answer;
-pub mod bm25;
 pub mod chunk;
 mod connectors;
 mod extract;
@@ -87,10 +86,16 @@ mod handoff;
 mod messages;
 pub mod store;
 mod uploads;
+mod widget;
 
 pub use answer::DEFAULT_ANSWER_THRESHOLD;
 pub use chunk::tokenize;
 pub use handoff::HandoffSink;
+// The tokenizer and BM25 ranker now live in the shared `lexical` crate
+// (escalation's duplicate scoring tokenizes with the same rules); this
+// re-export keeps `module_support::bm25` — and `crate::bm25` inside the
+// module — exactly where callers already expect it.
+pub use lexical::bm25;
 pub use store::reindex_stale_chunks;
 
 use std::sync::Arc;
@@ -178,31 +183,51 @@ const MIGRATION_SEARCH_STATS: SqlMigration = SqlMigration::new(
     include_str!("../migrations/sqlite/0007_search_stats.sql"),
 );
 
+/// The web widget's per-tenant origin allowlist (`widget_origins`, JSON
+/// TEXT, null = widget refused).
+const MIGRATION_WIDGET_SETTINGS: SqlMigration = SqlMigration::new(
+    "0008",
+    "widget_settings",
+    include_str!("../migrations/sqlite/0008_widget_settings.sql"),
+);
+
 /// The support module: tenant provisioning behind the harness admin
 /// token, API-key-authenticated source ingest, BM25 search and grounded
-/// answers, and the cron-driven connectors that keep a workspace's index
+/// answers, the cron-driven connectors that keep a workspace's index
 /// synced from a sitemap, a URL prefix or a GitHub repository
-/// (`POST /connectors`, issue #29).
+/// (`POST /connectors`, issue #29), and the web widget's publishable-key
+/// routes (`crate::widget`).
 ///
-/// Knob-free. Everything tunable — the revoked-kid list, the admin token —
-/// is deployment configuration read through the `Config` port, and the
-/// answer threshold is per-tenant data
+/// Nearly knob-free. Everything tunable — the revoked-kid list, the admin
+/// token, the widget's captcha threshold and site key — is deployment
+/// configuration read through the `Config` port, and the answer threshold
+/// and the widget origin allowlist are per-tenant data
 /// (`PUT /admin/tenants/{tenant_id}/settings`), so a builder setter for
 /// either would be a second place the same setting lived. The text model
 /// is likewise not passed here: it arrives through the runtime's
 /// [`Ports`](cratefield_core::Ports) at route-build time, so one instance
 /// serves a venture with a model and one without.
 ///
-/// The one piece of state is the optional [`HandoffSink`]: a handoff turn
-/// appends the sink's statements to its own atomic batch and kicks it to
-/// run. `Support::new()` carries no sink, so the module composes exactly
-/// as it did before one existed (see [`handoff`](self) for why the seam is
-/// a trait and not a dependency on `module-escalation`).
+/// Two pieces of builder state, both optional:
+///
+/// - The [`HandoffSink`]: a handoff turn appends the sink's statements to
+///   its own atomic batch and kicks it to run. `Support::new()` carries no
+///   sink, so the module composes exactly as it did before one existed
+///   (see [`handoff`](self) for why the seam is a trait and not a
+///   dependency on `module-escalation`).
+/// - [`Support::visitor_rate_limiter`]: the widget's per-visitor and
+///   per-IP buckets want a limiter *separate* from the port a runtime
+///   fills for the whole process (on Workers, a second Rate Limiting
+///   binding), so one anonymous browser's ceiling is not the tenant's own
+///   budget. `None` — the default — falls back to the shared
+///   `RateLimiter` port, and to no visitor limiting where that is absent
+///   too.
 #[derive(Default)]
 pub struct Support {
     /// `None` is the unwired module: a handoff still marks
     /// `needs_escalation` and nothing files a ticket.
     handoff: Option<Arc<dyn HandoffSink>>,
+    visitor_rate_limiter: Option<Arc<dyn cratefield_core::RateLimiter>>,
 }
 
 impl Support {
@@ -212,7 +237,10 @@ impl Support {
     /// and every other route still works.
     #[must_use]
     pub fn new() -> Self {
-        Self { handoff: None }
+        Self {
+            handoff: None,
+            visitor_rate_limiter: None,
+        }
     }
 
     /// A `Support` that hands an escalating turn to `handoff`: the sink's
@@ -223,6 +251,19 @@ impl Support {
     #[must_use]
     pub fn with_handoff(mut self, handoff: Arc<dyn HandoffSink>) -> Self {
         self.handoff = Some(handoff);
+        self
+    }
+    /// Gives the widget routes their own limiter, for the per-visitor and
+    /// per-IP buckets (`support-widget:{tenant}:v:{vid}` and
+    /// `…:ip:{ip}`). On Workers this is a second Rate Limiting binding
+    /// (`VISITOR_RATE_LIMITER`); where it is not wired, the widget falls
+    /// back to the shared `RateLimiter` port.
+    #[must_use]
+    pub fn visitor_rate_limiter(
+        mut self,
+        limiter: Option<Arc<dyn cratefield_core::RateLimiter>>,
+    ) -> Self {
+        self.visitor_rate_limiter = limiter;
         self
     }
 }
@@ -242,12 +283,15 @@ impl Module for Support {
 
     /// `HttpClient` for the `{"url"}` ingest form, for `POST /connectors`
     /// and for every fetch job the connectors enqueue; `RateLimiter` for
-    /// the per-tenant budget on ingest, search and messages; and
-    /// `TextModel` for `POST /messages`' grounded answers. All three
-    /// degrade honestly when absent: URL ingest and connector creation
-    /// answer `503 not-ready` (and the connector re-sync is a silent
-    /// no-op), the limiter is skipped, and messages answer `503
-    /// text-model-not-configured`.
+    /// the per-tenant budget on ingest, search and messages; `TextModel`
+    /// for `POST /messages`' grounded answers; and `Captcha` for the
+    /// widget's abuse gate (`crate::widget`). All four degrade honestly
+    /// when absent: URL ingest and connector creation answer `503
+    /// not-ready` (and the connector re-sync is a silent no-op), the
+    /// limiter is skipped, messages answer `503
+    /// text-model-not-configured`, and the widget captcha gate follows the
+    /// harness `verify_human_form` posture — demanded with no port in
+    /// production, stood down below it.
     ///
     /// `Blob` and `Defer` serve the chunked-upload routes. `Blob` is
     /// where upload parts land (`503 not-ready` on the upload routes when
@@ -281,6 +325,7 @@ impl Module for Support {
             Port::TextModel,
             Port::Tracker,
             Port::Mailer,
+            Port::Captcha,
             Port::Blob,
             Port::Defer,
         ]
@@ -363,7 +408,7 @@ impl Module for Support {
     }
 
     fn migrations(&self) -> Migrations {
-        const MIGRATIONS: [SqlMigration; 7] = [
+        const MIGRATIONS: [SqlMigration; 8] = [
             MIGRATION_INIT,
             MIGRATION_CONVERSATIONS,
             MIGRATION_SOURCE_MANAGEMENT,
@@ -371,6 +416,7 @@ impl Module for Support {
             MIGRATION_UPLOADS,
             MIGRATION_CONNECTORS,
             MIGRATION_SEARCH_STATS,
+            MIGRATION_WIDGET_SETTINGS,
         ];
         // Refuses a gap, a duplicate or an out-of-order id at compile
         // time.
@@ -439,7 +485,15 @@ impl Module for Support {
         // The model `POST /messages` asks: whatever the runtime resolved,
         // `None` — and the degraded 503 — where it resolved nothing.
         let text_model = ctx.ports.text_model.clone();
-        handlers::router(Arc::new(ctx), text_model, self.handoff.clone())
+        // The widget's own limiter, as given to the builder (`None`
+        // falls back to the shared port inside the widget routes).
+        let visitor_rate_limiter = self.visitor_rate_limiter.clone();
+        handlers::router(
+            Arc::new(ctx),
+            text_model,
+            self.handoff.clone(),
+            visitor_rate_limiter,
+        )
     }
 
     /// The re-index drain: every chunk whose `tokenizer_version` stamp
@@ -604,7 +658,8 @@ const PERSONAL_DATA: &[PersonalDataSet] = &[
     ),
     PersonalDataSet::none(
         "sg_tenant_settings",
-        "The workspace's answer threshold and when it was last set.",
+        "The workspace's answer threshold, the origins its web widget may be embedded \
+             on, and when either was last set.",
     ),
     PersonalDataSet::unreachable(
         "sg_uploads",

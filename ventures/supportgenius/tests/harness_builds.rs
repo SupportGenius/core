@@ -12,7 +12,9 @@ use supportgenius::compose;
 /// A keyless Resend adapter as the test mailer: the composition only
 /// needs a mailer port to build, and the tests never send. Keyless means
 /// it reports `NotConfigured` rather than pretending, should a send ever
-/// happen.
+/// happen. The trailing `None`s of the `compose` calls are the captcha
+/// and the text model — like every port here, mounted only when a secret
+/// asks for one.
 fn keyless_mailer() -> Arc<dyn Mailer> {
     Arc::new(Resend::new(
         Arc::new(FetchClient),
@@ -25,7 +27,7 @@ fn keyless_mailer() -> Arc<dyn Mailer> {
 
 #[test]
 fn harness_builds() {
-    let built = compose(keyless_mailer(), None);
+    let built = compose(keyless_mailer(), None, None, None);
     // The `ConfigError` lists every problem, so `Debug` on `Err` is the
     // useful output when this goes red. (`Cloudflare` is not `Debug`, so
     // the whole `Ok` half cannot be formatted.)
@@ -36,7 +38,7 @@ fn harness_builds() {
 
 #[test]
 fn harness_reports_every_module() {
-    let (harness, _runtime) = compose(keyless_mailer(), None).expect("harness builds");
+    let (harness, _runtime) = compose(keyless_mailer(), None, None, None).expect("harness builds");
     let names: Vec<&str> = harness
         .modules()
         .iter()

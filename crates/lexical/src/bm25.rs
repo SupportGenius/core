@@ -34,7 +34,7 @@ pub struct Posting {
     pub chunk_id: String,
     /// The indexed term. Compared exactly against the query terms, so
     /// both sides must have gone through the same
-    /// [`tokenize`](crate::chunk::tokenize) — the shared tokenizer is what
+    /// [`tokenize`](crate::tokenize) — the shared tokenizer is what
     /// guarantees that.
     pub term: String,
     /// How often the term occurs in the chunk.
@@ -71,7 +71,7 @@ pub struct Scored {
 /// not counted from `postings`. That is the contract that makes a
 /// bounded fetch safe: the caller **may** truncate `postings` per term
 /// (the query path fetches each term's top
-/// [`MAX_POSTINGS_PER_TERM`](crate::store::MAX_POSTINGS_PER_TERM) chunks
+/// `module_support::store::MAX_POSTINGS_PER_TERM` chunks
 /// by tf), because the idf can no longer be deflated by missing rows.
 /// What truncation costs is a contribution, not a wrong weight: a chunk
 /// outside a term's top rows is scored without that term, which is the

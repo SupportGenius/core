@@ -27,6 +27,14 @@
 //! curl -fsS http://127.0.0.1:8080/__health && curl -fsS http://127.0.0.1:8080/__ready
 //! ```
 //!
+//! One more variable turns on grounded answers (`POST /v1/support/messages`,
+//! issue #22): `ANTHROPIC_API_KEY` mounts the `TextModel` port — one
+//! Anthropic adapter per tier, ids overridable with
+//! `SUPPORTGENIUS_MODEL_FAST` / `SUPPORTGENIUS_MODEL_STRONG`. Without it the
+//! route answers `503 text-model-not-configured` and everything else works
+//! (the `dev-fakes` build mounts a labelled stub instead — see
+//! `dev_fakes.rs`).
+//!
 //! `CRONS` is comma-separated five-field cron expressions (UTC), the
 //! environment counterpart of a Worker's `[triggers] crons`. Without it,
 //! connector fetches still run when a connector is created (through
@@ -47,12 +55,13 @@ mod dev_fakes;
 
 use std::sync::Arc;
 
+use cratefield_adapter_anthropic::Anthropic;
 use cratefield_adapter_resend::Resend;
 use cratefield_adapter_sqlite::SqliteDatabase;
 use cratefield_adapter_turnstile::Turnstile;
 use cratefield_core::{
-    Captcha, Clock, Config, Database, Harness, HttpClient, KeyValue, Mailer, RateLimiter, Venture,
-    VentureEnv,
+    Captcha, Clock, Config, Database, Harness, HttpClient, KeyValue, Mailer, RateLimiter,
+    RoutingTextModel, TextModel, Venture, VentureEnv,
 };
 use cratefield_runtime_native::{
     EnvConfig, Native, OutboundOptions, ReqwestClient, TokioClock, install_tracing, serve,
@@ -61,6 +70,15 @@ use supportgenius_composition as composition;
 
 #[cfg(feature = "postgres")]
 use cratefield_adapter_postgres::Postgres;
+
+/// The model id the fast tier calls when `SUPPORTGENIUS_MODEL_FAST` is
+/// unset, and the strong tier's equivalent — the same ids, secrets and
+/// variables the Worker uses (`ventures/supportgenius` `src/lib.rs`).
+/// Written twice on purpose: the binary does not depend on the venture
+/// crate (and the venture crate is wasm-only), so the two constant pairs
+/// are pinned to each other by this comment and the README's tier table.
+const DEFAULT_MODEL_FAST: &str = "claude-haiku-4-5";
+const DEFAULT_MODEL_STRONG: &str = "claude-sonnet-5";
 
 /// The database this process booted with — kept concretely typed so
 /// migrations can run through the adapter's own runner after the
@@ -207,21 +225,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         runtime = runtime.captcha_arc(captcha);
     }
 
-    // TextModel and Tracker: the composition's unconfigured ports. The
-    // escalation module *requires* both, so the harness will not build
-    // without them, and no real adapter is in this binary's graph yet.
-    // They answer `NotConfigured`, so `POST /v1/support/messages` degrades
-    // exactly as production would with the port unset (`503
+    // The TextModel port (issue #22), wired like the Mailer one above:
+    // `build_text_model` carries the policy — a real key mounts the
+    // adapters, a dev-fakes build falls back to its labelled stub. With
+    // neither, the composition's `UnconfiguredTextModel` stands in: the
+    // escalation module *requires* the port, so the harness would not
+    // build without one, and it answers `NotConfigured`, so
+    // `POST /v1/support/messages` degrades exactly as with no port (`503
     // text-model-not-configured`) instead of the boot failing outright.
     //
-    // Deliberately not `cratefield-testing`'s fake: a shipping binary must
-    // not depend on the testing crate, and a fake that answered *something*
-    // would hide that no provider is wired. A developer who wants a working
-    // messages route locally should put a real provider key in the
-    // environment, not a fake answer in the binary.
-    runtime = runtime
-        .text_model(composition::UnconfiguredTextModel)
-        .tracker_arc(Arc::new(composition::UnconfiguredTracker));
+    // Tracker: the composition's unconfigured port, for the same reason —
+    // escalation requires it and no tracker adapter is wired into this
+    // binary yet. Deliberately not `cratefield-testing`'s fake: a shipping
+    // binary must not depend on the testing crate, and a fake that
+    // answered *something* would hide that no provider is wired.
+    runtime = match build_text_model(config, dev_fakes, &http, &clock) {
+        Some(text_model) => runtime.text_model_arc(text_model),
+        None => runtime.text_model(composition::UnconfiguredTextModel),
+    };
+    runtime = runtime.tracker_arc(Arc::new(composition::UnconfiguredTracker));
 
     // Single tenant, seeded at boot from env: the compiled identity is
     // the default, and these variables exist for operators who front the
@@ -419,6 +441,87 @@ fn real_mailer(
             .unwrap_or_else(|| composition::MAIL_FROM.to_owned()),
         config.get("MAIL_REPLY_TO"),
     ))
+}
+
+/// The `TextModel` port (issue #22), wired like the mailer above: an
+/// `ANTHROPIC_API_KEY` mounts one Anthropic adapter per tier behind a
+/// `RoutingTextModel` — the same adapters and the same variable names as
+/// the Worker. **A real key wins over the dev stub**: the stub exists so
+/// a developer can exercise the grounded-answer flow without
+/// credentials, and a credential in the environment is the stronger
+/// claim on the port — answering from the real provider beats answering
+/// from a fake, and the build that carries the key should not have to
+/// unset `SUPPORTGENIUS_DEV_FAKES` to get honest answers.
+///
+/// `None` — no port — is the honest degradation the support module
+/// documents: `POST /v1/support/messages` answers
+/// `503 text-model-not-configured` while every other route works.
+fn build_text_model(
+    config: EnvConfig,
+    dev_fakes: bool,
+    http: &Arc<dyn HttpClient>,
+    clock: &Arc<dyn Clock>,
+) -> Option<Arc<dyn TextModel>> {
+    let api_key = config
+        .get("ANTHROPIC_API_KEY")
+        .map(|key| key.trim().to_owned())
+        .filter(|key| !key.is_empty());
+    match api_key {
+        Some(key) => {
+            let tier = |name: &str, default: &str| {
+                config
+                    .get(name)
+                    .map(|model| model.trim().to_owned())
+                    .filter(|model| !model.is_empty())
+                    .unwrap_or_else(|| default.to_owned())
+            };
+            let fast = tier("SUPPORTGENIUS_MODEL_FAST", DEFAULT_MODEL_FAST);
+            let strong = tier("SUPPORTGENIUS_MODEL_STRONG", DEFAULT_MODEL_STRONG);
+            tracing::info!(%fast, %strong, "anthropic text model configured on both tiers");
+            Some(Arc::new(
+                RoutingTextModel::new()
+                    .fast(Arc::new(Anthropic::new(
+                        Arc::clone(http),
+                        Arc::clone(clock),
+                        Some(key.clone()),
+                        fast,
+                    )))
+                    .strong(Arc::new(Anthropic::new(
+                        Arc::clone(http),
+                        Arc::clone(clock),
+                        Some(key),
+                        strong,
+                    ))),
+            ))
+        }
+        // No key, dev fakes asked for: the stub answers, loudly labelled.
+        None if dev_fakes => {
+            #[cfg(feature = "dev-fakes")]
+            {
+                tracing::warn!(
+                    "SUPPORTGENIUS_DEV_FAKES: StubTextModel active — answers are \
+                     canned and cite whatever was retrieved; never serve \
+                     production traffic from this process"
+                );
+                Some(Arc::new(dev_fakes::StubTextModel))
+            }
+            #[cfg(not(feature = "dev-fakes"))]
+            {
+                tracing::warn!(
+                    "SUPPORTGENIUS_DEV_FAKES set, but this build was compiled \
+                     without the `dev-fakes` feature: no text model will be mounted"
+                );
+                None
+            }
+        }
+        None => {
+            tracing::warn!(
+                "ANTHROPIC_API_KEY unset: TextModel port not mounted, \
+                 POST /v1/support/messages will answer 503 text-model-not-configured"
+            );
+            None
+        }
+    }
 }
 
 /// Applies every module's migrations on boot, idempotently, through the

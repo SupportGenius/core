@@ -40,4 +40,37 @@ one. Until core "0.6" publishes to crates.io (Cratefield/harness#558),
 the whole `cratefield-*` set is pinned to that one git rev — see the
 comment in `Cargo.toml`.
 
+## Destinations
+
+An escalation is filed into one tracker per tenant (`sg_destinations`).
+Which trackers a build *can* file into is a compile-time fact, not config:
+the adapters are cargo features (`tracker-github`, `tracker-webhook`, both
+on by default), and `module-escalation`'s `check_destination` refuses any
+other kind **by name** — the per-tenant destination admin route (#23) maps
+that to `422`, so a tenant pointed at a tracker this build lacks is told
+which kind, rather than failing at file-time.
+
+| Destination | `kind` | Status |
+| --- | --- | --- |
+| GitHub Issues | `github` | works today |
+| Webhook (signed HTTPS `POST`) | `webhook` | works today |
+| Jira | `jira` | planned — upstream adapter not published |
+| Linear | `linear` | planned — upstream adapter not published |
+| Zendesk | `zendesk` | planned — upstream adapter not published |
+| Intercom | `intercom` | planned — upstream adapter not published |
+| Salesforce | `salesforce` | planned — upstream adapter not published |
+| `HubSpot` | `hubspot` | planned — upstream adapter not published |
+| Slack, as a tracker | `slack` | planned — upstream adapter not published |
+| Freshdesk | — | planned — no `Destination` variant in core yet |
+
+Slack and on-call notifications need no tracker of their own: the pipeline
+publishes `escalation.filed`, `escalation.dead_lettered` and
+`escalation.needs_human` through `cratefield-module-webhooks` (per-endpoint
+secret, retries, dead letters, replay), and a Slack incoming webhook is just
+an endpoint URL — the `webhook` row above. Each delivery is signed
+`Cratefield-Signature: t=<unix>,v1=<hex HMAC-SHA256 of "{t}.{body}">`, with
+`Cratefield-Event-Id` and `Cratefield-Event-Type` headers. The webhook
+*tracker* signs with one venture-wide secret (`ESCALATION_WEBHOOK_SECRET`),
+since it signs the payload rather than authenticating to a tracker.
+
 A [Factory Zero](https://factory0.ventures) venture.

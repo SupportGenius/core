@@ -23,7 +23,9 @@ cargo build --release --target x86_64-unknown-linux-musl -p supportgenius-bin --
 ```
 
 Smoke-test the result end to end (boots it on a scratch SQLite file, probes
-health, joins the waitlist):
+health, joins the waitlist, and exercises the support module's
+tenant/source/message chain — `outcome: "answered"` on a dev-fakes build,
+`503 text-model-not-configured` on the plain one):
 
 ```sh
 scripts/smoke.sh target/x86_64-unknown-linux-musl/release/supportgenius
@@ -40,18 +42,26 @@ scripts/smoke.sh target/x86_64-unknown-linux-musl/release/supportgenius
 | `BLOB_DIR` | unset | When set, a directory store under this path backs the `Blob` port for the chunked-upload routes (issue #30): documents up to 4 MiB arrive in 48 KiB parts, extraction runs right after `complete`, and — **only when `CRONS` is set** — the daily sweep collects uploads abandoned `open` past their 24-hour window. Unset, those routes answer `503 not-ready` — reported, not faked; every other route is unaffected. |
 | `CRONS` | unset → no scheduled work | Comma-separated cron expressions (UTC), the native counterpart of wrangler's `[triggers]`; each fires every module's scheduled hook. With none set, no scheduled work runs: the upload extraction backstop and abandoned-upload collection (issue #30), the waitlist retention purge, and the escalation retry sweeps are all lost — the inline drains after each request still run, so only the backstops go away. Example: `CRONS="23 4 * * *"`. |
 | `RESEND_API_KEY` | unset | Production mailer (Resend). Unset, Resend answers `NotConfigured` and sends nothing — reported, never faked. |
+| `ANTHROPIC_API_KEY` | unset | Production text model (issue #22): one Anthropic adapter per tier behind the harness `RoutingTextModel`. A blank value — empty or whitespace-only — counts as unset: the `TextModel` port is not mounted and `POST /v1/support/messages` answers `503 text-model-not-configured` while every other route works. On a dev-fakes build no key mounts `StubTextModel` instead, and a real key there wins over the stub. |
+| `SUPPORTGENIUS_MODEL_FAST` | `claude-haiku-4-5` | Model id the fast tier calls (the support answer). Same variable name the Worker uses. |
+| `SUPPORTGENIUS_MODEL_STRONG` | `claude-sonnet-5` | Model id the strong tier calls (the escalation judge, once that module is composed). Same variable name the Worker uses. |
 | `MAIL_FROM` | compiled venture default | From address for outgoing mail. |
 | `MAIL_REPLY_TO` | unset | Reply-To for outgoing mail. |
 | `SUPPORTGENIUS_DOMAIN` | compiled venture default | Overrides the venture's domain. |
 | `SUPPORTGENIUS_PUBLIC_URL` | compiled venture default | Overrides the venture's public URL. |
 | `SUPPORTGENIUS_CORS_ORIGINS` | compiled venture default | Comma-separated CORS allowlist. |
-| `SUPPORTGENIUS_DEV_FAKES` | unset | Set at boot, selects the dev fakes (stub mailer/captcha). Requires the `dev-fakes` feature; a non-`dev-fakes` build warns and wires the real adapters. Never serve production traffic from a dev-fakes process. |
+| `SUPPORTGENIUS_DEV_FAKES` | unset | Set at boot, selects the dev fakes (stub mailer/captcha/text model). Requires the `dev-fakes` feature; a non-`dev-fakes` build warns and wires the real adapters. A real `ANTHROPIC_API_KEY` beats `StubTextModel` — the stub answers only when no key is set. Never serve production traffic from a dev-fakes process. |
 | `FZ_APPLY_MIGRATIONS` | migrations run on boot | Set to `0`/`false`/`no`/`off` to skip the idempotent boot-time migration run (e.g. when your deploy pipeline applies them). |
 | `CRONS` | the composition's schedule | Comma-separated five-field cron expressions (UTC), the native counterpart of the Worker's `[triggers] crons`. **Unset runs the compiled default** — `*/5 * * * *` (escalation outbox drain) and `23 4 * * *` (waitlist retention purge) — which the binary spawns itself from `crates/composition`. Set it to override the whole schedule (an operator's list replaces the default, it does not add to it); each expression is fanned out to every module's `scheduled`, so a module whose work must not run on a given tick is gated inside the composition, not here. An override that omits a gated expression (today `23 4 * * *`, the daily waitlist purge) refuses to boot rather than silently never running that work. |
 
 The Turnstile captcha port mounts only when a Turnstile secret is present in
 the environment (read by the adapter itself); without one, no port and the
-module decides per request.
+module decides per request. The `TextModel` port follows the same rule with
+`ANTHROPIC_API_KEY` (see the table above): one adapter per tier mounts only
+when a non-blank key is present; with no key a dev-fakes build mounts
+`StubTextModel` instead and a plain build mounts nothing. The model ids —
+and the caveat that both tiers are one vendor — are documented in the
+[Worker README](../../ventures/supportgenius/README.md#model-tiers-and-judging).
 
 ## Docker
 

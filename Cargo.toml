@@ -39,8 +39,17 @@ cratefield-runtime-cloudflare = { git = "https://github.com/Cratefield/harness",
 cratefield-module-waitlist = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 cratefield-adapter-resend = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 cratefield-adapter-turnstile = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
-# The `TextModel` port over the Anthropic Messages API: the `evals`
-# runner's real-model option (`--model anthropic[:ID]`), native-only.
+# The two `Tracker` adapters `module-escalation` files into, and the
+# outbound-webhook module it publishes its escalation events through.
+# Feature-gated in `module-escalation` (`tracker-github`/`tracker-webhook`,
+# both on by default); the same pin as the rest of the set.
+cratefield-adapter-github-issues = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
+cratefield-adapter-webhook-tracker = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
+cratefield-module-webhooks = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
+# The Anthropic `TextModel` adapter (issue #22): wasm-safe, because it
+# runs over the `HttpClient` port rather than reqwest — the same adapter
+# serves the Worker and the static binary, one instance per tier. It is
+# also the `evals` runner's real-model option (`--model anthropic[:ID]`).
 cratefield-adapter-anthropic = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 cratefield-testing = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 cratefield-cli = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
@@ -67,6 +76,12 @@ http = "1.5.0"
 pollster = { version = "0.4", features = ["macro"] }
 # Pure Rust and wasm32-safe: content-addressed chunk ids in module-support.
 sha2 = "0.11"
+# The delivery signature `module-webhooks` and
+# `cratefield-adapter-webhook-tracker` sign with (HMAC-SHA256 over
+# `{unix}.{body}`). On the 0.13/digest-0.11 stack beside `sha2` above, so
+# no second digest stack enters the graph; named here so the escalation
+# tests can recompute a signature independently of the code that made it.
+hmac = "0.13.0"
 # Feature set matched to what runtime-native itself uses, so the binary
 # enables exactly what it needs (`macros`, `rt-multi-thread`) on top.
 tokio = { version = "1.53", default-features = false }
