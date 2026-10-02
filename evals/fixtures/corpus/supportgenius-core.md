@@ -10,12 +10,6 @@ the `ventures/supportgenius` Worker — the SupportGenius waitlist API — and
 both sharing their module list through `crates/composition`.
 The rest of the list below is still scaffolding and an ordered backlog.
 
-`evals/` (issue #38) is the golden set that gates retrieval: 100 questions
-over a frozen MIT corpus, run in CI with the deterministic `fake` model. On
-this revision it scores recall@6 0.914 against a committed baseline; the
-wrong-answer rate of a real model at the default answer threshold (0.60) is
-not measured yet.
-
 The plan, in order, is the issue list. Two modules, not five:
 
 - `crates/module-support` — tenants, sources, chunked uploads (text and

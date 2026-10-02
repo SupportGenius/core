@@ -53,3 +53,7 @@ tracing = { workspace = true }
 serde_json = { workspace = true }
 # The `dev-fakes` stubs implement `async_trait` ports.
 async-trait = { workspace = true }
+
+[dev-dependencies]
+# The SSRF test (tests/ssrf.rs) awaits the HttpClient port.
+pollster = { workspace = true }
