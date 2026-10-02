@@ -536,6 +536,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cratefield-adapter-github-issues"
+version = "0.1.0"
+source = "git+https://github.com/Cratefield/harness?rev=b50c1d99b6f29e11a9fd5f116a8cd31275f735c6#b50c1d99b6f29e11a9fd5f116a8cd31275f735c6"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "cratefield-core",
+ "getrandom 0.4.3",
+ "http",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "cratefield-adapter-postgres"
 version = "0.1.5"
 source = "git+https://github.com/Cratefield/harness?rev=b50c1d99b6f29e11a9fd5f116a8cd31275f735c6#b50c1d99b6f29e11a9fd5f116a8cd31275f735c6"
@@ -588,6 +603,23 @@ dependencies = [
  "http",
  "serde",
  "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "cratefield-adapter-webhook-tracker"
+version = "0.1.0"
+source = "git+https://github.com/Cratefield/harness?rev=b50c1d99b6f29e11a9fd5f116a8cd31275f735c6#b50c1d99b6f29e11a9fd5f116a8cd31275f735c6"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "cratefield-core",
+ "getrandom 0.4.3",
+ "hmac 0.13.0",
+ "http",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
  "tracing",
 ]
 
@@ -737,6 +769,25 @@ dependencies = [
  "time",
  "tracing",
  "ulid",
+]
+
+[[package]]
+name = "cratefield-module-webhooks"
+version = "0.1.0"
+source = "git+https://github.com/Cratefield/harness?rev=b50c1d99b6f29e11a9fd5f116a8cd31275f735c6#b50c1d99b6f29e11a9fd5f116a8cd31275f735c6"
+dependencies = [
+ "axum",
+ "bytes",
+ "cratefield-core",
+ "getrandom 0.4.3",
+ "hmac 0.13.0",
+ "http",
+ "sea-query",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "time",
+ "tracing",
 ]
 
 [[package]]
@@ -2011,16 +2062,24 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "bytes",
+ "cratefield-adapter-github-issues",
  "cratefield-adapter-sqlite",
+ "cratefield-adapter-webhook-tracker",
  "cratefield-core",
+ "cratefield-module-webhooks",
  "cratefield-testing",
+ "hmac 0.13.0",
+ "http",
  "module-escalation",
  "pollster",
  "sea-query",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror",
  "time",
+ "tracing",
 ]
 
 [[package]]

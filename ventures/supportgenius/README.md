@@ -56,11 +56,11 @@ rather than silently dropping the confirmation mail.
 The planned escalation flow drafts with one model and judges with a
 second, selected by tier — `fast` and `strong`, the two tiers the
 harness's `RoutingTextModel` defines. `fast` drafts; `strong` judges.
-Neither tier is wired today, to any vendor: the `TextModel` and
-`Tracker` ports live only on the harness's main branch (no published
-`cratefield-core` release carries them, 0.5.0 included), and no
-`TextModel` adapter for any vendor — Anthropic's included — is
-published at all.
+Neither tier is wired today, to any vendor: both ports come from the
+pinned harness rev `b50c1d9` — the `Tracker` port and its GitHub and
+webhook adapters ship from that same rev (#25) — and no published
+`cratefield-core` release carries either (0.5.0 included). No `TextModel`
+adapter for any vendor — Anthropic's included — is published at all.
 
 The plan is to point both tiers at Anthropic once the wiring exists.
 One vendor on both tiers is not an independent judge: the judge would be
@@ -68,6 +68,46 @@ reviewing the work of the same vendor's model that drafted it. Until a
 second `TextModel` adapter exists to take one of the tiers, the
 independent-judge property is unmet, and this caveat stays in this
 README.
+
+## Live smoke test: filing into GitHub
+
+`module-escalation` files into GitHub Issues through
+`cratefield-adapter-github-issues`. Running this end to end needs a token, a
+tenant pointed at a scratch repository, and — **not yet present** — the
+venture mounting the module: nothing composes `Escalation` (or the
+`Webhooks` tables its `escalation.*` events need) into `SupportGenius` yet
+(#21), and nothing exposes the per-tenant destination admin route (#23).
+So the steps below are the contract the module already implements and tests
+crate-side, not commands that run against the deployed Worker today.
+
+1. **Token.** A GitHub PAT or fine-grained token that can create issues:
+   classic needs `repo` (private repos) or `public_repo` (public); a
+   fine-grained token needs *Issues: read and write* on the target
+   repository. The adapter holds no token — it is sent per call as
+   `Authorization: Bearer <token>` — so one adapter serves every tenant.
+2. **Credential.** The tenant's `sg_destinations.credential_ref` is the
+   **name of the `Config` key** the secret lives under, never the secret;
+   the module's convention is `ESCALATION_TRACKER_CREDENTIAL`, resolved
+   through the `Config` port at file-time. A missing key dead-letters
+   (terminal), it does not retry.
+3. **Destination.** Point the tenant at a scratch repo with an
+   `sg_destinations` row: `destination` =
+   `{"github":{"owner":"you","repo":"scratch"}}`, `credential_ref` =
+   `ESCALATION_TRACKER_CREDENTIAL`. (#23 adds the admin route that sets
+   this through the API; until then it is a direct row.)
+4. **Observe.** The filed issue carries labels `bug` and
+   `severity:<info|warning|error|critical>`, and — when
+   `ESCALATION_CONVERSATION_URL` is set — a link back to
+   `<base>/<conversation-id>` in the body, alongside an invisible
+   `<!-- cratefield-idem: escalation:<ticket-id> -->` marker.
+5. **Idempotent rerun.** The adapter searches the repo for that marker
+   before creating, so a redelivered outbox row (or a re-run) finds the
+   existing issue and files nothing new. A *failed* lookup fails the call
+   rather than risking a duplicate.
+
+GitHub Enterprise works by building the adapter with
+`GitHubIssues::with_base(<GHE API root>)`; the default base is
+`https://api.github.com`.
 
 ## Adding a module later
 

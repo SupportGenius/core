@@ -38,6 +38,14 @@ pub(crate) const TRANSCRIPT: &str = "customer: checkout returns HTTP 500 when I 
 pub(crate) const CREDENTIAL_REF: &str = "ESCALATION_TRACKER_CREDENTIAL";
 /// The secret behind [`CREDENTIAL_REF`], seeded into the `FakeConfig`.
 pub(crate) const CREDENTIAL_SECRET: &str = "token-1";
+/// The Config key and base URL the file stage reads to link a filed ticket
+/// back to the conversation it came from (`<base>/<conversation_id>`).
+/// Duplicated as a literal here the way [`CREDENTIAL_REF`] is: the pipeline
+/// keeps the key crate-private.
+pub(crate) const CONVERSATION_URL_KEY: &str = "ESCALATION_CONVERSATION_URL";
+/// The base URL behind [`CONVERSATION_URL_KEY`]; the filed body carries
+/// `<base>/<conversation>`.
+pub(crate) const CONVERSATION_URL: &str = "https://support.acme.test/conversations";
 /// The instant every test starts from. Whole-second, so its RFC 3339 form
 /// string-compares chronologically — what the outbox's
 /// `next_attempt_at <= now` predicate relies on.
@@ -176,19 +184,25 @@ pub(crate) fn migrated_db() -> Arc<SqliteDatabase> {
     Arc::new(db)
 }
 
-/// Seeds the tenant's tracker destination: a GitHub repo, and the
-/// credential *reference* the file stage resolves through the Config port.
-pub(crate) fn seed_destination(db: &SqliteDatabase) {
+/// Seeds `tenant`'s tracker destination — the file stage's destination and
+/// the credential *reference* it resolves through the Config port.
+pub(crate) fn seed_destination(db: &SqliteDatabase, destination: &Destination) {
     let stmt = store::put_destination_stmt(
         TENANT,
-        &Destination::GitHub {
-            owner: "acme".to_owned(),
-            repo: "api".to_owned(),
-        },
+        destination,
         CREDENTIAL_REF,
         &format_at(time::OffsetDateTime::from_unix_timestamp(EPOCH).expect("epoch")),
     );
     pollster::block_on(db.batch_atomic(&[stmt])).expect("destination seeds");
+}
+
+/// The tenant's default destination: a GitHub repo.
+#[must_use]
+pub(crate) fn github_destination() -> Destination {
+    Destination::GitHub {
+        owner: "acme".to_owned(),
+        repo: "api".to_owned(),
+    }
 }
 
 /// Performs the intake handoff the way the calling module must: the
@@ -237,8 +251,19 @@ pub(crate) struct Fixture {
 /// committed through `batch_atomic`, and the given scripted fakes.
 #[must_use]
 pub(crate) fn fixture(model: FakeTextModel, tracker: FakeTracker) -> Fixture {
+    fixture_for(&github_destination(), model, tracker)
+}
+
+/// [`fixture`] pointed at another tracker — a `Destination::Webhook { url }`
+/// tenant, say.
+#[must_use]
+pub(crate) fn fixture_for(
+    destination: &Destination,
+    model: FakeTextModel,
+    tracker: FakeTracker,
+) -> Fixture {
     let db = migrated_db();
-    seed_destination(&db);
+    seed_destination(&db, destination);
     let clock = Arc::new(SettableClock::at_unix(EPOCH));
     let ticket_id = commit_handoff(&db, &clock, TENANT, CONVERSATION, TRANSCRIPT);
     Fixture {
@@ -267,7 +292,11 @@ impl Fixture {
             Arc::new(self.model.clone()),
             Arc::new(self.tracker.clone()),
             self.mailer.clone(),
-            Arc::new(FakeConfig::new().with(CREDENTIAL_REF, CREDENTIAL_SECRET)),
+            Arc::new(
+                FakeConfig::new()
+                    .with(CREDENTIAL_REF, CREDENTIAL_SECRET)
+                    .with(CONVERSATION_URL_KEY, CONVERSATION_URL),
+            ),
             self.clock.clone(),
             Arc::new(UlidIdGen),
             Some(Arc::new(self.defer.clone())),

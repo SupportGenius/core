@@ -18,12 +18,30 @@ workspace = true
 # carries them; integration tests turn the feature on through the self
 # dev-dependency below.
 testing = []
+# Both `Tracker` adapters the module can file into, on by default. A
+# venture that must not link one (a size budget, an enterprise-only
+# GitHub) turns its feature off; `connectors::check_destination` then
+# refuses that destination by name instead of failing at file-time.
+default = ["tracker-github", "tracker-webhook"]
+tracker-github = ["dep:cratefield-adapter-github-issues"]
+tracker-webhook = ["dep:cratefield-adapter-webhook-tracker"]
 
 [dependencies]
 # The ports (`TextModel`/`Tracker` included), the store
 # (`Database`/`Statement`/`Outbox`/`Clock`/`IdGen`), and `scrub_text` for
 # the error `Display`s.
 cratefield-core = { workspace = true }
+# The outbound-webhook module the pipeline publishes its escalation
+# lifecycle events through (`escalation.filed`, `.dead_lettered`,
+# `.needs_human`). A venture must register the `Webhooks` module so its
+# tables exist (issue #21 adds both to `crates/composition`); if it does
+# not, the publish read fails and the fan-out is skipped (with a warning)
+# rather than breaking every filing — see `Pipeline::webhook_stmts`.
+cratefield-module-webhooks = { workspace = true }
+# `Pipeline::webhook_stmts` warns when it skips a fan-out because the
+# webhooks tables are absent. The harness's own modules log through
+# `tracing`, so a venture's log sink already carries it.
+tracing = { workspace = true }
 # `Module::router` returns an `axum::Router`; this module returns it
 # deliberately empty (see `Escalation::router` in lib.rs), so the
 # dependency exists for the trait's return type alone. Same pin and
@@ -33,6 +51,11 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# The `Tracker` adapters `connectors::routing_tracker` registers. Optional
+# and feature-gated (see `[features]`); the pin is the workspace's one
+# harness rev.
+cratefield-adapter-github-issues = { workspace = true, optional = true }
+cratefield-adapter-webhook-tracker = { workspace = true, optional = true }
 # The store renders its queries through the same sea-query pin core uses
 # (`Statement::render` builds with the SQLite query builder).
 sea-query = { version = "0.32.7", default-features = false, features = [
@@ -53,6 +76,18 @@ time = { version = "0.3.45", default-features = false, features = [
 # the plain lib (the one the venture links) stays feature-free.
 module-escalation = { path = ".", features = ["testing"] }
 pollster = { workspace = true }
+# The signature test recomputes the `Cratefield-Signature` header
+# independently of the code that made it: HMAC-SHA256 over `{unix}.{body}`.
+hmac = { workspace = true }
+sha2 = { workspace = true }
+# The webhook-delivery test implements the `HttpClient` port itself,
+# because `FakeHttpClient` records only method/uri/body and the signature
+# lives in a header. `HttpClient::send` speaks `http::Request<Bytes>`, so
+# naming those types needs the two crates the port is built from — the
+# same versions `cratefield-testing` already links, so nothing new enters
+# the graph.
+bytes = { workspace = true }
+http = { workspace = true }
 # The store and intake round-trip tests run against a real in-memory
 # SQLite through the shipped migration. Already in the lock through
 # cratefield-testing; this only names the edge.
