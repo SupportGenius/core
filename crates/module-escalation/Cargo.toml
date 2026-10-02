@@ -41,6 +41,18 @@ cratefield-module-webhooks = { workspace = true }
 # `Pipeline::webhook_stmts` warns when it skips a fan-out because the
 # webhooks tables are absent. The harness's own modules log through
 # `tracing`, so a venture's log sink already carries it.
+# Issue #23: the destinations routes store a tenant's tracker credential
+# envelope-encrypted (cratefield-secrets) under a key the KMS
+# (cratefield-kms) wraps. Both are wasm-safe, so the Worker build carries
+# them.
+cratefield-secrets = { workspace = true }
+cratefield-kms = { workspace = true }
+# Shared workspace crate: the tenant API key the destinations routes
+# verify (the same `sg_…` bearer module-support mints and accepts).
+tenancy = { path = "../tenancy" }
+# One `tracing::error!` when the KMS a deployment configured cannot be
+# built (a broken KEK ring or key file). Already in the graph through
+# cratefield-core.
 tracing = { workspace = true }
 # `Module::router` returns an `axum::Router`; this module returns it
 # deliberately empty (see `Escalation::router` in lib.rs), so the
@@ -102,3 +114,12 @@ cratefield-adapter-sqlite = { workspace = true }
 # it (the path the issue names), and `FakeMailer` is the wired-mailer
 # side of the notify stage's `no_recipient` pin.
 cratefield-testing = { workspace = true }
+# The destinations routes' acceptance tests mint a tenant key with the
+# harness's own `Signer` through `tenancy::mint` — the same call
+# `module-support`'s admin route makes — so no second module has to be
+# mounted to exercise the escalation routes; the ordinary `tenancy`
+# dependency above is what the tests use.
+#
+# `ServiceExt::oneshot` drives the router without a network; pinned to
+# the same line cratefield-testing builds against so one tower compiles.
+tower = { version = "0.5.3", features = ["util"] }

@@ -69,7 +69,12 @@ use cratefield_core::{
     Tracker, TrackerError, Venture,
 };
 use cratefield_module_waitlist::Waitlist;
-use module_escalation::Escalation;
+use module_escalation::{Escalation, TenantDirectory};
+
+/// The escalation module's boot-time refusal for its development file
+/// KMS outside `ENV=development` (see the module's docs), re-exported so
+/// the native binary checks it through this crate like the cron gates.
+pub use module_escalation::local_kms_refusal;
 use module_support::{HandoffSink, Support};
 
 /// The venture name, kebab-case.
@@ -215,7 +220,29 @@ fn compose_support(support: Support) -> OnCron<Support> {
 /// test can build the same set the composition registers.
 #[must_use]
 pub fn escalation() -> Escalation {
-    Escalation::new()
+    Escalation::new().with_tenant_directory(Arc::new(SupportTenants))
+}
+
+/// Adapts `module-support`'s tenant table to escalation's
+/// [`TenantDirectory`] port, the same way [`EscalationHandoff`] adapts the
+/// other direction: escalation's destination routes refuse a suspended or
+/// closed tenant exactly as support's own routes do, and neither module
+/// learns about the other.
+struct SupportTenants;
+
+#[async_trait::async_trait]
+impl TenantDirectory for SupportTenants {
+    async fn is_active(
+        &self,
+        ctx: &ModuleContext,
+        tenant_id: &str,
+    ) -> Result<bool, cratefield_core::DbError> {
+        // No database means no tenant can be shown active: refuse.
+        let Some(db) = ctx.ports.db.as_deref() else {
+            return Ok(false);
+        };
+        module_support::tenant_is_active(db, tenant_id).await
+    }
 }
 
 /// Adds every venture module — and its templates — to any builder, with

@@ -186,7 +186,9 @@ pub fn update_ticket_judgment_stmt(ticket_id: &str, judgment: &Judgment, at: &st
 }
 
 /// Records a successful filing: the tracker's ticket id and URL, and
-/// `updated_at`.
+/// `updated_at`. An empty `url` is written as SQL NULL — the file stage
+/// blanks the URL a webhook reports, because that URL is the destination's
+/// secret (see `Pipeline::file_ticket`).
 #[must_use]
 pub fn update_ticket_filed_stmt(ticket_id: &str, filed: &Filed, at: &str) -> Statement {
     let mut update = Query::update();
@@ -194,7 +196,10 @@ pub fn update_ticket_filed_stmt(ticket_id: &str, filed: &Filed, at: &str) -> Sta
         .table(iden("sg_tickets"))
         .values([
             (iden("external_id"), filed.external_id.clone().into()),
-            (iden("external_url"), filed.url.clone().into()),
+            (
+                iden("external_url"),
+                (!filed.url.is_empty()).then(|| filed.url.clone()).into(),
+            ),
             (iden("updated_at"), at.to_owned().into()),
         ])
         .and_where(Expr::col(iden("id")).eq(ticket_id));
@@ -323,8 +328,11 @@ pub fn update_ticket_stage_stmt(ticket_id: &str, stage: Stage, at: &str) -> Stat
 
 /// Upserts a tenant's tracker destination (`tenant_id` is the primary
 /// key, so re-configuring a tenant replaces its row). `credential_ref`
-/// names the Config key the secret lives under — **never the secret
-/// itself**; it is resolved from the Config port at file-time.
+/// names where the secret lives — **never the secret itself**. Since
+/// issue #23 it is a `secret:` reference into the tenant's encrypted
+/// `cratefield-secrets` store; the older form is a Config key name
+/// resolved from the Config port at file-time. Either way the database
+/// holds a reference only.
 #[must_use]
 pub fn put_destination_stmt(
     tenant_id: &str,
@@ -353,6 +361,18 @@ pub fn put_destination_stmt(
                 .to_owned(),
         );
     Statement::render(&insert)
+}
+
+/// Deletes a tenant's destination row (`DELETE /destinations`). The
+/// credential and webhook-URL secrets live in the encrypted store and are
+/// deleted separately by the handler; this is the row only.
+#[must_use]
+pub fn delete_destination_stmt(tenant_id: &str) -> Statement {
+    let mut delete = Query::delete();
+    delete
+        .from_table(iden("sg_destinations"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id));
+    Statement::render(&delete)
 }
 
 /// The rendered equivalent of `Outbox::complete(db, id)` — a

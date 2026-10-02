@@ -98,6 +98,24 @@ pub use handoff::HandoffSink;
 pub use lexical::bm25;
 pub use store::reindex_stale_chunks;
 
+/// Whether `tenant_id` names a tenant that exists and is `active` — the
+/// same test every tenant-key route here applies after verifying the key
+/// (`handlers::authenticate`). Public so a composition can give another
+/// module (escalation's destination routes) the identical answer without
+/// that module reading this one's tables.
+///
+/// # Errors
+///
+/// The database's error when the lookup itself fails.
+pub async fn tenant_is_active(
+    db: &dyn cratefield_core::Database,
+    tenant_id: &str,
+) -> Result<bool, cratefield_core::DbError> {
+    Ok(store::find_tenant(db, tenant_id)
+        .await?
+        .is_some_and(|tenant| tenant.status == store::STATUS_ACTIVE))
+}
+
 use std::sync::Arc;
 
 use cratefield_core::{
