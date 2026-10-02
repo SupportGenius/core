@@ -57,6 +57,12 @@ getrandom = { workspace = true }
 [dev-dependencies]
 # The parity leg (Postgres) needs the `postgres` feature on the kit.
 cratefield-testing = { workspace = true, features = ["postgres"] }
+# The SRI drift test hashes `w.js` the way a browser's
+# `integrity="sha384-…"` attribute does: SHA-384 (already a dependency)
+# plus standard base64.
+base64 = "0.23"
+# The test's counting `RateLimiter` implements the `#[async_trait]` port.
+async-trait = { workspace = true }
 pollster = { workspace = true }
 # The scoring-parity tests compare response scores bit for bit with an
 # in-process rank. serde_json's default float parser is fast but can be

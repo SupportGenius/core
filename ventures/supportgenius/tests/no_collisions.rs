@@ -17,7 +17,9 @@ use supportgenius::compose;
 /// A keyless Resend adapter as the test mailer: the composition only
 /// needs a mailer port to build, and these tests never send. Keyless
 /// means it reports `NotConfigured` rather than pretending, should a send
-/// ever happen.
+/// ever happen. The trailing `None`s of the `compose` call are the captcha
+/// and the text model — like every port here, mounted only when a secret
+/// asks for one.
 fn keyless_mailer() -> Arc<dyn Mailer> {
     Arc::new(Resend::new(
         Arc::new(FetchClient),
@@ -36,7 +38,7 @@ fn keyless_mailer() -> Arc<dyn Mailer> {
 /// covered here with no edit to this file.
 #[test]
 fn composed_modules_have_unique_names_and_disjoint_tables() {
-    let (harness, _runtime) = compose(keyless_mailer(), None).expect("harness builds");
+    let (harness, _runtime) = compose(keyless_mailer(), None, None, None).expect("harness builds");
     let modules = harness.modules();
     assert!(
         !modules.is_empty(),

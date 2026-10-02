@@ -24,6 +24,7 @@
 
 mod pipeline;
 
+pub mod connectors;
 pub mod error;
 pub mod intake;
 pub mod model;
@@ -70,6 +71,7 @@ use cratefield_core::{
 };
 
 use crate::intake::OUTBOX_TABLE;
+use cratefield_module_webhooks::Webhooks;
 
 /// The SupportGenius escalation module (issue #4).
 ///
@@ -378,7 +380,15 @@ impl Module for Escalation {
                 idgen,
                 ctx.ports.defer.clone(),
             )
-            .with_retry_policy(policy);
+            .with_retry_policy(policy)
+            // Every stage that changes a ticket's life — filed,
+            // dead-lettered, parked for a human — also publishes the
+            // matching `escalation.*` event, in the stage's own atomic
+            // batch (see [`Pipeline`]). The publish is fail-safe: a
+            // venture that mounts this module without `Webhooks` has no
+            // webhook tables, and the fan-out is skipped rather than
+            // allowed to break every filing (see [`Pipeline::webhook_stmts`]).
+            .with_webhooks(Webhooks::new());
 
             for _ in 0..Pipeline::MAX_SWEEPS {
                 let processed = pipeline

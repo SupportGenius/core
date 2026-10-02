@@ -68,18 +68,24 @@ async fn a_handoff_becomes_a_filed_ticket_with_an_external_id() {
     );
     assert_eq!(call.draft.title, support::DRAFT_TITLE);
     assert_eq!(call.draft.severity, Severity::Error);
+    // The issue's labels: a `bug` marker plus the drafted severity as
+    // `severity:<level>`, so a tracker's filter finds and ranks it.
     assert_eq!(
         call.draft.labels,
-        ["escalated".to_owned(), "error".to_owned()]
+        ["bug".to_owned(), "severity:error".to_owned()]
+    );
+    // The body links back to the conversation the ticket came from.
+    assert!(
+        call.draft.body_markdown.contains(&format!(
+            "{}/{}",
+            support::CONVERSATION_URL,
+            support::CONVERSATION
+        )),
+        "the filed body links the conversation: {:?}",
+        call.draft.body_markdown
     );
     assert_eq!(call.draft.environment.as_deref(), Some("production"));
-    assert_eq!(
-        call.dest,
-        Destination::GitHub {
-            owner: "acme".to_owned(),
-            repo: "api".to_owned(),
-        }
-    );
+    assert_eq!(call.dest, support::github_destination());
 
     // The right tier asked at each stage, each carrying its own schema,
     // and the draft drafted from the transcript itself.
@@ -97,6 +103,46 @@ async fn a_handoff_becomes_a_filed_ticket_with_an_external_id() {
     );
     assert_eq!(prompts[0].messages.len(), 1);
     assert_eq!(prompts[0].messages[0].content, support::TRANSCRIPT);
+}
+
+/// Box 1, second destination kind: a tenant pointed at a webhook URL files
+/// the same ticket — same labels, same conversation link — through the same
+/// `Tracker` port, dispatching on the [`Destination`] alone.
+#[pollster::test]
+async fn a_webhook_destination_files_the_same_ticket_with_the_same_labels() {
+    let url = "https://hooks.acme.test/escalations";
+    let fixture = support::fixture_for(
+        &Destination::Webhook {
+            url: url.to_owned(),
+        },
+        support::happy_model(),
+        FakeTracker::new(TrackerMode::FileOk),
+    );
+    let pipeline = fixture.pipeline();
+    support::drain_all(&pipeline);
+
+    assert_eq!(support::ticket(&fixture).status, Status::Filed);
+    let filed = fixture.tracker.filed();
+    assert_eq!(filed.len(), 1, "one escalation, one tracker file");
+    assert_eq!(
+        filed[0].dest,
+        Destination::Webhook {
+            url: url.to_owned()
+        }
+    );
+    assert_eq!(
+        filed[0].draft.labels,
+        ["bug".to_owned(), "severity:error".to_owned()]
+    );
+    assert!(
+        filed[0].draft.body_markdown.contains(&format!(
+            "{}/{}",
+            support::CONVERSATION_URL,
+            support::CONVERSATION
+        )),
+        "the filed body links the conversation: {:?}",
+        filed[0].draft.body_markdown
+    );
 }
 
 /// Box 2: `verdict: reject` never calls the tracker, and the `rejected`

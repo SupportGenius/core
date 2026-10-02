@@ -85,7 +85,7 @@ async fn a_second_report_of_the_same_defect_links_instead_of_filing() {
         support::scripted_model(support::drafted_json(), support::file_judgment()),
         FakeTracker::new(TrackerMode::FileOk),
     );
-    support::seed_destination(&world.db);
+    support::seed_destination(&world.db, &support::github_destination());
     let pipeline = pipeline(&world);
 
     let first = support::commit_handoff(
@@ -221,7 +221,7 @@ async fn a_duplicate_of_that_was_not_shown_is_ignored_and_the_ticket_files() {
         ),
         FakeTracker::new(TrackerMode::FileOk),
     );
-    support::seed_destination(&world.db);
+    support::seed_destination(&world.db, &support::github_destination());
     let pipeline = pipeline(&world);
 
     let ticket_id = support::commit_handoff(
@@ -262,8 +262,8 @@ async fn candidates_are_scoped_to_the_tenant() {
         support::scripted_model(support::drafted_json(), support::file_judgment()),
         FakeTracker::new(TrackerMode::FileOk),
     );
-    support::seed_destination_for(&world.db, "tenant-a");
-    support::seed_destination_for(&world.db, "tenant-b");
+    support::seed_destination_for(&world.db, "tenant-a", &support::github_destination());
+    support::seed_destination_for(&world.db, "tenant-b", &support::github_destination());
     let pipeline = pipeline(&world);
 
     let a = support::commit_handoff(

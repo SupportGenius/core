@@ -42,14 +42,23 @@ use crate::error::Error;
 use crate::intake::OUTBOX_TABLE;
 use crate::model::{
     Drafted, EventKind, Judgment, Stage, StagePayload, Status, Ticket, Verdict, stage_seq,
+    webhook_events,
 };
 use crate::store;
 
 use cratefield_core::{
     Clock, Completion, Config, Credential, Database, Defer, Filed, IdGen, Inbox, Mailer, Message,
-    ModelTier, Outbox, OutboxRecord, Prompt, SendOutcome, Statement, TextModel, TicketDraft,
-    Tracker,
+    ModelTier, Outbox, OutboxRecord, Prompt, SendOutcome, Severity, Statement, TextModel,
+    TicketDraft, Tracker,
 };
+use cratefield_module_webhooks::{PublishError, Webhooks};
+
+/// The `Config` key naming the base URL of a support conversation
+/// (`<base>/<conversation_id>`). When set, the filed ticket's body carries a
+/// link back to the conversation it came from — see
+/// [`with_conversation_link`]. Deployment config, not tenant data: it is the
+/// venture's own site.
+pub(crate) const CONVERSATION_URL_KEY: &str = "ESCALATION_CONVERSATION_URL";
 
 /// The inbox table the migration creates; the stages' claim keys live in
 /// it, one `ticket:stage` per stage attempt. Reachable as
@@ -190,6 +199,11 @@ pub struct Pipeline {
     clock: Arc<dyn Clock>,
     idgen: Arc<dyn IdGen>,
     defer: Option<Arc<dyn Defer>>,
+    /// The outbound-webhook publisher for the `escalation.*` lifecycle
+    /// events. `None` (the [`Pipeline::new`] default) publishes nothing; a
+    /// composed venture wires it with [`Pipeline::with_webhooks`], whose
+    /// tables must exist in this database.
+    webhooks: Option<Webhooks>,
     outbox: Outbox,
     inbox: Inbox,
     policy: RetryPolicy,
@@ -241,6 +255,9 @@ impl Pipeline {
             clock,
             idgen,
             defer,
+            // Publishing is opt-in: a bare pipeline (every test fixture that
+            // does not build the webhooks tables) publishes nothing.
+            webhooks: None,
             outbox: Outbox::new(OUTBOX_TABLE),
             inbox: Inbox::new(INBOX_TABLE),
             policy: RetryPolicy::new(),
@@ -252,6 +269,17 @@ impl Pipeline {
     #[must_use]
     pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Wires the outbound-webhook publisher, so every outcome that changes
+    /// a ticket's life also publishes its `escalation.*` event **into the
+    /// same atomic batch** that records the audit row. The webhooks module's
+    /// tables must exist in this pipeline's database — the venture that
+    /// mounts escalation registers the `Webhooks` module for that.
+    #[must_use]
+    pub fn with_webhooks(mut self, webhooks: Webhooks) -> Self {
+        self.webhooks = Some(webhooks);
         self
     }
 
@@ -315,7 +343,16 @@ impl Pipeline {
         let ticket = match store::load_ticket(&*self.db, &payload.ticket_id).await {
             Ok(ticket) => ticket,
             Err(err) => {
-                return self.fail(record, stage, &payload.ticket_id, err, &at).await;
+                return self
+                    .fail(
+                        record,
+                        stage,
+                        &payload.ticket_id,
+                        &payload.tenant_id,
+                        err,
+                        &at,
+                    )
+                    .await;
             }
         };
         let Some(ticket) = ticket else {
@@ -323,7 +360,16 @@ impl Pipeline {
             // audit row still lands (an event survives on its own id) and
             // the status update is a harmless no-op.
             let err = Error::Decode(format!("ticket `{}` is missing", payload.ticket_id));
-            return self.fail(record, stage, &payload.ticket_id, err, &at).await;
+            return self
+                .fail(
+                    record,
+                    stage,
+                    &payload.ticket_id,
+                    &payload.tenant_id,
+                    err,
+                    &at,
+                )
+                .await;
         };
 
         // The crash-window branch. `claim` returned false, so the key is
@@ -372,7 +418,14 @@ impl Pipeline {
             Ok(completion) => completion,
             Err(err) => {
                 return self
-                    .fail(record, Stage::Draft, &ticket.id, Error::from(err), at)
+                    .fail(
+                        record,
+                        Stage::Draft,
+                        &ticket.id,
+                        &ticket.tenant_id,
+                        Error::from(err),
+                        at,
+                    )
                     .await;
             }
         };
@@ -381,7 +434,11 @@ impl Pipeline {
         // not parse is a terminal failure, not a retry.
         let drafted = match decode_completion::<Drafted>(&completion) {
             Ok(drafted) => drafted,
-            Err(err) => return self.fail(record, Stage::Draft, &ticket.id, err, at).await,
+            Err(err) => {
+                return self
+                    .fail(record, Stage::Draft, &ticket.id, &ticket.tenant_id, err, at)
+                    .await;
+            }
         };
 
         let body = render_body_markdown(&drafted);
@@ -453,13 +510,24 @@ impl Pipeline {
             Ok(completion) => completion,
             Err(err) => {
                 return self
-                    .fail(record, Stage::Judge, &ticket.id, Error::from(err), at)
+                    .fail(
+                        record,
+                        Stage::Judge,
+                        &ticket.id,
+                        &ticket.tenant_id,
+                        Error::from(err),
+                        at,
+                    )
                     .await;
             }
         };
         let judgment = match decode_completion::<Judgment>(&completion) {
             Ok(judgment) => judgment,
-            Err(err) => return self.fail(record, Stage::Judge, &ticket.id, err, at).await,
+            Err(err) => {
+                return self
+                    .fail(record, Stage::Judge, &ticket.id, &ticket.tenant_id, err, at)
+                    .await;
+            }
         };
 
         let mut detail = serde_json::to_value(&judgment).map_err(Error::from)?;
@@ -780,12 +848,28 @@ impl Pipeline {
         at: &str,
     ) -> Result<(), Error> {
         match self.file_ticket(ticket).await {
-            Ok(filed) => {
-                let detail = json!({
+            Ok((filed, kind)) => {
+                // A tracker's `Filed::url` is its public issue link (useful in
+                // a notification); a `webhook` destination's is the endpoint
+                // *itself* — credential material (issue #23) — so it reaches
+                // neither the audit row nor the event payload.
+                let url_is_public = kind != "webhook";
+                let mut detail = json!({
                     "external_id": filed.external_id.clone(),
-                    "url": filed.url.clone(),
                 });
-                let batch = [
+                if url_is_public {
+                    detail["url"] = json!(filed.url.clone());
+                }
+                let mut filed_data = json!({
+                    "ticket_id": ticket.id,
+                    "tenant_id": ticket.tenant_id,
+                    "destination_kind": kind,
+                    "external_id": filed.external_id,
+                });
+                if url_is_public {
+                    filed_data["url"] = json!(filed.url);
+                }
+                let mut batch = vec![
                     store::insert_event_stmt(
                         &self.idgen.ulid(),
                         &ticket.id,
@@ -808,6 +892,18 @@ impl Pipeline {
                     ),
                     store::outbox_complete_stmt(OUTBOX_TABLE, &record.id),
                 ];
+                // The `escalation.filed` fan-out joins the same batch, so a
+                // subscriber is told exactly when the ticket is filed — never
+                // for a file that rolled back, never missing one that landed.
+                batch.extend(
+                    self.webhook_stmts(
+                        &ticket.tenant_id,
+                        webhook_events::ESCALATION_FILED,
+                        &filed_data,
+                        at,
+                    )
+                    .await?,
+                );
                 self.commit(&batch).await?;
                 self.defer_next();
                 Ok(())
@@ -817,7 +913,10 @@ impl Pipeline {
             // destination dead-letters — `fail` sorts one from the other,
             // and both write their reason into a `file_dead_lettered`
             // / `file_retry_scheduled` row.
-            Err(err) => self.fail(record, Stage::File, &ticket.id, err, at).await,
+            Err(err) => {
+                self.fail(record, Stage::File, &ticket.id, &ticket.tenant_id, err, at)
+                    .await
+            }
         }
     }
 
@@ -825,7 +924,12 @@ impl Pipeline {
     /// per-call credential resolved first. Any gap — no drafted ticket to
     /// file, no destination row, no secret under the stored ref — is a
     /// terminal decode error, which dead-letters.
-    async fn file_ticket(&self, ticket: &Ticket) -> Result<Filed, Error> {
+    ///
+    /// Returns the tracker's [`Filed`] answer and the destination's
+    /// [`kind`](cratefield_core::Destination::kind) (never the destination
+    /// itself — a `Webhook` variant is credential material), which the
+    /// `escalation.filed` event reports.
+    async fn file_ticket(&self, ticket: &Ticket) -> Result<(Filed, &'static str), Error> {
         let title = ticket
             .title
             .clone()
@@ -856,12 +960,17 @@ impl Pipeline {
         };
         let credential = Credential::new(secret);
         let idempotency_key = format!("escalation:{}", ticket.id);
+        let body = with_conversation_link(body, &*self.config, &ticket.conversation_id);
+        let kind = destination.kind();
         let mut draft = TicketDraft::new(idempotency_key, title, body, severity)
-            .labels(vec!["escalated".to_owned(), severity.name().to_owned()]);
+            .labels(escalation_labels(severity));
         if let Some(environment) = &ticket.environment {
             draft = draft.environment(environment.clone());
         }
-        Ok(self.tracker.file(&destination, &credential, &draft).await?)
+        Ok((
+            self.tracker.file(&destination, &credential, &draft).await?,
+            kind,
+        ))
     }
 
     // ------------------------------------------------------------------
@@ -920,7 +1029,14 @@ impl Pipeline {
                     }
                     Err(err) => {
                         return self
-                            .fail(record, Stage::Notify, &ticket.id, Error::from(err), at)
+                            .fail(
+                                record,
+                                Stage::Notify,
+                                &ticket.id,
+                                &ticket.tenant_id,
+                                Error::from(err),
+                                at,
+                            )
                             .await;
                     }
                 }
@@ -986,6 +1102,7 @@ impl Pipeline {
         record: &OutboxRecord,
         stage: Stage,
         ticket_id: &str,
+        tenant_id: &str,
         err: Error,
         at: &str,
     ) -> Result<(), Error> {
@@ -1043,12 +1160,90 @@ impl Pipeline {
             // Terminal: the ticket parks for a human (a no-op when the
             // row is already gone) and the outbox row completes so it
             // stops. Never `retry_later` a terminal failure.
-            let batch = [
+            let mut batch = vec![
                 event,
                 store::update_ticket_status_stmt(ticket_id, Status::DeadLetter, at),
                 store::outbox_complete_stmt(OUTBOX_TABLE, &record.id),
             ];
+            let reason = err.to_string();
+            let payload = json!({
+                "ticket_id": ticket_id,
+                "tenant_id": tenant_id,
+                "stage": stage.as_topic(),
+                "reason": reason,
+            });
+            // The file stage has its own dead-letter event; every
+            // dead-letter — this one included — also parks the ticket for a
+            // human, so it publishes `needs_human` too.
+            if stage == Stage::File {
+                batch.extend(
+                    self.webhook_stmts(
+                        tenant_id,
+                        webhook_events::ESCALATION_DEAD_LETTERED,
+                        &payload,
+                        at,
+                    )
+                    .await?,
+                );
+            }
+            batch.extend(
+                self.webhook_stmts(
+                    tenant_id,
+                    webhook_events::ESCALATION_NEEDS_HUMAN,
+                    &payload,
+                    at,
+                )
+                .await?,
+            );
             self.commit(&batch).await
+        }
+    }
+
+    /// The `escalation.*` webhook fan-out for one outcome: the returned
+    /// statements go into the **same** [`Database::batch_atomic`] as the
+    /// outcome's audit row, so a subscriber hears about an outcome exactly
+    /// when it committed. Empty when no webhooks module is wired
+    /// ([`Pipeline::with_webhooks`]) or when no endpoint of the tenant
+    /// matches. The publish is a database read (the tenant's endpoints),
+    /// not an outbound port call — delivery happens later, in the webhooks
+    /// module's own drain.
+    ///
+    /// **Fail-safe by design.** A publish read failure — above all a venture
+    /// that mounts this module without the `Webhooks` module, so its tables
+    /// do not exist — must not break filing, which is the module's job;
+    /// the notification is not. So a database failure skips the fan-out and
+    /// warns. When `Webhooks` *is* composed the only way to reach this arm
+    /// is a database broken worse than the batch's own commit below, which
+    /// then fails the stage and retries it — the event is not lost.
+    /// [`PublishError::InvalidEventType`] cannot happen (our event-type
+    /// constants are header-safe), so it stays terminal if it ever does.
+    async fn webhook_stmts(
+        &self,
+        tenant_id: &str,
+        event_type: &str,
+        data: &Value,
+        at: &str,
+    ) -> Result<Vec<Statement>, Error> {
+        let Some(webhooks) = &self.webhooks else {
+            return Ok(Vec::new());
+        };
+        match webhooks
+            .publish(&*self.db, tenant_id, event_type, data, at)
+            .await
+        {
+            Ok(published) => Ok(published.into_statements()),
+            Err(PublishError::InvalidEventType(event_type)) => Err(Error::Decode(format!(
+                "webhooks refused the event type `{event_type}`"
+            ))),
+            Err(PublishError::Database(err)) => {
+                tracing::warn!(
+                    %err,
+                    tenant_id,
+                    event_type,
+                    "escalation: webhook fan-out skipped (is `Webhooks` composed in this venture?)"
+                );
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -1086,6 +1281,22 @@ impl Pipeline {
                     Status::DeadLetter,
                     at,
                 ));
+                // A ticket parked for a human is exactly what
+                // `needs_human` means; it joins the same batch.
+                batch.extend(
+                    self.webhook_stmts(
+                        &payload.tenant_id,
+                        webhook_events::ESCALATION_NEEDS_HUMAN,
+                        &json!({
+                            "ticket_id": payload.ticket_id,
+                            "tenant_id": payload.tenant_id,
+                            "stage": stage.as_topic(),
+                            "reason": format!("unknown outbox topic `{}`", record.topic),
+                        }),
+                        at,
+                    )
+                    .await?,
+                );
             }
         }
         batch.push(store::outbox_complete_stmt(OUTBOX_TABLE, &record.id));
@@ -1190,6 +1401,25 @@ fn failure_kind(stage: Stage) -> EventKind {
         Stage::File => EventKind::FileFailed,
         Stage::Notify => EventKind::NotifyFailed,
     }
+}
+
+/// The labels every filed escalation carries: a `bug` marker, and the
+/// drafted severity as `severity:<level>` (`severity:error`), so a tracker's
+/// label filter can find escalations and rank them without parsing the body.
+fn escalation_labels(severity: Severity) -> Vec<String> {
+    vec!["bug".to_owned(), format!("severity:{}", severity.name())]
+}
+
+/// Appends a link back to the support conversation the ticket came from,
+/// when the deployment names a conversation base (`ESCALATION_CONVERSATION_URL`):
+/// `<base>/<conversation_id>`. With no base configured the body is returned
+/// unchanged — a link is only added when there is somewhere to point.
+fn with_conversation_link(body: String, config: &dyn Config, conversation_id: &str) -> String {
+    let Some(base) = config.get(CONVERSATION_URL_KEY) else {
+        return body;
+    };
+    let base = base.trim_end_matches('/');
+    format!("{body}\n\n---\n\nEscalated from the support conversation: {base}/{conversation_id}\n")
 }
 
 /// The ticket body the draft stage renders: the reproduction steps as a

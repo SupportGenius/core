@@ -460,6 +460,29 @@ impl std::str::FromStr for EventKind {
     }
 }
 
+/// The webhook event types the pipeline publishes to a tenant's registered
+/// endpoints (`cratefield-module-webhooks`), with the **tenant id** as the
+/// event subject. Distinct from [`EventKind`]: that is the per-ticket audit
+/// trail in `sg_ticket_events`; these are the coarse lifecycle notifications
+/// a subscriber filters on.
+pub mod webhook_events {
+    /// The tracker accepted the ticket. Data: ticket id, tenant,
+    /// destination kind, and the tracker's external id; the public issue
+    /// URL too, except for a `webhook` destination, whose URL is the
+    /// endpoint itself and never leaves the process (issue #23).
+    pub const ESCALATION_FILED: &str = "escalation.filed";
+    /// The file stage gave up (a terminal tracker failure, or the retry
+    /// budget exhausted). Data: ticket id, tenant, stage, reason.
+    pub const ESCALATION_DEAD_LETTERED: &str = "escalation.dead_lettered";
+    /// The ticket stopped and a human must look: it parked as
+    /// [`Status::DeadLetter`]. Fires for a dead-letter at any stage, so a
+    /// file-stage dead-letter emits both this and
+    /// [`ESCALATION_DEAD_LETTERED`] (one is the tracker-specific signal, the
+    /// other the human-queue signal). Data: ticket id, tenant, stage,
+    /// reason.
+    pub const ESCALATION_NEEDS_HUMAN: &str = "escalation.needs_human";
+}
+
 /// A `sg_tickets` row, as read back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ticket {
