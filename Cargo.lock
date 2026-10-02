@@ -525,6 +525,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cratefield-adapter-anthropic"
+version = "0.1.0"
+source = "git+https://github.com/Cratefield/harness?rev=b50c1d99b6f29e11a9fd5f116a8cd31275f735c6#b50c1d99b6f29e11a9fd5f116a8cd31275f735c6"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "cratefield-core",
+ "getrandom 0.4.3",
+ "http",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "cratefield-adapter-apns"
 version = "0.1.5"
 source = "git+https://github.com/Cratefield/harness?rev=b50c1d99b6f29e11a9fd5f116a8cd31275f735c6#b50c1d99b6f29e11a9fd5f116a8cd31275f735c6"
@@ -1248,6 +1263,24 @@ dependencies = [
  "cfg-if",
  "home",
  "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "evals"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "cratefield-adapter-anthropic",
+ "cratefield-core",
+ "cratefield-runtime-native",
+ "cratefield-testing",
+ "module-support",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "tower",
 ]
 
 [[package]]

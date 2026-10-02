@@ -3,8 +3,9 @@ resolver = "3"
 # Globs on purpose: later issues add crates and ventures without editing
 # this file. Today `crates/*` matches `tenancy` and `composition`, `bin/*`
 # the static self-hosted binary, and `ventures/*` only `supportgenius`;
-# cargo accepts a glob that currently matches one entry.
-members = ["crates/*", "bin/*", "ventures/*"]
+# cargo accepts a glob that currently matches one entry. `evals` is a
+# top-level directory no glob covers, so it is listed literally.
+members = ["crates/*", "bin/*", "ventures/*", "evals"]
 
 [workspace.package]
 version = "0.1.0"
@@ -38,6 +39,9 @@ cratefield-runtime-cloudflare = { git = "https://github.com/Cratefield/harness",
 cratefield-module-waitlist = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 cratefield-adapter-resend = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 cratefield-adapter-turnstile = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
+# The `TextModel` port over the Anthropic Messages API: the `evals`
+# runner's real-model option (`--model anthropic[:ID]`), native-only.
+cratefield-adapter-anthropic = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 cratefield-testing = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 cratefield-cli = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 # Native-only (tokio/reqwest/redis do not compile to wasm): consumed only
