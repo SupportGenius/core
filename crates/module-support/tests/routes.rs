@@ -19,13 +19,19 @@ use cratefield_testing::{
     Dialect, FakeHttpClient, FakeRateLimiter, FakeTextModel, TestHarness, TextModelMode,
 };
 use module_support::Support;
+use module_support::bm25;
 use module_support::chunk::Chunker;
+use module_support::store::{self, SourceRow};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tower::ServiceExt;
+
+mod stats_check;
+use stats_check::{assert_stats_exact, df_of};
 
 const ADMIN_TOKEN: &str = "test-admin-token-0123456789abcdef";
 const ADMIN: &str = "/v1/support/admin/tenants";
@@ -478,24 +484,30 @@ async fn url_ingest_without_an_http_client_port_answers_503_not_ready() {
     }
 }
 
+/// The two-document ranking fixture: "quokka" occurs in one document
+/// only, "kangaroo" in both, the pad word keeps lengths comparable — and
+/// the whole corpus is two chunks, so it also pins the small-corpus gate
+/// (below `STOPWORD_MIN_CHUNKS` the majority-term rule is not applied,
+/// and searching "kangaroo" must still work).
+const QUOKKA_DOC: &str = "quokka quokka quokka kangaroo pad";
+const KANGAROO_DOC: &str = "kangaroo kangaroo kangaroo pad";
+
 #[pollster::test]
 async fn search_ranks_the_better_matching_document_first_with_strictly_ordered_scores() {
     for kit in kits() {
         let tenant = mint_tenant(&kit, "Ranked").await;
         let api_key = body_str(&tenant, "api_key");
 
-        // "quokka" occurs in one document only; "kangaroo" in both; the
-        // pad word keeps document lengths comparable.
         let a = ingest(
             &kit,
             &api_key,
-            json!({ "title": "Quokka", "text": "quokka quokka quokka kangaroo pad" }),
+            json!({ "title": "Quokka", "text": QUOKKA_DOC }),
         )
         .await;
         let b = ingest(
             &kit,
             &api_key,
-            json!({ "title": "Kangaroo", "text": "kangaroo kangaroo kangaroo pad" }),
+            json!({ "title": "Kangaroo", "text": KANGAROO_DOC }),
         )
         .await;
         let (a_id, b_id) = (
@@ -663,14 +675,31 @@ async fn empty_query_answers_empty_results_and_limit_clamps_to_the_hard_range() 
         let tenant = mint_tenant(&kit, "Edges").await;
         let api_key = body_str(&tenant, "api_key");
 
-        // ~72 chunks, every one of them containing the marker word, so
-        // a q=zz match set is bigger than any limit under test.
-        let words: Vec<String> = (0..5400)
-            .flat_map(|i| vec![format!("t{i:04}"), "zz".to_owned()])
-            .collect();
-        let reply = ingest(&kit, &api_key, json!({ "text": words.join(" ") })).await;
-        assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.body);
-        assert!(reply.body["chunks"].as_u64().unwrap_or(0) > 50);
+        // 110 single-chunk documents, 50 of them carrying the marker
+        // word: df(zz) = 50 of N = 110 stays under the stopword ratio,
+        // so q=zz has a real match set of 50 — bigger than any limit
+        // under test — and one chunk per document keeps the set's size
+        // exactly the ingest count.
+        for i in 0..50 {
+            let reply = ingest(
+                &kit,
+                &api_key,
+                json!({ "text": format!("zz marker{i:03} gate") }),
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.body);
+            assert_eq!(reply.body["chunks"], 1, "fixture documents are one chunk");
+        }
+        for i in 0..60 {
+            let reply = ingest(
+                &kit,
+                &api_key,
+                json!({ "text": format!("filler{i:03} gate plain") }),
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.body);
+        }
+        assert_eq!(count_of(&kit, "sg_chunks"), 110);
 
         let result_count = |reply: &Reply| -> usize {
             assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
@@ -706,6 +735,337 @@ async fn empty_query_answers_empty_results_and_limit_clamps_to_the_hard_range() 
             absent_q.body["results"].as_array().expect("results").len(),
             0
         );
+    }
+}
+
+/// The stopword rule, once the corpus is big enough to measure: a term
+/// in more than half the chunks is dropped before any postings are read,
+/// and so is a term this tenant never indexed. Both answer empty — there
+/// is no result set that "matched everything" would be useful for.
+#[pollster::test]
+async fn a_majority_term_and_an_unindexed_term_retrieve_nothing() {
+    for kit in kits() {
+        let tenant = mint_tenant(&kit, "Stopword").await;
+        let api_key = body_str(&tenant, "api_key");
+
+        // Ten single-chunk documents, nine carrying the boilerplate
+        // word: df = 9 of N = 10, ratio 0.9, past the 0.5 line.
+        for i in 0..9 {
+            let reply = ingest(
+                &kit,
+                &api_key,
+                json!({ "text": format!("boilerplate doc{i:03} unique{i:03}") }),
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.body);
+        }
+        let odd_one = ingest(
+            &kit,
+            &api_key,
+            json!({ "text": "filler000 the one document without it" }),
+        )
+        .await;
+        assert_eq!(odd_one.status, StatusCode::CREATED, "{}", odd_one.body);
+        assert_eq!(count_of(&kit, "sg_chunks"), 10);
+
+        for (query, why) in [
+            ("q=boilerplate", "a term in 9 of 10 chunks is a stopword"),
+            ("q=neverindexed", "a term with df 0 has nothing to find"),
+        ] {
+            let reply = search(&kit, &api_key, query).await;
+            assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+            assert_eq!(
+                reply.body["results"].as_array().expect("results").len(),
+                0,
+                "{why}: {}",
+                reply.body
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Issue #31: the persisted corpus statistics (`sg_terms`,
+// `sg_tenant_stats`) are exact, and the bounded fetch scores exactly
+// what an unbounded fetch would.
+// ---------------------------------------------------------------------
+
+/// `(term, df)` pairs one tenant carries in `sg_terms`, term order.
+async fn persisted_dfs(kit: &TestHarness, tenant_id: &str) -> Vec<(String, u64)> {
+    let rows = kit
+        .db
+        .query(&Statement::new(format!(
+            "SELECT term, df FROM sg_terms WHERE tenant_id = '{tenant_id}' ORDER BY term"
+        )))
+        .await
+        .expect("sg_terms reads");
+    rows.rows
+        .iter()
+        .map(|row| (row.get("term").expect("term"), row.get("df").expect("df")))
+        .collect()
+}
+
+/// The same pairs recounted the expensive way, off `sg_postings` — the
+/// count the ingest path must never have to run.
+async fn recounted_dfs(kit: &TestHarness, tenant_id: &str) -> Vec<(String, u64)> {
+    let rows = kit
+        .db
+        .query(&Statement::new(format!(
+            "SELECT term, COUNT(*) AS df FROM sg_postings WHERE tenant_id = '{tenant_id}' \
+             GROUP BY term ORDER BY term"
+        )))
+        .await
+        .expect("sg_postings recount runs");
+    rows.rows
+        .iter()
+        .map(|row| (row.get("term").expect("term"), row.get("df").expect("df")))
+        .collect()
+}
+
+/// `(n_chunks, total_len)` from `sg_tenant_stats`.
+async fn persisted_tenant_stats(kit: &TestHarness, tenant_id: &str) -> (u64, u64) {
+    let rows = kit
+        .db
+        .query(&Statement::new(format!(
+            "SELECT n_chunks, total_len FROM sg_tenant_stats WHERE tenant_id = '{tenant_id}'"
+        )))
+        .await
+        .expect("sg_tenant_stats reads");
+    let row = rows.rows.first().expect("the tenant has a stats row");
+    (
+        row.get("n_chunks").expect("n_chunks"),
+        row.get("total_len").expect("total_len"),
+    )
+}
+
+/// The same pair recounted off `sg_chunks`.
+async fn recounted_tenant_stats(kit: &TestHarness, tenant_id: &str) -> (u64, u64) {
+    let rows = kit
+        .db
+        .query(&Statement::new(format!(
+            "SELECT COUNT(*) AS n, SUM(term_count) AS total FROM sg_chunks \
+             WHERE tenant_id = '{tenant_id}'"
+        )))
+        .await
+        .expect("sg_chunks recount runs");
+    let row = rows.rows.first().expect("an aggregate row");
+    (row.get("n").expect("n"), row.get("total").expect("total"))
+}
+
+/// Both tables match both recounts for every tenant named, and no
+/// statistics exist for anybody else.
+async fn assert_tenant_stats_exact(kit: &TestHarness, tenant_ids: &[&str]) {
+    for tenant_id in tenant_ids {
+        assert_eq!(
+            persisted_dfs(kit, tenant_id).await,
+            recounted_dfs(kit, tenant_id).await,
+            "sg_terms equals the recount for {tenant_id}"
+        );
+        assert_eq!(
+            persisted_tenant_stats(kit, tenant_id).await,
+            recounted_tenant_stats(kit, tenant_id).await,
+            "sg_tenant_stats equals the recount for {tenant_id}"
+        );
+    }
+    let listed = tenant_ids
+        .iter()
+        .map(|id| format!("'{id}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert_eq!(
+        count_of(kit, "sg_tenant_stats"),
+        tenant_ids.len(),
+        "no tenant stats beyond the tenants with chunks"
+    );
+    assert_eq!(
+        count_where(kit, "sg_terms", &format!("tenant_id NOT IN ({listed})")),
+        0,
+        "no df rows beyond the tenants with chunks"
+    );
+}
+
+/// Ingest, a second tenant, a re-ingest of the same content (which the
+/// API cannot help but index again: a fresh source id mints fresh
+/// content-addressed chunk ids), and a genuine replay through the store
+/// primitive — rejected by the source primary key, rolled back whole.
+/// After every step, the persisted statistics equal a full recount.
+#[pollster::test]
+async fn persisted_statistics_equal_a_full_recount_through_ingest_re_ingest_and_replay() {
+    for kit in kits() {
+        let a = mint_tenant(&kit, "Stats A").await;
+        let b = mint_tenant(&kit, "Stats B").await;
+        let (a_key, a_id) = (body_str(&a, "api_key"), body_str(&a, "tenant_id"));
+        let (b_key, b_id) = (body_str(&b, "api_key"), body_str(&b, "tenant_id"));
+
+        // One multi-chunk document and one single-chunk one for A, with
+        // a shared term so the increments stack; different words for B.
+        let doc_one: String = (0..400)
+            .map(|i| format!("word{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let doc_two = "shared quokka habitat notes with shared repeats".to_owned();
+        let doc_three: String = (0..300)
+            .map(|i| format!("other{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let first = ingest(&kit, &a_key, json!({ "title": "One", "text": doc_one })).await;
+        assert_eq!(first.status, StatusCode::CREATED, "{}", first.body);
+        let second = ingest(&kit, &a_key, json!({ "title": "Two", "text": doc_two })).await;
+        assert_eq!(second.status, StatusCode::CREATED, "{}", second.body);
+        assert_tenant_stats_exact(&kit, &[&a_id]).await;
+
+        // B's arrival must not move A's numbers, and B's must be right.
+        let third = ingest(&kit, &b_key, json!({ "title": "Three", "text": doc_three })).await;
+        assert_eq!(third.status, StatusCode::CREATED, "{}", third.body);
+        assert_tenant_stats_exact(&kit, &[&a_id, &b_id]).await;
+
+        // The same content again: the increments land a second time,
+        // under fresh chunk ids, and the recount still matches.
+        let again = ingest(
+            &kit,
+            &a_key,
+            json!({ "title": "One again", "text": doc_one }),
+        )
+        .await;
+        assert_eq!(again.status, StatusCode::CREATED, "{}", again.body);
+        assert_ne!(
+            body_str(&again.body, "source_id"),
+            body_str(&first.body, "source_id"),
+            "a re-ingest is a new source"
+        );
+        assert_tenant_stats_exact(&kit, &[&a_id, &b_id]).await;
+
+        // A replay — same source id, same chunk ids — fails the source
+        // primary key and rolls the whole batch back, statistics
+        // included: the guarded increments cannot count what never
+        // landed.
+        let source_id = body_str(&first.body, "source_id");
+        let chunks = Chunker::default().split(&a_id, &source_id, &doc_one);
+        assert!(chunks.len() > 1, "the fixture spans several chunks");
+        let replay = store::insert_source_with_chunks(
+            kit.db.as_ref(),
+            &SourceRow {
+                id: source_id,
+                tenant_id: a_id.clone(),
+                title: "One".to_owned(),
+                url: None,
+                external_id: None,
+                byte_len: i64::try_from(doc_one.len()).expect("byte length fits"),
+                created_at: "2026-01-01T00:00:00Z".to_owned(),
+                updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            },
+            &chunks,
+        )
+        .await;
+        assert!(replay.is_err(), "the source primary key rejects the replay");
+        assert_tenant_stats_exact(&kit, &[&a_id, &b_id]).await;
+    }
+}
+
+/// Bounded-fetch scoring parity: what `/search` returns must equal an
+/// unbounded rank of the tenant's **full** postings — same order,
+/// bit-equal scores. The fetched subset decides which chunks get a
+/// contribution; it must never move a weight, because df and N come from
+/// the persisted statistics, not from the rows.
+#[pollster::test]
+async fn search_scores_equal_an_unbounded_rank_of_the_full_postings() {
+    for kit in kits() {
+        let tenant = mint_tenant(&kit, "Parity").await;
+        let api_key = body_str(&tenant, "api_key");
+        let tenant_id = body_str(&tenant, "tenant_id");
+        let a = ingest(
+            &kit,
+            &api_key,
+            json!({ "title": "Quokka", "text": QUOKKA_DOC }),
+        )
+        .await;
+        let b = ingest(
+            &kit,
+            &api_key,
+            json!({ "title": "Kangaroo", "text": KANGAROO_DOC }),
+        )
+        .await;
+        let (a_id, b_id) = (
+            body_str(&a.body, "source_id"),
+            body_str(&b.body, "source_id"),
+        );
+
+        // The unbounded reference, the expensive shape the old
+        // per-request aggregates had: every chunk, every posting row, df
+        // counted from the corpus.
+        let chunks: Vec<module_support::chunk::Chunk> = [
+            Chunker::default().split(&tenant_id, &a_id, QUOKKA_DOC),
+            Chunker::default().split(&tenant_id, &b_id, KANGAROO_DOC),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let mut df: HashMap<String, u64> = HashMap::new();
+        for chunk in &chunks {
+            for (term, _) in &chunk.terms {
+                *df.entry(term.clone()).or_insert(0) += 1;
+            }
+        }
+        #[expect(clippy::cast_precision_loss)]
+        let avg_length = {
+            let total: u64 = chunks.iter().map(|chunk| u64::from(chunk.length)).sum();
+            let count = u64::try_from(chunks.len()).expect("count fits");
+            total as f64 / count as f64
+        };
+        let corpus = bm25::Corpus {
+            chunk_count: u64::try_from(chunks.len()).expect("count fits"),
+            avg_length,
+        };
+
+        // The query path's accumulation shape, unbounded: the terms in
+        // query order, each term's rows by tf descending, chunk_id
+        // ascending.
+        let kept = ["quokka".to_owned(), "kangaroo".to_owned()];
+        let mut postings: Vec<bm25::Posting> = Vec::new();
+        for term in &kept {
+            let mut rows: Vec<bm25::Posting> = chunks
+                .iter()
+                .filter_map(|chunk| {
+                    let tf = chunk
+                        .terms
+                        .iter()
+                        .find(|(candidate, _)| candidate == term)
+                        .map(|(_, tf)| *tf)?;
+                    Some(bm25::Posting {
+                        chunk_id: chunk.id.clone(),
+                        term: term.clone(),
+                        tf,
+                        length: chunk.length,
+                    })
+                })
+                .collect();
+            rows.sort_by(|x, y| y.tf.cmp(&x.tf).then_with(|| x.chunk_id.cmp(&y.chunk_id)));
+            postings.extend(rows);
+        }
+        let expected = bm25::rank(&kept, &postings, &df, &corpus, &bm25::Params::default());
+
+        let reply = search(&kit, &api_key, "q=quokka+kangaroo").await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        let results = reply.body["results"].as_array().expect("results");
+        assert_eq!(results.len(), expected.len(), "{}", reply.body);
+        for (hit, want) in results.iter().zip(&expected) {
+            assert_eq!(
+                hit["chunk_id"].as_str().expect("chunk id"),
+                want.chunk_id,
+                "order: {}",
+                reply.body
+            );
+            // Bit equality, not "close": the bounded fetch reads every
+            // row the reference does, so the sums are the same
+            // additions in the same order.
+            assert_eq!(
+                hit["score"].as_f64().expect("score").to_bits(),
+                want.score.to_bits(),
+                "score parity for {}",
+                want.chunk_id
+            );
+        }
     }
 }
 
@@ -2512,9 +2872,24 @@ async fn the_scheduled_reindex_reclaims_a_v1_index_for_japanese_queries() {
                  ('{}', '{v1_term}', '{}', 1)",
                 seeded.tenant_id, seeded.chunk_id
             ),
+            // The statistics a v1 index carried (what migration 0007's
+            // backfill derives from it): the one run term, length 1.
+            format!(
+                "DELETE FROM sg_terms WHERE tenant_id = '{}'",
+                seeded.tenant_id
+            ),
+            format!(
+                "INSERT INTO sg_terms (tenant_id, term, df) VALUES ('{}', '{v1_term}', 1)",
+                seeded.tenant_id
+            ),
+            format!(
+                "UPDATE sg_tenant_stats SET total_len = 1 WHERE tenant_id = '{}'",
+                seeded.tenant_id
+            ),
         ] {
             pollster::block_on(kit.db.execute(&Statement::new(sql))).expect("v1 simulation runs");
         }
+        assert_stats_exact(&kit, "for the simulated v1 index");
 
         // The natural query misses: v1 matches only the exact full run.
         let before = search(
@@ -2560,6 +2935,12 @@ async fn the_scheduled_reindex_reclaims_a_v1_index_for_japanese_queries() {
         });
         assert!(term_count > 1, "bigrams were written: {term_count}");
         assert_eq!(term_count, posting_sum, "term_count matches the postings");
+        // The re-index moved the statistics with the rows: the v1 run
+        // term is gone from sg_terms, the bigrams are in, and the
+        // tenant's total length is the new term count.
+        assert!(assert_stats_exact(&kit, "after the re-index") > 1);
+        assert_eq!(df_of(&kit, &seeded.tenant_id, v1_term), None);
+        assert_eq!(df_of(&kit, &seeded.tenant_id, "パス"), Some(1));
 
         // And the same query now finds the document.
         let after = search(
@@ -2738,5 +3119,277 @@ async fn a_german_clarify_is_rendered_in_german() {
             "Ich möchte Ihnen eine fundierte Antwort geben statt einer schnellen falschen — \
              könnten Sie die Frage umformulieren oder ein paar Einzelheiten ergänzen?"
         );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Issue #31 on the source-management paths: every manual write keeps
+// the persisted statistics equal to a full recount.
+// ---------------------------------------------------------------------
+
+/// Manual ingest, the diff-based `PUT` replace (kept, vanished and added
+/// windows in one batch), the `external_id` re-ingest that replaces in
+/// place, and `DELETE` — after each, `sg_terms` and `sg_tenant_stats`
+/// equal a recount, a term no chunk carries any more has no row, and a
+/// tenant with no chunks has no stats row. Tenant B's numbers never move.
+#[pollster::test]
+async fn statistics_stay_exact_through_manual_replace_reingest_and_delete() {
+    for kit in kits() {
+        let a = mint_tenant(&kit, "Stats manual A").await;
+        let b = mint_tenant(&kit, "Stats manual B").await;
+        let (a_key, a_id) = (body_str(&a, "api_key"), body_str(&a, "tenant_id"));
+        let b_key = body_str(&b, "api_key");
+
+        let words: Vec<String> = (0..400).map(|i| format!("word{i:03}")).collect();
+        let original = words.join(" ");
+        let created = ingest(
+            &kit,
+            &a_key,
+            json!({ "title": "Doc", "external_id": "doc", "text": original }),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+        let source_id = body_str(&created.body, "source_id");
+        let other = ingest(
+            &kit,
+            &a_key,
+            json!({ "title": "Other", "text": "word000 quokka habitat notes" }),
+        )
+        .await;
+        assert_eq!(other.status, StatusCode::CREATED, "{}", other.body);
+        let b_doc = ingest(
+            &kit,
+            &b_key,
+            json!({ "title": "B", "text": "word000 kangaroo pouch notes" }),
+        )
+        .await;
+        assert_eq!(b_doc.status, StatusCode::CREATED, "{}", b_doc.body);
+        assert!(assert_stats_exact(&kit, "after three ingests") > 400);
+        assert_eq!(df_of(&kit, &a_id, "word000"), Some(2));
+        assert_eq!(df_of(&kit, &a_id, "word205"), Some(1));
+
+        // A PUT that changes words 200..210: the windows spanning them
+        // vanish, new ones arrive, the rest are kept untouched.
+        let mut edited = words.clone();
+        for (i, word) in edited.iter_mut().enumerate() {
+            if (200..210).contains(&i) {
+                *word = format!("mark{i:03}");
+            }
+        }
+        let put = send(
+            &kit.router,
+            Method::PUT,
+            &source_path(&source_id),
+            Some(&a_key),
+            Some(
+                &json!({ "title": "Doc", "external_id": "doc", "text": edited.join(" ") })
+                    .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(put.status, StatusCode::OK, "{}", put.body);
+        assert_stats_exact(&kit, "after the PUT replace");
+        assert_eq!(
+            df_of(&kit, &a_id, "word205"),
+            None,
+            "a vanished term has no row"
+        );
+        assert_eq!(df_of(&kit, &a_id, "mark205"), Some(1));
+        let hits = search(&kit, &a_key, "q=word205").await;
+        assert_eq!(hits.body["results"].as_array().expect("results").len(), 0);
+
+        // Re-ingesting the external id replaces in place — back to the
+        // original text.
+        let again = ingest(
+            &kit,
+            &a_key,
+            json!({ "title": "Doc", "external_id": "doc", "text": original }),
+        )
+        .await;
+        assert_eq!(again.status, StatusCode::OK, "{}", again.body);
+        assert_eq!(body_str(&again.body, "source_id"), source_id);
+        assert_stats_exact(&kit, "after the external_id re-ingest");
+        assert_eq!(df_of(&kit, &a_id, "mark205"), None);
+        assert_eq!(df_of(&kit, &a_id, "word205"), Some(1));
+
+        // A replace to the same text is a no-op diff: nothing moves.
+        let same = send(
+            &kit.router,
+            Method::PUT,
+            &source_path(&source_id),
+            Some(&a_key),
+            Some(&json!({ "title": "Doc", "external_id": "doc", "text": original }).to_string()),
+        )
+        .await;
+        assert_eq!(same.status, StatusCode::OK, "{}", same.body);
+        assert_stats_exact(&kit, "after an unchanged PUT");
+        assert_eq!(df_of(&kit, &a_id, "word000"), Some(2));
+
+        // DELETE takes the source's whole contribution with it.
+        let deleted = send(
+            &kit.router,
+            Method::DELETE,
+            &source_path(&source_id),
+            Some(&a_key),
+            None,
+        )
+        .await;
+        assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{}", deleted.body);
+        assert_stats_exact(&kit, "after DELETE");
+        assert_eq!(
+            df_of(&kit, &a_id, "word000"),
+            Some(1),
+            "the other doc's share stays"
+        );
+        assert_eq!(df_of(&kit, &a_id, "word399"), None);
+
+        // Deleting the tenant's last source leaves no statistics at all
+        // for it, and B's are untouched throughout.
+        let last = send(
+            &kit.router,
+            Method::DELETE,
+            &source_path(&body_str(&other.body, "source_id")),
+            Some(&a_key),
+            None,
+        )
+        .await;
+        assert_eq!(last.status, StatusCode::NO_CONTENT, "{}", last.body);
+        assert_stats_exact(&kit, "after deleting A's last source");
+        assert_eq!(
+            count_where(&kit, "sg_tenant_stats", &format!("tenant_id = '{a_id}'")),
+            0
+        );
+        assert_eq!(
+            count_where(&kit, "sg_terms", &format!("tenant_id = '{a_id}'")),
+            0
+        );
+        let b_hits = search(&kit, &b_key, "q=kangaroo").await;
+        assert_eq!(b_hits.body["results"].as_array().expect("results").len(), 1);
+    }
+}
+
+/// A replace that shrinks a long document to one window and grows it
+/// back — the vanished and added sets both span more than one statement
+/// batch of ids — keeps the statistics exact in both directions.
+#[pollster::test]
+async fn statistics_stay_exact_when_a_replace_moves_many_windows_at_once() {
+    for kit in kits() {
+        let tenant = mint_tenant(&kit, "Stats many").await;
+        let api_key = body_str(&tenant, "api_key");
+        // Over 120 windows (the id batch of one statement) in one inline
+        // document: mostly one-character words, so 20 000 words fit the
+        // 48 KiB ceiling, with a two-character term every seventh word so
+        // the windows carry postings too. A cheap LCG keeps the windows
+        // distinct, so none are deduplicated away.
+        let letters: Vec<char> = "abcdefghijklmnopqrstuvwxyz0123456789".chars().collect();
+        let mut seed: u64 = 0x5eed;
+        let long: String = (0..20_000)
+            .map(|i| {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let pick = usize::try_from(seed >> 58).expect("six bits") % letters.len();
+                if i % 7 == 0 {
+                    format!("{}{}", letters[pick], letters[(i / 7) % letters.len()])
+                } else {
+                    letters[pick].to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(long.len() < 48 * 1024, "{}", long.len());
+        let created = ingest(
+            &kit,
+            &api_key,
+            json!({ "external_id": "long", "text": long }),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+        assert!(
+            created.body["chunks"].as_u64().expect("chunks") > 120,
+            "the fixture must span more than one id batch: {}",
+            created.body
+        );
+        assert_stats_exact(&kit, "after the long ingest");
+
+        let short = ingest(
+            &kit,
+            &api_key,
+            json!({ "external_id": "long", "text": "short replacement text" }),
+        )
+        .await;
+        assert_eq!(short.status, StatusCode::OK, "{}", short.body);
+        assert_stats_exact(&kit, "after shrinking to one window");
+
+        let back = ingest(
+            &kit,
+            &api_key,
+            json!({ "external_id": "long", "text": long }),
+        )
+        .await;
+        assert_eq!(back.status, StatusCode::OK, "{}", back.body);
+        assert_stats_exact(&kit, "after growing back");
+    }
+}
+
+/// Migration 0007 on an index that predates it: the backfill derives
+/// `sg_terms` and `sg_tenant_stats` from the existing rows (only postings
+/// whose chunk exists count), and re-running it changes nothing — it
+/// never double-counts what the write paths already maintain.
+#[pollster::test]
+async fn the_search_stats_migration_backfills_an_existing_index_exactly_once() {
+    for kit in kits() {
+        let a = mint_tenant(&kit, "Backfill A").await;
+        let b = mint_tenant(&kit, "Backfill B").await;
+        let long: String = (0..400)
+            .map(|i| format!("word{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for (tenant, text) in [
+            (&a, long.as_str()),
+            (&a, "word000 quokka habitat"),
+            (&b, "kangaroo pouch word000"),
+        ] {
+            let reply = ingest(&kit, &body_str(tenant, "api_key"), json!({ "text": text })).await;
+            assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.body);
+        }
+        let exact = assert_stats_exact(&kit, "before the backfill simulation");
+
+        // What a pre-0007 database holds: the index, no statistics — and
+        // the old per-term index in place of the tf one.
+        let migration = include_str!("../migrations/sqlite/0007_search_stats.sql");
+        let statements: Vec<String> = migration
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .split(';')
+            .map(str::trim)
+            .filter(|sql| !sql.is_empty())
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(statements.len(), 6, "{statements:?}");
+        for sql in [
+            "DROP TABLE sg_terms",
+            "DROP TABLE sg_tenant_stats",
+            "DROP INDEX idx_sg_postings_tenant_term_tf",
+            "CREATE INDEX idx_sg_postings_tenant_term ON sg_postings (tenant_id, term)",
+        ] {
+            pollster::block_on(kit.db.execute(&Statement::new(sql))).expect("pre-0007 shape");
+        }
+
+        for run in ["the first run", "a second run"] {
+            for sql in &statements {
+                pollster::block_on(kit.db.execute(&Statement::new(sql.as_str())))
+                    .unwrap_or_else(|e| panic!("{run}: {sql}: {e:?}"));
+            }
+            assert_eq!(
+                assert_stats_exact(&kit, &format!("after {run} of the backfill")),
+                exact,
+                "{run} backfills every term exactly once"
+            );
+        }
+        assert_eq!(df_of(&kit, &body_str(&a, "tenant_id"), "word000"), Some(2));
+        assert_eq!(df_of(&kit, &body_str(&b, "tenant_id"), "word000"), Some(1));
     }
 }

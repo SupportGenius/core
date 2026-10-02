@@ -1,0 +1,34 @@
+[package]
+name = "evals"
+description = "Golden-set eval runner for module-support: retrieval, answers and the confidence sweep (issue #38)"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The module under test, driven over its HTTP router exactly like
+# `crates/module-support/tests/routes.rs` drives it.
+module-support = { path = "../crates/module-support" }
+cratefield-core = { workspace = true }
+cratefield-testing = { workspace = true }
+# The `--model anthropic[:ID]` option: harness adapters over the ports the
+# kit already assembles. Native-only — `evals` never builds for wasm.
+cratefield-adapter-anthropic = { workspace = true }
+cratefield-runtime-native = { workspace = true }
+axum = { version = "0.8", default-features = false, features = ["query"] }
+# `ServiceExt::oneshot` drives the router without a network; pinned to the
+# same line cratefield-testing builds against so one tower compiles.
+tower = { version = "0.5.3", features = ["util"] }
+# The in-crate fake model implements the async `TextModel` port.
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Only for the report's `date`; already in the lock via module-support.
+time = { version = "0.3", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

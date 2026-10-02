@@ -37,6 +37,11 @@ jobs:
       # first surface wherever someone runs the migration collector.
       - name: fz, with its cli feature
         run: cargo clippy -p supportgenius --all-targets --locked --features cli -- -D warnings
+      # The binary's `dev_fakes.rs` is compiled only under the `dev-fakes`
+      # feature, which the workspace run above never enables — a lint there
+      # would otherwise first surface wherever someone builds the fakes.
+      - name: dev-fakes, with its stub ports
+        run: cargo clippy -p supportgenius-bin --all-targets --locked --features dev-fakes -- -D warnings
 
   test:
     name: test
@@ -48,6 +53,27 @@ jobs:
           toolchain: "1.98.1"
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
+      # The binary's `dev_fakes.rs` — and the tests over it added in this
+      # diff — are compiled only under the `dev-fakes` feature, so the
+      # workspace run above never builds them.
+      - name: supportgenius-bin, with dev fakes
+        run: cargo test -p supportgenius-bin --locked --features dev-fakes
+
+  evals:
+    # The golden set (issue #38), run with the deterministic `fake` model so
+    # the job needs no API key: it fails on a `recall@6` regression against
+    # `evals/baseline.json`, which is why the baseline is committed source.
+    # Its answer numbers measure retrieval-as-answer, not model quality —
+    # real-model runs are committed under `evals/results/` by hand instead.
+    name: evals (golden set, fake model)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run -p evals --locked -- --model fake
 
   wasm:
     name: worker-build (ventures/supportgenius)

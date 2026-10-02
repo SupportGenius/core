@@ -16,6 +16,11 @@ sha2 = { workspace = true }
 http = { workspace = true }
 # Shared workspace crate: tenant API keys over the Signer port.
 tenancy = { path = "../tenancy" }
+# Shared workspace crate: the one tokenizer and Okapi BM25, moved out of
+# this module so escalation's duplicate scoring can tokenize with the
+# same rules. Re-exported from lib.rs/chunk.rs, so callers here are
+# unchanged.
+lexical = { path = "../lexical" }
 # sea-query stays on 0.32 with the same feature set the published waitlist
 # module uses, so one backend feature union serves the whole graph and
 # `Statement` values round-trip through core unchanged.
@@ -27,6 +32,14 @@ bytes = "1"
 axum = { version = "0.8", default-features = false, features = ["query"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# PDF text extraction for the upload extract job (issue #30). Pure Rust
+# with a lean, wasm-safe dependency set at these features (the parser is
+# `pom`, not `nom`), so the same extraction runs in a Worker isolate and
+# in the native binary — no feature gate, no second implementation.
+lopdf = { version = "0.32.0", default-features = false, features = ["pom_parser"] }
+# Structured logs from the extract drain and the abandoned-upload GC —
+# work that happens outside any request.
+tracing = { workspace = true }
 time = { version = "0.3", default-features = false, features = [
     "std",
     "formatting",
@@ -44,7 +57,18 @@ getrandom = { workspace = true }
 [dev-dependencies]
 # The parity leg (Postgres) needs the `postgres` feature on the kit.
 cratefield-testing = { workspace = true, features = ["postgres"] }
+# The SRI drift test hashes `w.js` the way a browser's
+# `integrity="sha384-…"` attribute does: SHA-384 (already a dependency)
+# plus standard base64.
+base64 = "0.23"
+# The test's counting `RateLimiter` implements the `#[async_trait]` port.
+async-trait = { workspace = true }
 pollster = { workspace = true }
+# The scoring-parity tests compare response scores bit for bit with an
+# in-process rank. serde_json's default float parser is fast but can be
+# one ULP off; `float_roundtrip` makes the test-side parse exact, so a
+# mismatch means the fetch, not the JSON, moved the number.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 # `ServiceExt::oneshot` drives the router without a network; pinned to
 # the same line cratefield-testing builds against so one tower compiles.
 tower = { version = "0.5.3", features = ["util"] }

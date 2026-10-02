@@ -1,7 +1,8 @@
 //! Query-side ranking: Okapi BM25 computed in Rust over the postings rows
 //! the caller fetched.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::BuildHasher;
 
 /// BM25's two knobs.
 ///
@@ -33,7 +34,7 @@ pub struct Posting {
     pub chunk_id: String,
     /// The indexed term. Compared exactly against the query terms, so
     /// both sides must have gone through the same
-    /// [`tokenize`](crate::chunk::tokenize) — the shared tokenizer is what
+    /// [`tokenize`](crate::tokenize) — the shared tokenizer is what
     /// guarantees that.
     pub term: String,
     /// How often the term occurs in the chunk.
@@ -64,15 +65,23 @@ pub struct Scored {
 ///
 /// # Preconditions
 ///
-/// The result is only as honest as `postings` is complete: [`Corpus`]
-/// gives the tenant's `N`, and `df(term)` is counted as the number of
-/// distinct chunk ids **in `postings`** with that term. That is exact if
-/// and only if the caller fetched every posting for the query's terms
-/// within the tenant. A `LIMIT` on that SQL is the silent way to break
-/// ranking: it deflates `df`, inflates `idf`, and reorders results with
-/// no error anywhere. Duplicate query terms are counted once (standard
-/// BM25 with qtf = 1), postings whose term is not in the query are
-/// ignored, and a chunk's score is the sum over its postings:
+/// `df` carries each term's document frequency — the number of the
+/// tenant's chunks containing it — and [`Corpus`] the tenant's `N`, both
+/// read from the persisted statistics (`sg_terms`, `sg_tenant_stats`),
+/// not counted from `postings`. That is the contract that makes a
+/// bounded fetch safe: the caller **may** truncate `postings` per term
+/// (the query path fetches each term's top
+/// `module_support::store::MAX_POSTINGS_PER_TERM` chunks
+/// by tf), because the idf can no longer be deflated by missing rows.
+/// What truncation costs is a contribution, not a wrong weight: a chunk
+/// outside a term's top rows is scored without that term, which is the
+/// documented, intended trade for a query cost that stays flat as the
+/// corpus grows.
+///
+/// Duplicate query terms are counted once (standard BM25 with qtf = 1),
+/// postings whose term is not in the query — or whose term is absent
+/// from `df`, i.e. df 0, never indexed — are ignored, and a chunk's
+/// score is the sum over its postings:
 ///
 /// ```text
 /// idf(t)   = ln(1 + (N - df + 0.5) / (df + 0.5))
@@ -90,9 +99,10 @@ pub struct Scored {
 /// Returned sorted by score descending, ties broken by `chunk_id`
 /// ascending, using [`f64::total_cmp`] so the order is deterministic and
 /// NaN-free even for equal or pathological scores.
-pub fn rank(
+pub fn rank<S: BuildHasher>(
     query_terms: &[String],
     postings: &[Posting],
+    df: &HashMap<String, u64, S>,
     corpus: &Corpus,
     params: &Params,
 ) -> Vec<Scored> {
@@ -101,28 +111,23 @@ pub fn rank(
         return Vec::new();
     }
 
-    // df: term -> distinct chunk ids among the fetched postings. A set,
-    // not a count, because defensive duplicates in the rows must not
-    // count twice.
-    let mut df: HashMap<&str, HashSet<&str>> = HashMap::new();
-    for posting in postings {
-        if query.contains(posting.term.as_str()) {
-            df.entry(posting.term.as_str())
-                .or_default()
-                .insert(posting.chunk_id.as_str());
-        }
-    }
-
     // N and df as f64: a support corpus is nowhere near 2^53 chunks, so
     // the precision this cast loses cannot surface in an idf.
     #[expect(clippy::cast_precision_loss)]
     let n = corpus.chunk_count as f64;
-    let idf: HashMap<&str, f64> = df
+    let idf: HashMap<&str, f64> = query
         .iter()
-        .map(|(term, chunks)| {
+        .filter_map(|term| {
+            let term_df = *df.get(*term).unwrap_or(&0);
+            if term_df == 0 {
+                // Never indexed by this tenant: there is nothing to
+                // weight, and a df of 0 in the formula would be a
+                // maximum idf for a term that has no rows behind it.
+                return None;
+            }
             #[expect(clippy::cast_precision_loss)]
-            let df = chunks.len() as f64;
-            (*term, (1.0 + (n - df + 0.5) / (df + 0.5)).ln())
+            let df = term_df as f64;
+            Some((*term, (1.0 + (n - df + 0.5) / (df + 0.5)).ln()))
         })
         .collect();
 
@@ -176,6 +181,14 @@ mod tests {
         }
     }
 
+    /// The persisted df map a caller would read out of `sg_terms`.
+    fn dfs(pairs: &[(&str, u64)]) -> HashMap<String, u64> {
+        pairs
+            .iter()
+            .map(|(term, df)| ((*term).to_string(), *df))
+            .collect()
+    }
+
     #[test]
     fn score_matches_the_formula_hand_computed() {
         // One term, one posting, tiny corpus. N = 4, df = 1, tf = 2,
@@ -188,8 +201,9 @@ mod tests {
             avg_length: 5.0,
         };
         let query = ["retry".to_string()];
+        let df = dfs(&[("retry", 1)]);
 
-        let ranked = rank(&query, &postings, &corpus, &Params::default());
+        let ranked = rank(&query, &postings, &df, &corpus, &Params::default());
         assert_eq!(ranked.len(), 1);
         assert_eq!(ranked[0].chunk_id, "c1");
 
@@ -212,8 +226,9 @@ mod tests {
             avg_length: 10.0,
         };
         let query = ["rarity".to_string(), "common".to_string()];
+        let df = dfs(&[("rarity", 1), ("common", 90)]);
 
-        let ranked = rank(&query, &postings, &corpus, &Params::default());
+        let ranked = rank(&query, &postings, &df, &corpus, &Params::default());
         let score_of = |id: &str| {
             ranked
                 .iter()
@@ -238,8 +253,9 @@ mod tests {
             avg_length: 27.5,
         };
         let query = ["timeout".to_string()];
+        let df = dfs(&[("timeout", 2)]);
 
-        let ranked = rank(&query, &postings, &corpus, &Params::default());
+        let ranked = rank(&query, &postings, &df, &corpus, &Params::default());
         assert_eq!(ranked.len(), 2);
         assert_eq!(ranked[0].chunk_id, "short");
         assert!(ranked[0].score > ranked[1].score);
@@ -258,8 +274,9 @@ mod tests {
             avg_length: 10.0,
         };
         let query = ["outage".to_string()];
+        let df = dfs(&[("outage", 2)]);
 
-        let ranked = rank(&query, &postings, &corpus, &Params::default());
+        let ranked = rank(&query, &postings, &df, &corpus, &Params::default());
         assert_eq!(ranked[0].chunk_id, "saturated");
         let (saturated, sparse) = (ranked[0].score, ranked[1].score);
         assert!(saturated > sparse);
@@ -279,9 +296,10 @@ mod tests {
             avg_length: 10.0,
         };
         let query = ["term".to_string()];
+        let df = dfs(&[("term", 2)]);
 
-        let first = rank(&query, &postings, &corpus, &Params::default());
-        let second = rank(&query, &postings, &corpus, &Params::default());
+        let first = rank(&query, &postings, &df, &corpus, &Params::default());
+        let second = rank(&query, &postings, &df, &corpus, &Params::default());
         assert_eq!(first[0].chunk_id, "alpha-chunk");
         assert_eq!(first[1].chunk_id, "beta-chunk");
         // Bit equality, not a float comparison: identical arithmetic must
@@ -302,6 +320,7 @@ mod tests {
     #[test]
     fn degenerate_corpus_stays_finite() {
         let query = ["recovery".to_string()];
+        let df = dfs(&[("recovery", 1)]);
         for corpus in [
             Corpus {
                 chunk_count: 0,
@@ -315,6 +334,7 @@ mod tests {
             let ranked = rank(
                 &query,
                 &[posting("c1", "recovery", 3, 7)],
+                &df,
                 &corpus,
                 &Params::default(),
             );
@@ -339,8 +359,9 @@ mod tests {
             chunk_count: 2,
             avg_length: 110.0,
         };
+        let df = dfs(&[("refund", 2), ("window", 2)]);
 
-        let ranked = rank(&query, &postings, &corpus, &Params::default());
+        let ranked = rank(&query, &postings, &df, &corpus, &Params::default());
         assert_eq!(ranked.len(), 2);
         assert_eq!(ranked[0].chunk_id, "billing-doc");
         assert!(ranked[0].score > ranked[1].score);
@@ -353,11 +374,12 @@ mod tests {
             chunk_count: 3,
             avg_length: 8.0,
         };
+        let df = dfs(&[("cat", 1)]);
         let once = ["cat".to_string()];
         let twice = ["cat".to_string(), "cat".to_string()];
 
-        let a = rank(&once, &postings, &corpus, &Params::default());
-        let b = rank(&twice, &postings, &corpus, &Params::default());
+        let a = rank(&once, &postings, &df, &corpus, &Params::default());
+        let b = rank(&twice, &postings, &df, &corpus, &Params::default());
         // Bit equality: "counted once" means the duplicate never entered
         // the sum, not merely that it made no visible difference.
         assert_eq!(a[0].score.to_bits(), b[0].score.to_bits());
@@ -376,9 +398,10 @@ mod tests {
             avg_length: 8.0,
         };
         let query = ["cat".to_string()];
+        let df = dfs(&[("cat", 2)]);
 
-        let a = rank(&query, &with_noise, &corpus, &Params::default());
-        let b = rank(&query, &without_noise, &corpus, &Params::default());
+        let a = rank(&query, &with_noise, &df, &corpus, &Params::default());
+        let b = rank(&query, &without_noise, &df, &corpus, &Params::default());
         assert_eq!(a.len(), 2);
         for (scored, expected) in a.iter().zip(&b) {
             assert_eq!(scored.chunk_id, expected.chunk_id);
@@ -397,11 +420,73 @@ mod tests {
             rank(
                 &[],
                 &[posting("c1", "x", 1, 4)],
+                &dfs(&[("x", 1)]),
                 &corpus,
                 &Params::default()
             )
             .is_empty()
         );
-        assert!(rank(&["x".to_string()], &[], &corpus, &Params::default()).is_empty());
+        assert!(
+            rank(
+                &["x".to_string()],
+                &[],
+                &dfs(&[("x", 1)]),
+                &corpus,
+                &Params::default()
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn df_comes_from_the_map_so_a_truncated_term_still_weighs_true() {
+        // "common" is in 50 of the tenant's 50 chunks, but the caller —
+        // as the bounded query path does — fetched only its top two rows
+        // by tf. The idf must come from the persisted df, not from the
+        // two rows: scoring the truncated fetch must reproduce the score
+        // the full postings would give the surviving chunks, bit for bit.
+        let query = ["common".to_string()];
+        let corpus = Corpus {
+            chunk_count: 50,
+            avg_length: 10.0,
+        };
+        let df = dfs(&[("common", 50)]);
+
+        let mut full = Vec::new();
+        for i in 0..50 {
+            full.push(posting(&format!("c{i:02}"), "common", 1, 10));
+        }
+        // What LIMIT 2 would have returned: every tf ties, so the index
+        // yields the two smallest chunk_ids.
+        let truncated = &full[..2];
+
+        let whole = rank(&query, &full, &df, &corpus, &Params::default());
+        let cut = rank(&query, truncated, &df, &corpus, &Params::default());
+        assert_eq!(whole.len(), 50);
+        assert_eq!(cut.len(), 2);
+        for (scored, expected) in cut.iter().zip(&whole) {
+            assert_eq!(scored.chunk_id, expected.chunk_id);
+            assert_eq!(scored.score.to_bits(), expected.score.to_bits());
+        }
+    }
+
+    #[test]
+    fn a_term_absent_from_df_is_ignored_even_if_rows_were_fetched() {
+        // The query path never fetches postings for a df-0 term, so a
+        // row that slips through anyway (a stats/index divergence) must
+        // contribute nothing rather than a runaway idf.
+        let corpus = Corpus {
+            chunk_count: 4,
+            avg_length: 8.0,
+        };
+        let query = ["ghost".to_string()];
+        let ranked = rank(
+            &query,
+            &[posting("c1", "ghost", 3, 8)],
+            &dfs(&[]),
+            &corpus,
+            &Params::default(),
+        );
+        assert!(ranked.is_empty(), "df 0 means no weight, not maximum idf");
     }
 }
