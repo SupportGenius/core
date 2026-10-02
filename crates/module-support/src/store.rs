@@ -37,6 +37,9 @@ pub(crate) const STATUS_ACTIVE: &str = "active";
 /// The label recorded for the first key `POST /admin/tenants` mints.
 pub(crate) const FIRST_KEY_LABEL: &str = "primary";
 
+/// The label `POST /keys` records when the request body names none.
+pub(crate) const DEFAULT_KEY_LABEL: &str = "key";
+
 /// Distinct terms one retrieval may look up and fetch postings for:
 /// after deduping, the first [`MAX_QUERY_TERMS`] terms of the query, the
 /// rest dropped. A support question with more than 32 distinct terms is
@@ -90,6 +93,10 @@ pub(crate) struct TenantRow {
 pub(crate) struct ApiKeyRow {
     pub id: String,
     pub tenant_id: String,
+    /// The key's own id (the column predates per-key ids and keeps its
+    /// name): the `tenancy` key id bound into the credential's signed
+    /// subject, and what `GET`/`DELETE /keys/{kid}` address. Not the
+    /// signing-key generation, which lives in config alone.
     pub kid: String,
     pub label: String,
     pub created_at: String,
@@ -181,6 +188,92 @@ pub(crate) async fn insert_api_key(db: &dyn Database, key: &ApiKeyRow) -> Result
             key.created_at.clone().into(),
         ]);
     execute(db, &Statement::render(&insert)).await
+}
+
+/// The tenant's key row carrying `kid`, scoped to the tenant. This is the
+/// read that makes a row — not merely a valid signature — the thing that
+/// authenticates: a kid with no row, or a row held by another tenant,
+/// returns `None` and the caller answers the same indistinguishable `401`
+/// it answers every other key failure.
+pub(crate) async fn find_api_key(
+    db: &dyn Database,
+    tenant_id: &str,
+    kid: &str,
+) -> Result<Option<ApiKeyRow>, DbError> {
+    let mut select = Query::select();
+    select
+        .columns(["id", "tenant_id", "kid", "label", "created_at"])
+        .from(iden("sg_api_keys"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden("kid")).eq(kid));
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows.rows.first().map(api_key_from))
+}
+
+/// The tenant's key rows, oldest first — the order `created_at` gives,
+/// with the ULID `id` as a tiebreaker so two keys minted in the same
+/// truncated second still list deterministically.
+pub(crate) async fn list_api_keys(
+    db: &dyn Database,
+    tenant_id: &str,
+) -> Result<Vec<ApiKeyRow>, DbError> {
+    let mut select = Query::select();
+    select
+        .columns(["id", "tenant_id", "kid", "label", "created_at"])
+        .from(iden("sg_api_keys"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .order_by(iden("created_at"), sea_query::Order::Asc)
+        .order_by(iden("id"), sea_query::Order::Asc);
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows.rows.iter().map(api_key_from).collect())
+}
+
+/// Atomically deletes the tenant's key row carrying `kid`, refusing in the
+/// same statement when it is the tenant's last key.
+///
+/// The "another key remains" test is an `EXISTS` clause *inside* the
+/// `DELETE`, not a `SELECT` the caller can lose a race against: a separate
+/// list-then-delete lets two concurrent deletes — each authenticated with
+/// the key the other is deleting — both pass the check and leave the
+/// tenant with no key at all. Here the row is removed only if a sibling
+/// row exists at delete time.
+///
+/// Returns the rows removed: `1` on success, `0` when the row is absent
+/// (unknown or another tenant's key) or is the tenant's only key. The
+/// caller tells those two `0`s apart with a follow-up existence read.
+pub(crate) async fn delete_api_key(
+    db: &dyn Database,
+    tenant_id: &str,
+    kid: &str,
+) -> Result<u64, DbError> {
+    // `SELECT 1 FROM sg_api_keys WHERE tenant_id = ? AND kid <> ?`: does a
+    // sibling key remain? A correlated `EXISTS` in the delete condition,
+    // so the whole decision is one atomic statement.
+    let sibling = Query::select()
+        .expr(Expr::value(1))
+        .from(iden("sg_api_keys"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden("kid")).ne(kid))
+        .take();
+    let mut delete = Query::delete();
+    delete
+        .from_table(iden("sg_api_keys"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden("kid")).eq(kid))
+        .and_where(Expr::exists(sibling));
+    db.execute(&Statement::render(&delete)).await
+}
+
+/// One `sg_api_keys` row from a result row, columns as
+/// [`ApiKeyRow`] names them.
+fn api_key_from(row: &cratefield_core::Row) -> ApiKeyRow {
+    ApiKeyRow {
+        id: row.get("id").unwrap_or_default(),
+        tenant_id: row.get("tenant_id").unwrap_or_default(),
+        kid: row.get("kid").unwrap_or_default(),
+        label: row.get("label").unwrap_or_default(),
+        created_at: row.get("created_at").unwrap_or_default(),
+    }
 }
 
 /// The `sg_chunks` insert statements for `chunks` — the source's windows,

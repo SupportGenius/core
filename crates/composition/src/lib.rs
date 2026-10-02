@@ -243,6 +243,19 @@ impl TenantDirectory for SupportTenants {
         };
         module_support::tenant_is_active(db, tenant_id).await
     }
+
+    async fn key_is_live(
+        &self,
+        ctx: &ModuleContext,
+        tenant_id: &str,
+        key_id: &str,
+    ) -> Result<bool, cratefield_core::DbError> {
+        // No database means no key can be shown on record: refuse.
+        let Some(db) = ctx.ports.db.as_deref() else {
+            return Ok(false);
+        };
+        module_support::api_key_is_live(db, tenant_id, key_id).await
+    }
 }
 
 /// Adds every venture module — and its templates — to any builder, with

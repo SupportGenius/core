@@ -116,6 +116,23 @@ pub async fn tenant_is_active(
         .is_some_and(|tenant| tenant.status == store::STATUS_ACTIVE))
 }
 
+/// Whether the tenant's API key `key_id` is still on record in
+/// `sg_api_keys` — the row that is the key's revocation state. A deleted
+/// row means a revoked key. Exposed for the composition, so a module that
+/// authenticates the same `sg_` keys (escalation's destination routes)
+/// refuses a revoked one exactly as this module's own routes do.
+///
+/// # Errors
+///
+/// The database's error when the lookup itself fails.
+pub async fn api_key_is_live(
+    db: &dyn cratefield_core::Database,
+    tenant_id: &str,
+    key_id: &str,
+) -> Result<bool, cratefield_core::DbError> {
+    Ok(store::find_api_key(db, tenant_id, key_id).await?.is_some())
+}
+
 use std::sync::Arc;
 
 use cratefield_core::{

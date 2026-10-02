@@ -31,9 +31,11 @@ const ADMIN: &str = "/v1/support/admin/tenants";
 const SEARCH: &str = "/v1/support/search";
 
 /// The rows a `/search` request reads before retrieval even starts:
-/// `authenticate` resolves the bearer key with one primary-key read. The
-/// budgets below measure the whole request, so they carry this row.
-const AUTH_ROWS: u64 = 1;
+/// `authenticate` resolves the bearer key's tenant with one primary-key
+/// read and then the key's own `sg_api_keys` row (its revocation state,
+/// #37) with one indexed read. The budgets below measure the whole
+/// request, so they carry these rows.
+const AUTH_ROWS: u64 = 2;
 
 /// `usize` as `u64`; every count here fits.
 fn n(x: usize) -> u64 {

@@ -22,4 +22,17 @@ pub trait TenantDirectory: Send + Sync {
     /// infrastructure failure (a database outage), which the routes answer
     /// with a `500`, never as evidence about the tenant.
     async fn is_active(&self, ctx: &ModuleContext, tenant_id: &str) -> Result<bool, DbError>;
+
+    /// `Ok(true)` only while the tenant's API key `key_id` (the per-key id
+    /// `tenancy::verify` returns) is still on record. A key the tenant has
+    /// deleted — revoked — is `Ok(false)`, so a signature that still
+    /// verifies is refused here on its very next request, exactly as
+    /// `module-support`'s own routes refuse it. `Err` is an infrastructure
+    /// failure, answered with a `500`.
+    async fn key_is_live(
+        &self,
+        ctx: &ModuleContext,
+        tenant_id: &str,
+        key_id: &str,
+    ) -> Result<bool, DbError>;
 }

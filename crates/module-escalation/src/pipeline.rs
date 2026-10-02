@@ -49,7 +49,7 @@ use crate::store;
 use cratefield_core::{
     Clock, Completion, Config, Credential, Database, Defer, Destination, Filed, IdGen, Inbox,
     Mailer, Message, ModelTier, Outbox, OutboxRecord, Prompt, SendOutcome, Severity, Statement,
-    TextModel, TicketDraft, Tracker,
+    TextModel, TicketDraft, Tracker, scrub_text,
 };
 use cratefield_module_webhooks::{PublishError, Webhooks};
 use cratefield_secrets::Actor;
@@ -410,9 +410,13 @@ impl Pipeline {
         ticket: &Ticket,
         at: &str,
     ) -> Result<(), Error> {
+        // The transcript is customer-authored text: it may carry an email
+        // address, a signed link, a bearer token. `scrub_text` redacts those
+        // before the text leaves for the model, so the drafter cannot copy a
+        // secret or an address into the draft it writes.
         let prompt = Prompt::new(ModelTier::Fast)
             .system(DRAFT_SYSTEM)
-            .user(&ticket.transcript)
+            .user(scrub_text(&ticket.transcript))
             .json_schema(Drafted::json_schema());
 
         let completion = match self.model.complete(&prompt).await {
@@ -568,8 +572,9 @@ impl Pipeline {
 
     /// Commits the judge's verdict — one all-or-nothing batch per
     /// outcome: on to the file stage, linked to an existing filed ticket,
-    /// parked as rejected, or parked with a question for the customer and
-    /// on to the notify stage.
+    /// parked as rejected, blocked for PII (a verdict that would file a
+    /// draft the judge found unclean), or parked with a question for the
+    /// customer and on to the notify stage.
     ///
     /// The judge's `duplicate_of` is validated here, the way a citation
     /// is: only an id from `candidates` (the exact list the brief showed,
@@ -599,6 +604,8 @@ impl Pipeline {
         };
 
         match judgment.verdict {
+            // `commit_file` refuses a draft the judge found carrying
+            // customer PII (`pii_clean: false`): it is blocked, never filed.
             Verdict::File => {
                 self.commit_file(record, ticket, judgment, judge_completed, None, at)
                     .await
@@ -732,6 +739,15 @@ impl Pipeline {
         ignored: Option<Statement>,
         at: &str,
     ) -> Result<(), Error> {
+        // The one place the file stage is set and enqueued, so the PII
+        // gate lives here: whichever verdict led here — a plain `file`, or
+        // a `duplicate` that fell back to filing — a draft the judge found
+        // carrying customer PII never reaches the tracker.
+        if !judgment.pii_clean {
+            return self
+                .block_for_pii(record, ticket, judgment, judge_completed, ignored, at)
+                .await;
+        }
         let mut batch = vec![judge_completed];
         batch.extend(ignored);
         batch.extend([
@@ -831,6 +847,46 @@ impl Pipeline {
             EventKind::DuplicateIgnored,
             &detail,
         )
+    }
+
+    /// Parks a ticket the judge would file but found carrying customer PII.
+    /// It is a hard stop, not a fixable verdict: nothing is enqueued, the
+    /// tracker is never touched, and the ticket is parked exactly as a
+    /// rejection is. The audit says why, so this block is distinguishable
+    /// from a plain not-a-defect rejection. `ignored` is the
+    /// `duplicate_ignored` event when a `duplicate` verdict fell back here.
+    async fn block_for_pii(
+        &self,
+        record: &OutboxRecord,
+        ticket: &Ticket,
+        judgment: &Judgment,
+        judge_completed: Statement,
+        ignored: Option<Statement>,
+        at: &str,
+    ) -> Result<(), Error> {
+        let why = json!({
+            "blocked_for_pii": true,
+            "reason": "the judge found customer PII in the draft; it must not reach a tracker",
+            "reasons": judgment.reasons,
+        });
+        let blocked = store::insert_event_stmt(
+            &self.idgen.ulid(),
+            &ticket.id,
+            stage_seq(Stage::Judge, 1),
+            at,
+            Stage::Judge,
+            EventKind::Rejected,
+            &why,
+        );
+        let mut batch = vec![judge_completed];
+        batch.extend(ignored);
+        batch.extend([
+            blocked,
+            store::update_ticket_judgment_stmt(&ticket.id, judgment, at),
+            store::update_ticket_status_stmt(&ticket.id, Status::Rejected, at),
+            store::outbox_complete_stmt(OUTBOX_TABLE, &record.id),
+        ]);
+        self.commit(&batch).await
     }
 
     // ------------------------------------------------------------------
@@ -1689,7 +1745,10 @@ fn judge_brief(ticket: &Ticket, candidates: &[Candidate]) -> String {
         }
     }
     brief.push_str("\nOriginal transcript:\n");
-    brief.push_str(&ticket.transcript);
+    // The same customer-authored transcript the drafter saw, scrubbed the
+    // same way: no un-redacted address or token rides into the judge prompt
+    // either.
+    brief.push_str(&scrub_text(&ticket.transcript));
     brief
 }
 

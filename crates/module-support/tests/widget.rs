@@ -363,6 +363,11 @@ async fn a_publishable_key_opens_no_secret_or_admin_route() {
             (Method::DELETE, format!("{sources}/some-id"), SC::UNAUTHORIZED, "unauthorized", None),
             (Method::GET, "/v1/support/search?q=reset".into(), SC::UNAUTHORIZED, "unauthorized", None),
             (Method::POST, "/v1/support/messages".into(), SC::UNAUTHORIZED, "unauthorized", msg),
+            // Key management (#37): a page-readable key can neither list, mint nor
+            // revoke the tenant's secret keys.
+            (Method::GET, "/v1/support/keys".into(), SC::UNAUTHORIZED, "unauthorized", None),
+            (Method::POST, "/v1/support/keys".into(), SC::UNAUTHORIZED, "unauthorized", Some(json!({}))),
+            (Method::DELETE, "/v1/support/keys/some-kid".into(), SC::UNAUTHORIZED, "unauthorized", None),
             (Method::POST, ADMIN.into(), SC::FORBIDDEN, "admin-forbidden", Some(json!({ "name": "X" }))),
             (Method::PUT, settings_path, SC::FORBIDDEN, "admin-forbidden", None),
             (Method::POST, keys_path, SC::FORBIDDEN, "admin-forbidden", None),

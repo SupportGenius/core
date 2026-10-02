@@ -391,8 +391,22 @@ async fn tenant_of(
     state: &DestinationsState,
     headers: &HeaderMap,
 ) -> Result<(String, Actor), Problem> {
-    let tenant_id = authenticate(&state.ctx, headers)?;
+    let key = authenticate(&state.ctx, headers)?;
+    let tenant_id = key.tenant_id;
     if !tenant_is_active(state, &tenant_id).await? {
+        return Err(Problem::new(&UNAUTHORIZED));
+    }
+    // A valid signature is not enough: the key must still be on record, so
+    // a key revoked by deleting its row is refused here too. No directory
+    // means no way to tell, so no key is live (fail closed).
+    let live = match state.tenants.as_deref() {
+        Some(tenants) => tenants
+            .key_is_live(&state.ctx, &tenant_id, &key.key_id)
+            .await
+            .map_err(Problem::from)?,
+        None => false,
+    };
+    if !live {
         return Err(Problem::new(&UNAUTHORIZED));
     }
     let actor = Actor::new(format!("tenant:{tenant_id}")).map_err(|_| Problem::internal())?;
@@ -457,11 +471,11 @@ async fn credential_present(
 }
 
 /// Verifies the `Authorization` bearer as a tenant API key and returns the
-/// tenant it names. Every failure collapses into [`UNAUTHORIZED`]. The
-/// module keeps no tenant table of its own, so tenant *status* is checked
-/// separately, through the composed [`TenantDirectory`] (see
-/// [`tenant_of`]).
-fn authenticate(ctx: &ModuleContext, headers: &HeaderMap) -> Result<String, Problem> {
+/// tenant and key it names. Every failure collapses into [`UNAUTHORIZED`].
+/// The module keeps no tenant or key table of its own, so tenant *status*
+/// and the key's own row (revocation) are checked separately, through the
+/// composed [`TenantDirectory`] (see [`tenant_of`]).
+fn authenticate(ctx: &ModuleContext, headers: &HeaderMap) -> Result<tenancy::TenantKey, Problem> {
     let unauthorized = || Problem::new(&UNAUTHORIZED);
     let Some(raw) = headers
         .get(header::AUTHORIZATION)
@@ -480,7 +494,7 @@ fn authenticate(ctx: &ModuleContext, headers: &HeaderMap) -> Result<String, Prob
     let Ok(key) = tenancy::verify(signer, presented, &revoked) else {
         return Err(unauthorized());
     };
-    Ok(key.tenant_id)
+    Ok(key)
 }
 
 /// The `internal` problem for a required port that `requires()` promised

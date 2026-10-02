@@ -202,6 +202,138 @@ async fn a_reject_verdict_never_calls_the_tracker_and_records_why() {
     );
 }
 
+/// The done-when box for issue #37: a `file` verdict the judge found
+/// unclean (`pii_clean: false`) must never reach `Tracker::file`. The
+/// ticket parks exactly as a rejection does, and the audit says it was
+/// blocked for PII rather than rejected as a non-defect.
+#[pollster::test]
+async fn a_file_verdict_with_pii_is_never_filed_and_records_the_block() {
+    let fixture = support::fixture(
+        support::scripted_model(support::drafted_json(), support::pii_file_judgment()),
+        // An accepting tracker: were the gate missing, the file would
+        // succeed and the `filed().is_empty()` assert below would fail.
+        FakeTracker::new(TrackerMode::FileOk),
+    );
+    let pipeline = fixture.pipeline();
+    support::drain_all(&pipeline);
+
+    assert!(
+        fixture.tracker.filed().is_empty(),
+        "a PII-flagged draft is never filed: {:?}",
+        fixture.tracker.filed()
+    );
+
+    let ticket = support::ticket(&fixture);
+    assert_eq!(
+        ticket.status,
+        Status::Rejected,
+        "not `{}`",
+        ticket.status.as_str()
+    );
+    assert_eq!(ticket.verdict, Some(Verdict::File));
+    assert_eq!(ticket.external_id, None);
+
+    let events = support::events(&fixture);
+    let blocked = support::event_of_kind(&events, EventKind::Rejected);
+    let detail = blocked
+        .detail
+        .as_ref()
+        .expect("a blocked event carries its detail");
+    assert_eq!(
+        detail["blocked_for_pii"],
+        serde_json::json!(true),
+        "the audit says the block was for PII"
+    );
+    assert!(
+        detail["reason"]
+            .as_str()
+            .expect("the block carries a reason")
+            .contains("PII"),
+        "the reason names PII: {detail:?}"
+    );
+
+    // Blocked means nothing enqueued: no file row lingers to run later.
+    assert_eq!(
+        support::outbox_count(&fixture),
+        0,
+        "a PII block enqueues no file stage"
+    );
+}
+
+/// A `duplicate` verdict naming no shown candidate falls back to filing —
+/// and that fallback is the same file stage, so the PII gate holds there
+/// too: a draft the judge found unclean is blocked, never filed, whichever
+/// verdict led to the file stage.
+#[pollster::test]
+async fn a_duplicate_fallback_with_pii_is_never_filed() {
+    let mut judgment = support::duplicate_judgment("not-a-shown-candidate");
+    judgment["pii_clean"] = serde_json::json!(false);
+    let fixture = support::fixture(
+        support::scripted_model(support::drafted_json(), judgment),
+        FakeTracker::new(TrackerMode::FileOk),
+    );
+    let pipeline = fixture.pipeline();
+    support::drain_all(&pipeline);
+
+    assert!(
+        fixture.tracker.filed().is_empty(),
+        "a PII-flagged fallback is never filed: {:?}",
+        fixture.tracker.filed()
+    );
+    let ticket = support::ticket(&fixture);
+    assert_eq!(
+        ticket.status,
+        Status::Rejected,
+        "not `{}`",
+        ticket.status.as_str()
+    );
+    let events = support::events(&fixture);
+    let blocked = support::event_of_kind(&events, EventKind::Rejected);
+    assert_eq!(
+        blocked.detail.as_ref().expect("detail")["blocked_for_pii"],
+        serde_json::json!(true)
+    );
+    // The trail still shows the duplicate verdict that fell back.
+    let _ignored = support::event_of_kind(&events, EventKind::DuplicateIgnored);
+    assert_eq!(support::outbox_count(&fixture), 0, "no file stage enqueued");
+}
+
+/// The transcript is customer-authored text: `scrub_text` redacts the
+/// email it carries before either the drafter or the judge sees it, so
+/// the raw address never leaves for a model.
+#[pollster::test]
+async fn an_email_in_the_transcript_is_scrubbed_before_either_model_call() {
+    let transcript =
+        "customer: reach me at jane.doe@example.com and the checkout 500s on a gift card";
+    let fixture = support::fixture_with_transcript(
+        support::happy_model(),
+        FakeTracker::new(TrackerMode::FileOk),
+        transcript,
+    );
+    let pipeline = fixture.pipeline();
+    support::drain_all(&pipeline);
+
+    // Both the draft (fast) and judge (strong) prompts carry the
+    // transcript; neither may carry the address verbatim.
+    let prompts: Vec<Prompt> = fixture.model.prompts();
+    assert_eq!(prompts.len(), 2, "the drafter and the judge both ran");
+    for prompt in &prompts {
+        for message in &prompt.messages {
+            assert!(
+                !message.content.contains("jane.doe@example.com"),
+                "the address reached the {:?} prompt: {}",
+                prompt.tier,
+                message.content
+            );
+            assert!(
+                message.content.contains("[subject_hash:"),
+                "the address is redacted, not dropped silently: {}",
+                message.content
+            );
+        }
+    }
+}
+
 /// Box 3: `verdict: needs_info` writes a customer-facing question instead
 /// of filing.
 #[pollster::test]

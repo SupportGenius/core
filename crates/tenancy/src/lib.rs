@@ -18,11 +18,14 @@
 //! corrected. Keys live out of the module boundary so modules consume
 //! tenancy through ports and never issue keys themselves.
 //!
-//! **Revocation.** v1 keys are stateless — no row to flip — so revocation
-//! is a kid list the caller supplies per verification, sourced from
-//! config under [`REVOKED_KIDS_KEY`]; a row per kid supersedes that
-//! later. That keeps this crate a pure function of (signer, presented
-//! key, revoked kids): no config plumbing, no clock, no I/O.
+//! **Revocation.** This crate stays stateless — a pure function of
+//! (signer, presented key, revoked kids) on the `verify` side: no config
+//! plumbing, no clock, no I/O — so the revoked-kid list a caller supplies
+//! per verification (sourced from config under [`REVOKED_KIDS_KEY`]) is
+//! the emergency override on the *signing* kid. An individual key is
+//! revoked by the consuming module: it keeps a row per **key id** and
+//! refuses to authenticate one whose row is gone, so deleting that row
+//! revokes the key with no config edit.
 //!
 //! **Two key classes.** A *secret* key ([`mint`]/[`verify`],
 //! `sg_<kid>.…`) is a bearer credential: it names tenants, mutates
@@ -43,7 +46,7 @@
 
 use std::fmt;
 
-use cratefield_core::{Kid, MAX_KID_NAME, Payload, Signer};
+use cratefield_core::{IdGen, Kid, MAX_KID_NAME, Payload, Signer, UlidIdGen};
 
 /// The purpose every tenant API key is signed with: `"tenancy.api-key"`.
 ///
@@ -89,34 +92,46 @@ pub const PUBLISHABLE_PREFIX: &str = "sg_pub_";
 /// comma-separated: `REVOKED_KIDS = "cur, k-2026-08"`. Both consumer
 /// modules read this same name so one edit revokes everywhere at once;
 /// [`parse_revoked_kids`] turns the raw value into the list [`verify`]
-/// takes. When keys move into rows, revocation-by-row supersedes this
-/// key.
+/// takes. It is the emergency override, checked alongside the per-key row
+/// a module now keeps: the row is deleted to revoke one key, this list to
+/// revoke a kid everywhere at once whatever rows exist.
 pub const REVOKED_KIDS_KEY: &str = "REVOKED_KIDS";
 
+/// Separates the tenant id from the per-key id in a key's signed subject:
+/// `"{tenant_id}.{key_id}"`. Tenant ids are ULIDs (Crockford base32, no
+/// punctuation), so a `.` cannot occur inside one and the split is
+/// unambiguous whatever the tenant id is.
+const SUBJECT_SEPARATOR: char = '.';
+
 /// A minted key: the secret string (`key`, shown to the holder exactly
-/// once) plus the metadata to remember. There is no key row in v1, so
-/// this struct is the whole record — `kid` for revocation bookkeeping,
-/// `tenant_id` for anything that must name a holder's tenant without
-/// verifying again.
+/// once) plus the metadata to remember. `kid` is the signing-key
+/// generation the token was signed with (what the revoked-kid config list
+/// matches); `key_id` is the per-key id this crate generates, bound into
+/// the token, and the identity the consuming module stores per row.
 #[derive(Debug, Clone)]
 pub struct MintedKey {
     /// The full `sg_<kid>.<payload>.<mac>` string.
     pub key: String,
-    /// The key id the signer's ring actually signed with.
+    /// The signing-key generation the token was signed with.
     pub kid: String,
+    /// This key's own id, bound into the signed subject.
+    pub key_id: String,
     /// The tenant this key authenticates.
     pub tenant_id: String,
 }
 
-/// What a verified key authenticates: the tenant it names and the kid it
-/// was signed with — the kid so a request log can say which key
-/// generation a call came in on.
+/// What a verified key authenticates: the tenant it names, the per-key id
+/// it was minted with — so a caller can look the key's own row up and
+/// revoke it individually — and the signing-key generation, so a request
+/// log can say which key generation a call came in on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantKey {
     /// The tenant the key authenticates.
     pub tenant_id: String,
-    /// The key id the token was actually signed with.
+    /// The signing-key generation the token was signed with.
     pub kid: String,
+    /// The key's own id, from the signed subject.
+    pub key_id: String,
 }
 
 /// Why a key failed to mint or verify. Deliberately coarse: `Revoked` is
@@ -128,7 +143,10 @@ pub struct TenantKey {
 pub enum KeyError {
     /// The string does not have the `sg_<kid>.<payload>.<mac>` shape:
     /// missing prefix, no kid segment, or a kid segment outside
-    /// `[a-z0-9_-]{1,32}`.
+    /// `[a-z0-9_-]{1,32}`. Also returned when the signed subject is not
+    /// `{tenant_id}.{key_id}` — a token minted before per-key ids existed
+    /// carries no key id and is refused here rather than treated as a
+    /// tenant named by the whole subject.
     Malformed,
     /// The signer named a kid this crate cannot render into a prefix.
     /// Only reachable with a hand-built ring whose names ignore the
@@ -157,19 +175,17 @@ impl std::error::Error for KeyError {}
 
 /// Mints a tenant API key over the `Signer` port.
 ///
-/// The signed payload carries `purpose: API_KEY_PURPOSE` and `subject:
-/// tenant_id` — the `{tenant_id, kid}` pair the credential exists to
-/// convey. `tenant_id` is opaque to this crate: no charset or shape
-/// rules, the caller's tenant identity is taken verbatim.
+/// A fresh per-key id (a ULID) is generated and bound into the signed
+/// payload as `subject = "{tenant_id}.{key_id}"`, so the credential names
+/// both its tenant and its own identity — that is what lets a caller
+/// revoke this key and no other. `tenant_id` itself is opaque to this
+/// crate: no charset or shape rules.
 ///
 /// Signing always uses the ring's current key and cannot be steered, so
-/// the real kid is recovered by verifying the token just produced — one
-/// cheap MAC that also proves the key round-trips before a holder ever
-/// sees it. `exp: None` requests no particular lifetime; the signer's own
-/// `TokenPolicy` still applies (with the reference `HmacSigner` that is
-/// its 30-day default ceiling for this purpose, so keys expire and
-/// holders re-mint — the deliberate backstop while keys are stateless and
-/// nothing can be individually revoked).
+/// the signing kid is recovered by verifying the token just produced —
+/// one cheap MAC that also proves the key round-trips before a holder
+/// ever sees it. `exp: None` leaves lifetime to the signer's own
+/// `TokenPolicy` (the 30-day default ceiling with the reference signer).
 ///
 /// # Errors
 ///
@@ -215,9 +231,10 @@ fn mint_over(
     purpose: &str,
     prefix: &str,
 ) -> Result<MintedKey, KeyError> {
+    let key_id = UlidIdGen.ulid();
     let token = signer.sign(&Payload {
         purpose: purpose.to_owned(),
-        subject: tenant_id.to_owned(),
+        subject: format!("{tenant_id}{SUBJECT_SEPARATOR}{key_id}"),
         // Expiry is the signer's policy call, not ours.
         exp: None,
         // The ring overrides this on sign; the real kid is recovered
@@ -229,11 +246,13 @@ fn mint_over(
     Ok(MintedKey {
         key: format!("{prefix}{kid}.{token}"),
         kid,
+        key_id,
         tenant_id: tenant_id.to_owned(),
     })
 }
 
-/// Verifies a presented key and returns the tenant it authenticates.
+/// Verifies a presented key and returns the tenant and key it
+/// authenticates.
 ///
 /// The `sg_<kid>` prefix is display metadata and is not trusted: the kid
 /// segment must be a well-formed name, but authority comes only from the
@@ -248,20 +267,25 @@ fn mint_over(
 /// read must never name tenants at it. The reverse holds for
 /// [`verify_publishable`].
 ///
-/// `revoked_kids` is the caller's list — today parsed out of config
-/// under [`REVOKED_KIDS_KEY`] with [`parse_revoked_kids`], later a row
-/// per kid. Comparison is ASCII case-insensitive so a hand-written
-/// config entry cannot silently miss.
+/// The signed subject is split into `{tenant_id}.{key_id}`; a token whose
+/// subject carries no key id is [`KeyError::Malformed`].
+///
+/// `revoked_kids` is the caller's list, usually parsed out of config
+/// under [`REVOKED_KIDS_KEY`] with [`parse_revoked_kids`] as the
+/// emergency override on the signing kid; a consuming module revokes an
+/// individual key by dropping the row for its `key_id` instead.
+/// Comparison is ASCII case-insensitive so a hand-written config entry
+/// cannot silently miss.
 ///
 /// # Errors
 ///
 /// [`KeyError::Malformed`] when the string lacks the
-/// `sg_<kid>.<payload>.<mac>` shape, [`KeyError::Invalid`] when the
-/// signer rejects the credential, the prefix kid does not match the
-/// payload kid, or the credential is a publishable key,
-/// [`KeyError::Revoked`] when the authenticated kid is on
-/// `revoked_kids`, and [`KeyError::UnknownKid`] when the payload names a
-/// kid this crate cannot render.
+/// `sg_<kid>.<payload>.<mac>` shape or its subject carries no key id,
+/// [`KeyError::Invalid`] when the signer rejects the credential, the
+/// prefix kid does not match the payload kid, or the credential is a
+/// publishable key, [`KeyError::Revoked`] when the authenticated kid is
+/// on `revoked_kids`, and [`KeyError::UnknownKid`] when the payload names
+/// a kid this crate cannot render.
 pub fn verify(
     signer: &dyn Signer,
     presented: &str,
@@ -279,6 +303,11 @@ pub fn verify(
 /// A secret key is refused here, not downgraded: a page-sourced
 /// credential gets exactly the authority `sg_pub_` names and nothing the
 /// holder could have pasted in makes broader.
+///
+/// A publishable key carries a per-key id in its subject like a secret
+/// key does (the same `{tenant_id}.{key_id}` shape), but no module keeps a
+/// row for one today, so it is revoked by kid (`revoked_kids`) or by
+/// expiry — not individually.
 ///
 /// # Errors
 ///
@@ -337,9 +366,17 @@ fn verify_over(
     {
         return Err(KeyError::Revoked);
     }
+    // `rsplit_once`: the key id is appended last and is a ULID (no `.`),
+    // so this is the tenant/key split even if a tenant id ever held one.
+    let (tenant_id, key_id) = payload
+        .subject
+        .rsplit_once(SUBJECT_SEPARATOR)
+        .filter(|(tenant_id, key_id)| !tenant_id.is_empty() && !key_id.is_empty())
+        .ok_or(KeyError::Malformed)?;
     Ok(TenantKey {
-        tenant_id: payload.subject,
+        tenant_id: tenant_id.to_owned(),
         kid,
+        key_id: key_id.to_owned(),
     })
 }
 
@@ -448,10 +485,64 @@ mod tests {
         let minted = mint(&signer, "tenant-alpha").expect("mint");
         assert!(minted.key.starts_with(KEY_PREFIX));
         assert_eq!(minted.tenant_id, "tenant-alpha");
+        assert!(!minted.key_id.is_empty());
 
         let key = verify(&signer, &minted.key, &[]).expect("verify");
         assert_eq!(key.tenant_id, "tenant-alpha");
         assert_eq!(key.kid, minted.kid);
+        assert_eq!(key.key_id, minted.key_id, "the key id round-trips");
+    }
+
+    #[test]
+    fn two_mints_for_one_tenant_are_distinct_keys() {
+        let signer = signer();
+        // Same tenant, same second: only the generated per-key id can
+        // tell these apart, and it must.
+        let first = mint(&signer, "tenant-alpha").expect("mint");
+        let second = mint(&signer, "tenant-alpha").expect("mint");
+        assert_ne!(first.key_id, second.key_id);
+        assert_ne!(first.key, second.key);
+        let verified = verify(&signer, &second.key, &[]).expect("verify");
+        assert_eq!(verified.tenant_id, "tenant-alpha");
+        assert_eq!(verified.key_id, second.key_id);
+    }
+
+    #[test]
+    fn a_subject_without_a_key_id_is_malformed() {
+        let signer = signer();
+        // A token minted before per-key ids existed: the subject is the
+        // bare tenant id, no separator. It must be rejected outright, not
+        // read as a tenant.
+        let legacy = signer.sign(&Payload {
+            purpose: crate::API_KEY_PURPOSE.to_owned(),
+            subject: "tenant-alpha".to_owned(),
+            exp: None,
+            kid: Kid::Cur,
+        });
+        let disguised = format!("{KEY_PREFIX}cur.{legacy}");
+        assert_eq!(verify(&signer, &disguised, &[]), Err(KeyError::Malformed));
+
+        // An empty key id after the separator is equally not a key id.
+        let trailing = signer.sign(&Payload {
+            purpose: crate::API_KEY_PURPOSE.to_owned(),
+            subject: "tenant-alpha.".to_owned(),
+            exp: None,
+            kid: Kid::Cur,
+        });
+        assert_eq!(
+            verify(&signer, &format!("{KEY_PREFIX}cur.{trailing}"), &[]),
+            Err(KeyError::Malformed)
+        );
+    }
+
+    #[test]
+    fn key_id_never_carries_the_separator() {
+        // The split in `verify` is unambiguous only because a key id is a
+        // ULID (Crockford base32). Guard the generator choice, not just
+        // the current output.
+        let signer = signer();
+        let minted = mint(&signer, "tenant-alpha").expect("mint");
+        assert!(!minted.key_id.contains(crate::SUBJECT_SEPARATOR));
     }
 
     #[test]

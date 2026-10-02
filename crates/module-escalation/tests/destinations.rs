@@ -49,11 +49,13 @@ struct World {
     tenants: Arc<FakeTenants>,
 }
 
-/// A [`TenantDirectory`] standing in for `module-support`'s tenant table:
-/// every tenant is active except the ones a test suspends.
+/// A [`TenantDirectory`] standing in for `module-support`'s tenant and key
+/// tables: every tenant is active except the ones a test suspends, and
+/// every key is on record except the ones a test revokes.
 #[derive(Default)]
 struct FakeTenants {
     suspended: Mutex<HashSet<String>>,
+    revoked_keys: Mutex<HashSet<String>>,
 }
 
 impl FakeTenants {
@@ -62,6 +64,14 @@ impl FakeTenants {
             .lock()
             .expect("tenants lock")
             .insert(tenant.to_owned());
+    }
+
+    /// Drops the key's row, the way `DELETE /v1/support/keys/{kid}` does.
+    fn revoke_key(&self, key_id: &str) {
+        self.revoked_keys
+            .lock()
+            .expect("tenants lock")
+            .insert(key_id.to_owned());
     }
 }
 
@@ -73,6 +83,19 @@ impl TenantDirectory for FakeTenants {
             .lock()
             .expect("tenants lock")
             .contains(tenant_id))
+    }
+
+    async fn key_is_live(
+        &self,
+        _ctx: &ModuleContext,
+        _tenant_id: &str,
+        key_id: &str,
+    ) -> Result<bool, DbError> {
+        Ok(!self
+            .revoked_keys
+            .lock()
+            .expect("tenants lock")
+            .contains(key_id))
     }
 }
 
@@ -769,6 +792,42 @@ async fn without_a_kms_the_route_refuses_and_the_config_form_still_files() {
             owner: "acme".to_owned(),
             repo: "api".to_owned(),
         }
+    );
+}
+
+/// A key the tenant revoked (its `sg_api_keys` row deleted) is refused on
+/// the destination routes on its very next request, though its signature
+/// still verifies — revocation is enforced on this module's auth path too,
+/// not only on `module-support`'s. The tenant's other key keeps working.
+#[pollster::test]
+async fn a_revoked_key_is_refused_on_the_destination_routes() {
+    let dir = dev_key_dir();
+    let world = kit_with(vec![], Some(&dir));
+    let old = tenancy::mint(&*world.harness.signer, "acme").expect("mint");
+    let new = tenant_key(&world, "acme");
+    let body = json!({
+        "destination": { "git_hub": { "owner": "acme", "repo": "api" } },
+        "credential": "acme-token",
+    });
+    let reply = put(&world, DESTINATIONS, &old.key, body).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.json());
+    assert_eq!(
+        get(&world, DESTINATIONS, &old.key).await.status,
+        StatusCode::OK
+    );
+
+    world.tenants.revoke_key(&old.key_id);
+
+    let reply = get(&world, DESTINATIONS, &old.key).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "the revoked key");
+    assert_eq!(
+        reply.json()["type"],
+        json!(format!("{PROBLEMS}escalation-unauthorized"))
+    );
+    assert_eq!(
+        get(&world, DESTINATIONS, &new).await.status,
+        StatusCode::OK,
+        "the tenant's other key is unaffected"
     );
 }
 
