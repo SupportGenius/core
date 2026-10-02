@@ -7,20 +7,21 @@
 
 mod support;
 
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 use axum::http::{Method, StatusCode};
 use cratefield_core::{
-    Credential, Destination, Filed, MapConfig, Module, Row, Statement, SystemClock, TicketDraft,
-    TicketState, TicketStatus, Tracker, TrackerError, UlidIdGen,
+    Credential, DbError, Destination, Filed, MapConfig, Module, ModuleContext, Row, Statement,
+    SystemClock, TicketDraft, TicketState, TicketStatus, Tracker, TrackerError, UlidIdGen,
 };
 use cratefield_testing::{
     Dialect, FakeTextModel, FiledCall, TempDir, TestHarness, TestResponse, TrackerMode, request,
     request_as,
 };
 use module_escalation::intake::OUTBOX_TABLE;
-use module_escalation::{Escalation, Intake, Pipeline};
+use module_escalation::{Escalation, Intake, Pipeline, TenantDirectory};
 use serde_json::{Value, json};
 
 const ADMIN_TOKEN: &str = "test-admin-token-0123456789abcdef";
@@ -43,6 +44,36 @@ const CANARY_URL: &str = "https://hooks.canary.test/CANARY-wh-7b2f?token=zz";
 struct World {
     harness: TestHarness,
     config: MapConfig,
+    /// The tenant directory the module was composed with: every tenant is
+    /// active until a test suspends it.
+    tenants: Arc<FakeTenants>,
+}
+
+/// A [`TenantDirectory`] standing in for `module-support`'s tenant table:
+/// every tenant is active except the ones a test suspends.
+#[derive(Default)]
+struct FakeTenants {
+    suspended: Mutex<HashSet<String>>,
+}
+
+impl FakeTenants {
+    fn suspend(&self, tenant: &str) {
+        self.suspended
+            .lock()
+            .expect("tenants lock")
+            .insert(tenant.to_owned());
+    }
+}
+
+#[async_trait::async_trait]
+impl TenantDirectory for FakeTenants {
+    async fn is_active(&self, _ctx: &ModuleContext, tenant_id: &str) -> Result<bool, DbError> {
+        Ok(!self
+            .suspended
+            .lock()
+            .expect("tenants lock")
+            .contains(tenant_id))
+    }
 }
 
 /// A throwaway directory holding a development KMS master key.
@@ -63,13 +94,25 @@ fn kit_with(extra: Vec<(&'static str, String)>, key_file: Option<&TempDir>) -> W
     }
     pairs.extend(extra);
 
+    let tenants = Arc::new(FakeTenants::default());
+    let module = Escalation::new().with_tenant_directory(tenants.clone());
+    let (harness, config) = harness_for(module, pairs);
+    World {
+        harness,
+        config,
+        tenants,
+    }
+}
+
+/// The harness over `module` with `pairs` as its config.
+fn harness_for(module: Escalation, pairs: Vec<(&'static str, String)>) -> (TestHarness, MapConfig) {
     let config = MapConfig::from_pairs(pairs);
     let for_ports = config.clone();
-    let modules: Vec<Box<dyn Module>> = vec![Box::new(Escalation::new())];
+    let modules: Vec<Box<dyn Module>> = vec![Box::new(module)];
     let harness = TestHarness::with_database_and_ports(modules, Dialect::Sqlite, move |ports| {
         ports.config = Arc::new(for_ports);
     });
-    World { harness, config }
+    (harness, config)
 }
 
 /// Mints a tenant key over the harness's own `Signer`.
@@ -727,4 +770,190 @@ async fn without_a_kms_the_route_refuses_and_the_config_form_still_files() {
             repo: "api".to_owned(),
         }
     );
+}
+
+/// A suspended tenant is refused on every destination route, the way the
+/// rest of the API refuses it: its own key gets the same indistinguishable
+/// `401` a bad key gets, and the admin routes for it answer `404` (as
+/// `module-support`'s admin routes for a non-active tenant do). Nothing it
+/// had stored changes.
+#[pollster::test]
+async fn a_suspended_tenant_is_refused_on_every_destination_route() {
+    let dir = dev_key_dir();
+    let world = kit_with(vec![], Some(&dir));
+    let key = tenant_key(&world, "acme");
+    let body = json!({
+        "destination": { "git_hub": { "owner": "acme", "repo": "api" } },
+        "credential": "acme-token",
+    });
+    let reply = put(&world, DESTINATIONS, &key, body.clone()).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.json());
+
+    world.tenants.suspend("acme");
+
+    let unauthorized = json!(format!("{PROBLEMS}escalation-unauthorized"));
+    let reply = get(&world, DESTINATIONS, &key).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "GET");
+    assert_eq!(reply.json()["type"], unauthorized);
+    let reply = put(&world, DESTINATIONS, &key, body.clone()).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "PUT");
+    assert_eq!(reply.json()["type"], unauthorized);
+    let reply = request_as(
+        &world.harness.router,
+        Method::DELETE,
+        DESTINATIONS,
+        &key,
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "DELETE");
+    assert_eq!(reply.json()["type"], unauthorized);
+
+    let admin = format!("{ADMIN_TENANTS}/acme/destinations");
+    let reply = get(&world, &admin, ADMIN_TOKEN).await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND, "admin GET");
+    let reply = put(&world, &admin, ADMIN_TOKEN, body).await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND, "admin PUT");
+    let reply = request_as(
+        &world.harness.router,
+        Method::DELETE,
+        &admin,
+        ADMIN_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND, "admin DELETE");
+
+    // The row and its sealed credential are exactly as the tenant left them.
+    assert_eq!(
+        count_of(
+            &world,
+            "SELECT COUNT(*) AS n FROM sg_destinations WHERE tenant_id = 'acme'"
+        ),
+        1
+    );
+    assert_eq!(active_secrets(&world, "escalation.tracker.credential"), 1);
+
+    // Another tenant is unaffected.
+    let globex = tenant_key(&world, "globex");
+    assert_eq!(
+        get(&world, DESTINATIONS, &globex).await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// Without a tenant directory the module cannot tell an active tenant from
+/// a suspended one, so the destination routes refuse everyone (fail closed)
+/// instead of trusting the key alone.
+#[pollster::test]
+async fn without_a_tenant_directory_every_tenant_is_refused() {
+    let (harness, _config) = harness_for(
+        Escalation::new(),
+        vec![("ADMIN_TOKEN", ADMIN_TOKEN.to_owned())],
+    );
+    let key = tenancy::mint(&*harness.signer, "acme")
+        .expect("the harness signer mints a tenant key")
+        .key;
+    let reply = request_as(&harness.router, Method::GET, DESTINATIONS, &key, None).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    let admin = format!("{ADMIN_TENANTS}/acme/destinations");
+    let reply = request_as(&harness.router, Method::GET, &admin, ADMIN_TOKEN, None).await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+}
+
+/// Every secret access the destination routes and the file stage make is
+/// written to the `harness_secret_audit` chain: the tenant's store, the
+/// secret's name, the action, the actor and the time — never the value or
+/// its ciphertext — and the chain verifies.
+#[pollster::test]
+async fn every_secret_access_lands_in_the_audit_chain() {
+    let dir = dev_key_dir();
+    let world = kit_with(vec![], Some(&dir));
+    let key = tenant_key(&world, "acme");
+
+    let reply = put(
+        &world,
+        DESTINATIONS,
+        &key,
+        json!({
+            "destination": { "webhook": { "url": CANARY_URL } },
+            "credential": CANARY_CREDENTIAL,
+        }),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.json());
+    let reply = get(&world, DESTINATIONS, &key).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let admin = format!("{ADMIN_TENANTS}/acme/destinations");
+    let reply = request_as(
+        &world.harness.router,
+        Method::DELETE,
+        &admin,
+        ADMIN_TOKEN,
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+
+    let rows = pollster::block_on(
+        world.harness.db.query(&Statement::new(
+            "SELECT store, actor, name, action, allowed, ts FROM harness_secret_audit ORDER BY seq"
+                .to_owned(),
+        )),
+    )
+    .expect("the audit chain reads");
+    let entries: Vec<(String, String, String, String)> = rows
+        .rows
+        .iter()
+        .map(|row| {
+            let ts: String = row.get("ts").expect("a timestamp");
+            assert!(!ts.is_empty(), "every row is timestamped");
+            (
+                row.get("store").expect("a store"),
+                row.get("actor").expect("an actor"),
+                row.get("name").expect("a name"),
+                row.get("action").expect("an action"),
+            )
+        })
+        .collect();
+    let has = |actor: &str, name: &str, action: &str| {
+        entries
+            .iter()
+            .any(|(store, a, n, act)| store == "acme" && a == actor && n == name && act == action)
+    };
+    assert!(
+        has("tenant:acme", "escalation.tracker.credential", "put"),
+        "{entries:?}"
+    );
+    assert!(
+        has("tenant:acme", "escalation.tracker.destination", "put"),
+        "{entries:?}"
+    );
+    assert!(
+        has("tenant:acme", "escalation.tracker.credential", "get"),
+        "{entries:?}"
+    );
+    assert!(
+        has("admin", "escalation.tracker.credential", "delete"),
+        "{entries:?}"
+    );
+    assert!(
+        has("admin", "escalation.tracker.destination", "delete"),
+        "{entries:?}"
+    );
+
+    // No value, no ciphertext: the canaries are nowhere in the chain.
+    for (store, actor, name, action) in &entries {
+        for field in [store, actor, name, action] {
+            assert!(
+                !field.contains(CANARY_CREDENTIAL) && !field.contains(CANARY_URL),
+                "a secret value reached the audit chain"
+            );
+        }
+    }
+
+    // And the chain is intact.
+    let store = cratefield_secrets::StoreId::Tenant("acme".to_owned());
+    pollster::block_on(cratefield_secrets::verify(&store, &*world.harness.db))
+        .expect("the tenant's audit chain verifies");
 }

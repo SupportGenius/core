@@ -106,7 +106,11 @@ async fn main() {
         return;
     }
     install_tracing();
-    if let Err(err) = run().await {
+    let booted = match refuse_local_kms_outside_development(EnvConfig) {
+        Ok(()) => run().await,
+        Err(err) => Err(err),
+    };
+    if let Err(err) = booted {
         tracing::error!(error = %err, "supportgenius failed");
         std::process::exit(1);
     }
@@ -391,6 +395,21 @@ async fn open_database(config: EnvConfig) -> Result<BootDb, Box<dyn std::error::
 /// matching `cratefield-core`'s own parse (unset/blank is development).
 /// Production requires a real `RateLimiter`; development and staging accept
 /// the fail-open degradation so a self-host runs with zero configuration.
+/// The escalation module's development file KMS outside an explicit
+/// `ENV=development` (issue #23): its destination routes would already
+/// refuse to store credentials (no KMS, `503`), but a self-host that
+/// pointed `ESCALATION_KMS_KEY_FILE` at a key with `ENV` unset or
+/// production-like meant something else, so the binary refuses to boot
+/// and names the setting instead of serving degraded.
+fn refuse_local_kms_outside_development(
+    config: EnvConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match composition::local_kms_refusal(&config) {
+        Some(refusal) => Err(refusal.into()),
+        None => Ok(()),
+    }
+}
+
 fn is_production(config: EnvConfig) -> bool {
     config.get("ENV").as_deref().and_then(VentureEnv::parse) == Some(VentureEnv::Production)
 }

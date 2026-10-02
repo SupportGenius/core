@@ -17,6 +17,7 @@
 mod destinations;
 mod pipeline;
 mod secrets;
+mod tenants;
 
 pub mod connectors;
 pub mod error;
@@ -27,6 +28,8 @@ pub mod store;
 pub use error::Error;
 pub use intake::{Handoff, Intake};
 pub use pipeline::{Pipeline, RetryPolicy};
+pub use secrets::local_kms_refusal;
+pub use tenants::TenantDirectory;
 
 /// Test doubles the published fakes do not cover: a seeded in-memory
 /// [`cratefield_core::Config`] and a clock a test can move forward. The
@@ -112,8 +115,23 @@ use cratefield_module_webhooks::Webhooks;
 ///     ]
 /// );
 /// ```
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Escalation;
+///
+/// The destination routes additionally need a [`TenantDirectory`]
+/// ([`Escalation::with_tenant_directory`]) to refuse suspended tenants;
+/// without one they refuse every tenant (fail closed).
+#[derive(Clone, Default)]
+pub struct Escalation {
+    /// Who may use the destination routes; `None` refuses everyone.
+    tenants: Option<Arc<dyn TenantDirectory>>,
+}
+
+impl std::fmt::Debug for Escalation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Escalation")
+            .field("tenant_directory", &self.tenants.is_some())
+            .finish()
+    }
+}
 
 impl Escalation {
     /// The module's name as the harness mounts it (`/v1/escalation`).
@@ -125,7 +143,16 @@ impl Escalation {
     /// number of harnesses.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self { tenants: None }
+    }
+
+    /// The directory the destination routes check tenant status against
+    /// (see [`TenantDirectory`]): a suspended or closed tenant is refused
+    /// there the way the rest of the API refuses it.
+    #[must_use]
+    pub fn with_tenant_directory(mut self, tenants: Arc<dyn TenantDirectory>) -> Self {
+        self.tenants = Some(tenants);
+        self
     }
 
     /// The conversation → first-outbox-row handoff.
@@ -408,6 +435,14 @@ impl Module for Escalation {
             }
         }
 
+        // The development file KMS outside an explicit ENV=development:
+        // the routes already fail closed (no KMS, `503`); this makes the
+        // misconfiguration loud wherever config is validated, and the
+        // native binary refuses to boot on it.
+        if let Some(refusal) = secrets::local_kms_refusal(cfg) {
+            errors.push(format!("escalation: {refusal}"));
+        }
+
         errors.into_result()
     }
 
@@ -419,7 +454,7 @@ impl Module for Escalation {
     /// is resolved from config once, here.
     fn router(&self, ctx: ModuleContext) -> axum::Router {
         let kms = secrets::kms_from_config(&*ctx.config);
-        destinations::router(Arc::new(ctx), kms)
+        destinations::router(Arc::new(ctx), kms, self.tenants.clone())
     }
 
     /// The drain: build a [`Pipeline`] from whatever ports the runtime

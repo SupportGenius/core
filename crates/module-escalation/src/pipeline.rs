@@ -52,7 +52,7 @@ use cratefield_core::{
     TextModel, TicketDraft, Tracker,
 };
 use cratefield_module_webhooks::{PublishError, Webhooks};
-use cratefield_secrets::{Actor, Secrets};
+use cratefield_secrets::Actor;
 
 /// The `Config` key naming the base URL of a support conversation
 /// (`<base>/<conversation_id>`). When set, the filed ticket's body carries a
@@ -1014,7 +1014,7 @@ impl Pipeline {
                  configured"
             ))
         })?;
-        let store = Secrets::new(kms)
+        let store = crate::secrets::audited_secrets(kms, self.db.clone())
             .tenant(tenant_id, self.db.clone())
             .map_err(|_| {
                 Error::Decode(format!("tenant `{tenant_id}` has no usable secret store"))
@@ -1059,9 +1059,10 @@ impl Pipeline {
         Ok((destination, credential))
     }
 
-    /// Reads one named secret from the tenant store, mapping "not found"
-    /// and "unreadable" onto the same terminal decode error — neither
-    /// heals on retry, and neither names a value.
+    /// Reads one named secret from the tenant store. "Not found" and
+    /// "unreadable" are the same terminal decode error — neither heals on
+    /// retry, and neither names a value — except a database failure
+    /// (including the audit chain's append), which retries.
     async fn read_secret(
         store: &cratefield_secrets::SecretStore,
         actor: &Actor,
@@ -1071,10 +1072,15 @@ impl Pipeline {
         store
             .get(name, actor)
             .await
-            .map_err(|_| {
-                Error::Decode(format!(
+            .map_err(|err| match err {
+                // A database failure — the secret row's read or the audit
+                // chain's append — is transient like any other `Db` error:
+                // the outbox redelivers rather than dead-lettering a
+                // ticket over a blip.
+                cratefield_secrets::SecretsError::Database(db) => Error::Db(db),
+                _ => Error::Decode(format!(
                     "secret `{name}` (tenant `{tenant_id}`) could not be read"
-                ))
+                )),
             })?
             .ok_or_else(|| {
                 Error::Decode(format!("secret `{name}` (tenant `{tenant_id}`) is not set"))

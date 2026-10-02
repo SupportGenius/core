@@ -33,11 +33,13 @@ use cratefield_core::{
     SystemClock, TrackerError, require_admin,
 };
 use cratefield_kms::Kms;
-use cratefield_secrets::{Actor, SecretBytes, Secrets};
+use cratefield_secrets::{Actor, SecretBytes};
 
 use crate::secrets::{
     CREDENTIAL_REF, CREDENTIAL_SECRET, SECRET_REF_PREFIX, WEBHOOK_SECRET, WEBHOOK_URL_MARKER,
+    audited_secrets,
 };
+use crate::tenants::TenantDirectory;
 
 /// The external id the validation probe asks the tracker about — never a
 /// real ticket. `Rejected` ("no such ticket") is a *healthy* answer, so the
@@ -106,13 +108,20 @@ struct DestinationsState {
     /// The KMS resolved once at router build time, or `None` when the
     /// deployment configured none — the routes then answer `503`.
     kms: Option<Arc<dyn Kms>>,
+    /// Tenant status; `None` refuses every tenant (fail closed, see
+    /// [`crate::tenants`]).
+    tenants: Option<Arc<dyn TenantDirectory>>,
 }
 
 /// Mounts the tenant and admin destination routes. `kms` is built from
 /// config by the caller (`crate::secrets::kms_from_config`) so the provider
 /// is resolved once, not per request.
-pub(crate) fn router(ctx: Arc<ModuleContext>, kms: Option<Arc<dyn Kms>>) -> axum::Router {
-    let state = Arc::new(DestinationsState { ctx, kms });
+pub(crate) fn router(
+    ctx: Arc<ModuleContext>,
+    kms: Option<Arc<dyn Kms>>,
+    tenants: Option<Arc<dyn TenantDirectory>>,
+) -> axum::Router {
+    let state = Arc::new(DestinationsState { ctx, kms, tenants });
     axum::Router::new()
         .route(
             "/destinations",
@@ -143,7 +152,7 @@ async fn put_tenant(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Problem> {
-    let (tenant_id, actor) = tenant_of(&state.ctx, &headers)?;
+    let (tenant_id, actor) = tenant_of(&state, &headers).await?;
     put_destination(&state, &tenant_id, &actor, &scope, &body).await
 }
 
@@ -152,7 +161,7 @@ async fn get_tenant(
     State(state): State<Arc<DestinationsState>>,
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
-    let (tenant_id, actor) = tenant_of(&state.ctx, &headers)?;
+    let (tenant_id, actor) = tenant_of(&state, &headers).await?;
     get_destination(&state, &tenant_id, &actor, &scope).await
 }
 
@@ -161,7 +170,7 @@ async fn delete_tenant(
     State(state): State<Arc<DestinationsState>>,
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
-    let (tenant_id, actor) = tenant_of(&state.ctx, &headers)?;
+    let (tenant_id, actor) = tenant_of(&state, &headers).await?;
     delete_destination(&state, &tenant_id, &actor, &scope).await
 }
 
@@ -176,7 +185,7 @@ async fn put_admin(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Problem> {
-    let actor = admin_of(&state.ctx, &headers)?;
+    let actor = admin_of(&state, &headers, &tenant_id, &scope).await?;
     put_destination(&state, &tenant_id, &actor, &scope, &body).await
 }
 
@@ -186,7 +195,7 @@ async fn get_admin(
     Path(tenant_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
-    let actor = admin_of(&state.ctx, &headers)?;
+    let actor = admin_of(&state, &headers, &tenant_id, &scope).await?;
     get_destination(&state, &tenant_id, &actor, &scope).await
 }
 
@@ -196,7 +205,7 @@ async fn delete_admin(
     Path(tenant_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
-    let actor = admin_of(&state.ctx, &headers)?;
+    let actor = admin_of(&state, &headers, &tenant_id, &scope).await?;
     delete_destination(&state, &tenant_id, &actor, &scope).await
 }
 
@@ -267,7 +276,7 @@ async fn put_destination(
     // no second copy of the plaintext is kept around.
     let secret = SecretBytes::new(credential.expose().as_bytes().to_vec());
     drop(credential);
-    let secret_store = Secrets::new(kms)
+    let secret_store = audited_secrets(kms, db.clone())
         .tenant(tenant_id, db.clone())
         .map_err(|_| Problem::internal())?;
     secret_store
@@ -353,7 +362,7 @@ async fn delete_destination(
         return Err(required_port_missing("Db").instance(&scope.request_id));
     };
     if let Some(kms) = state.kms.clone()
-        && let Ok(secret_store) = Secrets::new(kms).tenant(tenant_id, db.clone())
+        && let Ok(secret_store) = audited_secrets(kms, db.clone()).tenant(tenant_id, db.clone())
     {
         // Deleting a name that was never set is a no-op, so this is safe
         // whether the row was a secret-backed one or a legacy config-key
@@ -375,16 +384,49 @@ async fn delete_destination(
 // ---------------------------------------------------------------------------
 
 /// The tenant a tenant-key request acts for, and the audit actor for it.
-fn tenant_of(ctx: &ModuleContext, headers: &HeaderMap) -> Result<(String, Actor), Problem> {
-    let tenant_id = authenticate(ctx, headers)?;
+/// A valid key for a tenant that is not active (suspended, closed,
+/// unknown) is refused with the same indistinguishable `401` as a bad key
+/// — the answer `module-support`'s routes give the same key.
+async fn tenant_of(
+    state: &DestinationsState,
+    headers: &HeaderMap,
+) -> Result<(String, Actor), Problem> {
+    let tenant_id = authenticate(&state.ctx, headers)?;
+    if !tenant_is_active(state, &tenant_id).await? {
+        return Err(Problem::new(&UNAUTHORIZED));
+    }
     let actor = Actor::new(format!("tenant:{tenant_id}")).map_err(|_| Problem::internal())?;
     Ok((tenant_id, actor))
 }
 
-/// The audit actor for an admin request, once the admin token checks out.
-fn admin_of(ctx: &ModuleContext, headers: &HeaderMap) -> Result<Actor, Problem> {
-    require_admin(&*ctx.config, headers)?;
+/// The audit actor for an admin request, once the admin token checks out
+/// and the tenant named in the path is active. A tenant that is unknown,
+/// suspended or closed is one `404`, the way `module-support`'s admin
+/// routes for a tenant answer it.
+async fn admin_of(
+    state: &DestinationsState,
+    headers: &HeaderMap,
+    tenant_id: &str,
+    scope: &Scope,
+) -> Result<Actor, Problem> {
+    require_admin(&*state.ctx.config, headers)?;
+    if !tenant_is_active(state, tenant_id).await? {
+        return Err(Problem::not_found().instance(&scope.request_id));
+    }
     Actor::new("admin").map_err(|_| Problem::internal())
+}
+
+/// Whether `tenant_id` is active, per the composed [`TenantDirectory`].
+/// No directory means no way to tell, so no tenant is (fail closed). A
+/// database failure is a `500`, not evidence about the tenant.
+async fn tenant_is_active(state: &DestinationsState, tenant_id: &str) -> Result<bool, Problem> {
+    let Some(tenants) = state.tenants.as_deref() else {
+        return Ok(false);
+    };
+    tenants
+        .is_active(&state.ctx, tenant_id)
+        .await
+        .map_err(Problem::from)
 }
 
 /// Whether the credential the row references can be resolved. A `secret:`
@@ -404,7 +446,7 @@ async fn credential_present(
     let Some(kms) = state.kms.clone() else {
         return Ok(false);
     };
-    let secret_store = Secrets::new(kms).tenant(tenant_id, db.clone())?;
+    let secret_store = audited_secrets(kms, db.clone()).tenant(tenant_id, db.clone())?;
     match secret_store.get(name, actor).await {
         Ok(found) => Ok(found.is_some()),
         // No data key means nothing was ever sealed in this store, so no
@@ -416,8 +458,9 @@ async fn credential_present(
 
 /// Verifies the `Authorization` bearer as a tenant API key and returns the
 /// tenant it names. Every failure collapses into [`UNAUTHORIZED`]. The
-/// module keeps no tenant table of its own, so the signed key is the whole
-/// check — the same credential `module-support` issues and verifies.
+/// module keeps no tenant table of its own, so tenant *status* is checked
+/// separately, through the composed [`TenantDirectory`] (see
+/// [`tenant_of`]).
 fn authenticate(ctx: &ModuleContext, headers: &HeaderMap) -> Result<String, Problem> {
     let unauthorized = || Problem::new(&UNAUTHORIZED);
     let Some(raw) = headers

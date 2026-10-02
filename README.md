@@ -29,10 +29,14 @@ The plan, in order, is the issue list. Two modules, not five:
   and then stored **encrypted** (through `cratefield-secrets`), never as a
   Worker secret an operator edits by hand. That storage is enabled by
   configuration: `HARNESS_KEK_CURRENT` (the Worker's numbered KEK ring) or
-  `ESCALATION_KMS_KEY_FILE` (a development master-key file, refused in
-  `ENV=production`). With neither set the routes answer
+  `ESCALATION_KMS_KEY_FILE` (a development master-key file, used only with
+  `ENV=development` — with `ENV` unset or anything else the key is not used
+  and the native binary refuses to boot). With neither set the routes answer
   `503 escalation-kms-not-configured`; a destination whose `credential_ref`
-  names a plain Config key still files as before.
+  names a plain Config key still files as before. A suspended or closed
+  tenant is refused on these routes exactly as on support's (`401` for its
+  key, `404` on the admin route for it), and every read, write and delete
+  of a stored credential is appended to the `harness_secret_audit` chain.
 - `ventures/supportgenius` — the Cloudflare Worker (built)
 - `bin/supportgenius` — the same modules as one static binary, which is what
   the site promises
