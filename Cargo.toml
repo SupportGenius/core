@@ -15,45 +15,33 @@ license = "MIT"
 repository = "https://github.com/SupportGenius/core"
 
 [workspace.dependencies]
-# Every cratefield-* dependency is pinned to ONE harness git rev, never
-# split between crates.io and git: mixing sources puts two copies of
-# `cratefield-core` in the graph (the modules' `Module` impls are typed
-# against one of them and fail the harness builder), which is a compile
-# error, not a warning.
-#
-# The rev is b50c1d9, harness main on 2026-09-28, because that is where
-# core 0.5.0 publishes the `TextModel`/`Tracker` ports and
-# cratefield-testing the matching `FakeTextModel`/`FakeTracker` doubles —
-# the two ports this workspace's support and escalation modules are
-# written against, which were mirrored locally until now. No crates.io
-# release carries them (the latest companions still require core ^0.4),
-# so a crates.io pin cannot express this graph at all.
-# Return the whole set to crates.io — core "0.6" and its companions —
-# once Cratefield/harness#558 is published and its crates-io-resolve job
-# is green.
-cratefield-core = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
+# Every cratefield-* dependency moves together on ONE cratefield-core line
+# (0.6): a partial move puts two copies of `cratefield-core` in the graph
+# (the modules' `Module` impls are typed against one of them and fail the
+# harness builder), which is a compile error, not a warning.
+cratefield-core = "0.6"
 # Fluent catalogs (the support module's canned clarify/handoff texts) and
 # `Accept-Language` parsing for the per-turn language fallback.
-cratefield-i18n = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
-cratefield-runtime-cloudflare = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
-cratefield-module-waitlist = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
-cratefield-adapter-resend = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
-cratefield-adapter-turnstile = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
+cratefield-i18n = "0.2"
+cratefield-runtime-cloudflare = "0.2"
+cratefield-module-waitlist = "0.2"
+cratefield-adapter-resend = "0.3"
+cratefield-adapter-turnstile = "0.2"
 # The `TextModel` port over the Anthropic Messages API: the `evals`
 # runner's real-model option (`--model anthropic[:ID]`), native-only.
-cratefield-adapter-anthropic = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
-cratefield-testing = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
-cratefield-cli = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
+cratefield-adapter-anthropic = "0.2"
+cratefield-testing = "0.3"
+cratefield-cli = "0.3"
 # Native-only (tokio/reqwest/redis do not compile to wasm): consumed only
 # by `bin/supportgenius`, whose native deps are target-gated so the wasm
 # graph stays clean.
-cratefield-runtime-native = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
+cratefield-runtime-native = "0.2"
 # rusqlite with the `bundled` feature: the static musl binary compiles
 # SQLite in, no system lib and no dynamic linking.
-cratefield-adapter-sqlite = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
+cratefield-adapter-sqlite = "0.2"
 # Postgres is the operator's opt-in (`--features postgres`), not the
 # default: SQLite is what makes the binary run with zero configuration.
-cratefield-adapter-postgres = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
+cratefield-adapter-postgres = "0.2"
 # The `http` feature stays off: with it enabled, D1 writes hang under
 # workerd/miniflare (upstream, worker 0.8.5, verified empirically).
 worker = { version = "0.8", default-features = false, features = ["d1"] }

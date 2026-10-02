@@ -132,12 +132,14 @@ jobs:
           fi
 
   conformance:
-    # b50c1d9 was HEAD of Cratefield/harness's main when pinned
-    # (2026-09-28), so the pin can be re-checked against that branch.
+    # 1475d0190b4ef05c20fdd450f3967ce6ec005360 is the harness commit that
+    # published cratefield-core 0.6.0 and every dependent (Cratefield/harness#558,
+    # the 0.6.0 crates.io release). No release tag exists, so the full SHA is
+    # the pin; it is on main.
     name: conformance (module kit)
     needs: detect-modules
     if: needs.detect-modules.outputs.has_modules == 'true'
-    uses: Cratefield/harness/.github/workflows/conformance.yml@b50c1d99b6f29e11a9fd5f116a8cd31275f735c6
+    uses: Cratefield/harness/.github/workflows/conformance.yml@1475d0190b4ef05c20fdd450f3967ce6ec005360
     with:
       module-glob: "crates/module-*"
 
