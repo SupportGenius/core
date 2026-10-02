@@ -6,8 +6,13 @@
 //! [`handlers::MAX_TEXT_BYTES`] for why), or up to 4 MiB in chunks
 //! through the upload routes (`uploads`) — is split into overlapping
 //! word windows by [`chunk::Chunker`] and inverted into `sg_postings`
-//! rows. At query time, the caller fetches the postings for the query's
-//! terms and [`bm25::rank`] scores them in-process with Okapi BM25.
+//! rows, with the corpus statistics BM25 needs (`sg_terms` document
+//! frequencies, `sg_tenant_stats` chunk counts) maintained in the same
+//! atomic batch by every write path. At query time the caller reads
+//! those statistics, then fetches at most
+//! [`store::MAX_POSTINGS_PER_TERM`] postings per query term, and
+//! [`bm25::rank`] scores them in-process with Okapi BM25 — so a query's
+//! cost is bounded by the query, not by the corpus.
 //!
 //! [`tokenize`] is shared by both halves, which is the point: a query
 //! tokenised differently from the index it searches finds nothing, so
@@ -79,7 +84,7 @@ mod connectors;
 mod extract;
 mod handlers;
 mod messages;
-mod store;
+pub mod store;
 mod uploads;
 
 pub use answer::DEFAULT_ANSWER_THRESHOLD;
@@ -160,6 +165,15 @@ const MIGRATION_CONNECTORS: SqlMigration = SqlMigration::new(
     "0006",
     "connectors",
     include_str!("../migrations/sqlite/0006_connectors.sql"),
+);
+
+/// Persisted corpus statistics (`sg_terms`, `sg_tenant_stats`, backfilled
+/// from the existing index) and the per-term postings index the bounded
+/// query path reads (issue #31).
+const MIGRATION_SEARCH_STATS: SqlMigration = SqlMigration::new(
+    "0007",
+    "search_stats",
+    include_str!("../migrations/sqlite/0007_search_stats.sql"),
 );
 
 /// The support module: tenant provisioning behind the harness admin
@@ -243,6 +257,8 @@ impl Module for Support {
             "sg_sources",
             "sg_chunks",
             "sg_postings",
+            "sg_terms",
+            "sg_tenant_stats",
             "sg_conversations",
             "sg_messages",
             "sg_tenant_settings",
@@ -295,6 +311,11 @@ impl Module for Support {
     /// `sg_conversations` and `sg_tenant_settings` hold flags, a
     /// threshold and timestamps, and are `none`.
     ///
+    /// **The search statistics split the same way.** `sg_terms` is a
+    /// projection of the index — the workspace's words with their counts —
+    /// so it is `unreachable` like `sg_postings`; `sg_tenant_stats` is two
+    /// numbers per workspace and is `none`.
+    ///
     /// **The connector tables follow their elders.** `sg_connectors` is
     /// `none` — configuration about the workspace, and a credential
     /// *reference* rather than a credential. `sg_ingest_pages` and
@@ -306,13 +327,14 @@ impl Module for Support {
     }
 
     fn migrations(&self) -> Migrations {
-        const MIGRATIONS: [SqlMigration; 6] = [
+        const MIGRATIONS: [SqlMigration; 7] = [
             MIGRATION_INIT,
             MIGRATION_CONVERSATIONS,
             MIGRATION_SOURCE_MANAGEMENT,
             MIGRATION_INTERNATIONALIZATION,
             MIGRATION_UPLOADS,
             MIGRATION_CONNECTORS,
+            MIGRATION_SEARCH_STATS,
         ];
         // Refuses a gap, a duplicate or an out-of-order id at compile
         // time.
@@ -509,6 +531,23 @@ const PERSONAL_DATA: &[PersonalDataSet] = &[
         "The index is a projection of sg_chunks and leaves with them — on source \
              deletion or replacement, or when the workspace's account is closed; no \
              person is identifiable from a word-count row.",
+    ),
+    PersonalDataSet::unreachable(
+        "sg_terms",
+        DataKind::Content,
+        "One row per indexed word per workspace: how many passages carry it — a \
+             count derived from sg_postings, kept so ranking never has to count the \
+             index. The words are the workspace's own vocabulary and may include a name.",
+        "Same as sg_postings: a projection of the workspace's documents with no column \
+             that identifies a person. A word's row leaves when no passage carries it any \
+             more — on source deletion or replacement — and when the workspace's account \
+             is closed.",
+    ),
+    PersonalDataSet::none(
+        "sg_tenant_stats",
+        "One row per workspace: how many passages it holds and their total word count \
+             — the two aggregates BM25 normalises with. Numbers only; nothing here names \
+             anyone.",
     ),
     PersonalDataSet::none(
         "sg_conversations",

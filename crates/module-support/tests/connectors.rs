@@ -26,6 +26,9 @@ use module_support::Support;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
+mod stats_check;
+use stats_check::{assert_stats_exact, df_of};
+
 const ADMIN_TOKEN: &str = "test-admin-token-0123456789abcdef";
 const ADMIN: &str = "/v1/support/admin/tenants";
 const CONNECTORS: &str = "/v1/support/connectors";
@@ -1062,9 +1065,16 @@ async fn a_page_that_answers_404_on_resync_deletes_its_source() {
         // The vanished page's own term finds it — then finds nothing.
         let hits = search_hits(&kit, key, "aardvark").await;
         assert_eq!(hits.len(), 1);
+        assert!(assert_stats_exact(&kit, "after the connector's first index") > 0);
 
         resync(&kit, &http, &[]).await;
 
+        assert_eq!(
+            assert_stats_exact(&kit, "after the 404 delete"),
+            0,
+            "the page's statistics left with its source"
+        );
+        assert_eq!(count_of(&kit, "sg_tenant_stats"), 0);
         assert_eq!(count_of(&kit, "sg_sources"), 0, "the source is gone");
         assert_eq!(count_of(&kit, "sg_chunks"), 0);
         assert_eq!(count_of(&kit, "sg_postings"), 0);
@@ -1247,10 +1257,12 @@ async fn a_github_file_that_answers_404_deletes_by_external_id() {
         // The re-sync refetches the tree (304: unchanged) and the file,
         // which is gone: the source keyed `github:acme/widgets:docs/a.md`
         // — not by its fetch URL — must be the thing deleted.
+        assert!(assert_stats_exact(&kit, "after the GitHub file indexed") > 0);
         resync(&kit, &http, &[]).await;
         assert_eq!(count_of(&kit, "sg_sources"), 0);
         assert_eq!(count_of(&kit, "sg_chunks"), 0);
         assert_eq!(count_of(&kit, "sg_ingest_pages"), 1, "only the tree row");
+        assert_eq!(assert_stats_exact(&kit, "after the GitHub 404 delete"), 0);
     }
 }
 
@@ -1519,6 +1531,9 @@ async fn a_changed_page_replaces_its_source_in_place_and_bumps_updated_at() {
         crawl_sitemap(&kit, key).await;
         let id_before = text_column(&kit, "SELECT id AS v FROM sg_sources");
         let created = text_column(&kit, "SELECT created_at AS v FROM sg_sources");
+        let tenant_id = tenant["tenant_id"].as_str().expect("tenant id");
+        assert!(assert_stats_exact(&kit, "after the first crawl") > 0);
+        assert_eq!(df_of(&kit, tenant_id, "rotterdam"), Some(1));
 
         let later = kit.clock.0 + time::Duration::hours(24);
         tick(&kit, &http, later, None).await.expect("tick runs");
@@ -1542,6 +1557,12 @@ async fn a_changed_page_replaces_its_source_in_place_and_bumps_updated_at() {
             search_hits(&kit, key, "rotterdam").await,
             Vec::<Value>::new()
         );
+        // The connector's replace diffed the statistics like the manual
+        // PUT does: the vanished window's terms out, the new one's in.
+        assert_stats_exact(&kit, "after the connector re-index");
+        assert_eq!(df_of(&kit, tenant_id, "rotterdam"), None);
+        assert_eq!(df_of(&kit, tenant_id, "antwerp"), Some(1));
+        assert_eq!(df_of(&kit, tenant_id, "parcels"), Some(1));
     }
 }
 
@@ -1600,6 +1621,12 @@ async fn a_hand_indexed_source_under_the_page_url_is_adopted_not_duplicated() {
         );
         assert_eq!(search_hits(&kit, key, "two").await.len(), 1);
         assert_eq!(search_hits(&kit, key, "gazebo").await.len(), 1);
+        // Adoption is a replace of the hand-indexed source: its "one"
+        // left the statistics, the crawled "two" entered.
+        assert_stats_exact(&kit, "after adopting a hand-indexed source");
+        let tenant_id = tenant["tenant_id"].as_str().expect("tenant id");
+        assert_eq!(df_of(&kit, tenant_id, "one"), None);
+        assert_eq!(df_of(&kit, tenant_id, "warranty"), Some(1));
     }
 }
 
@@ -1669,6 +1696,9 @@ async fn one_cron_tick_runs_every_sweep_even_when_one_fails() {
         assert_eq!(search_hits(&kit, key, "eight").await.len(), 1);
         assert_eq!(search_hits(&kit, key, "nine").await, Vec::<Value>::new());
         assert_eq!(count_of(&kit, "sg_ingest_outbox"), 0, "all jobs retired");
+        // The re-index sweep and the re-sync's replace each moved the
+        // statistics with the rows, in one tick.
+        assert!(assert_stats_exact(&kit, "after the re-index and the re-sync") > 0);
     }
 }
 
@@ -1689,6 +1719,7 @@ fn the_connector_migration_is_support_0006() {
             ("0004", "internationalization"),
             ("0005", "uploads"),
             ("0006", "connectors"),
+            ("0007", "search_stats"),
         ],
         "connectors is support/0006, after main's 0003/0004 and the uploads 0005"
     );

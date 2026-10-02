@@ -4,20 +4,26 @@
 //! hand-written SQL in this crate, and the `fz doctor` lint keeps them
 //! portable).
 //!
-//! The isolation boundary is [`tenant_id`]: every statement in this file
+//! The isolation boundary is `tenant_id`: every statement in this file
 //! filters on it, whatever credential was verified upstream. Nothing here
 //! is reachable without a tenant id, and nothing here ignores one — the
 //! deliberate exceptions are the module's own cron sweeps over every
 //! tenant it holds, never a tenant's request: the re-index's stale-chunk
-//! select ([`stale_chunks`]) and the connector re-sync's listing
-//! ([`list_connectors`], [`pending_subjects`], and the per-connector page
+//! select (`stale_chunks`) and the connector re-sync's listing
+//! (`list_connectors`, `pending_subjects`, and the per-connector page
 //! reads keyed by a connector id), whose rows each carry the tenant into
 //! every job they produce.
+//!
+//! Most of this module is private to the crate. The public surface is
+//! the retrieval bounds (so callers can reason about a query's cost) and
+//! [`insert_source_with_chunks`], the one ingest primitive, which bulk
+//! importers and the tests drive directly — with the same atomic-batch
+//! statistics maintenance the HTTP route gets.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use cratefield_core::{Database, DbError, Row, Statement};
-use sea_query::{Alias, Expr, Func, OnConflict, Order, Query};
+use sea_query::{Alias, Expr, Func, OnConflict, Order, Query, SelectStatement, SimpleExpr};
 use time::format_description::well_known::Rfc3339;
 
 use crate::bm25::{Corpus, Posting};
@@ -30,6 +36,49 @@ pub(crate) const STATUS_ACTIVE: &str = "active";
 
 /// The label recorded for the first key `POST /admin/tenants` mints.
 pub(crate) const FIRST_KEY_LABEL: &str = "primary";
+
+/// Distinct terms one retrieval may look up and fetch postings for:
+/// after deduping, the first [`MAX_QUERY_TERMS`] terms of the query, the
+/// rest dropped. A support question with more than 32 distinct terms is
+/// not a question, and the cap is what keeps a pathological query
+/// (`?q=` a novel's worth of text — or a long CJK run, which tokenizes
+/// into one bigram per character) from turning into that many database
+/// reads. 32 query terms cost at most 32 statistics lookups and
+/// 32 postings fetches — a query's cost is bounded by the query, never
+/// by the corpus.
+pub const MAX_QUERY_TERMS: usize = 32;
+
+/// Postings fetched per term: the term's chunks by tf, highest first
+/// (`chunk_id` ascending breaks ties deterministically). A chunk outside a
+/// term's top [`MAX_POSTINGS_PER_TERM`] is scored without that term's
+/// contribution. 128 because the ranker's output is capped far below it
+/// anyway (`/search` shows at most 50, `/messages` grounds in 6), so a
+/// chunk with a term's top tf almost always outranks the cut; because it
+/// keeps a full [`MAX_QUERY_TERMS`]-term query under ~4k posting rows;
+/// and because it is small enough that the per-term read runs straight
+/// off the `(tenant_id, term, tf DESC, chunk_id)` index with no sort.
+pub const MAX_POSTINGS_PER_TERM: usize = 128;
+
+/// A term carried by more than this fraction of a tenant's chunks is a
+/// stopword by statistics and is dropped before any postings are
+/// fetched. Language-neutral and self-maintaining: whatever the corpus
+/// treats as filler (`the`, `and`, a CJK particle bigram, …) crosses the
+/// line on its own, and the line moves with the corpus rather than a
+/// word list. The cost is the point — such a term's postings fetch alone
+/// would scale with the whole corpus, for a contribution BM25's idf
+/// already weights to almost nothing (`ln(1 + 0.5/df)` shrinks toward
+/// zero as df grows).
+pub const STOPWORD_DF_RATIO: f64 = 0.5;
+
+/// Smallest corpus the stopword ratio above is trusted in. Below a
+/// handful of chunks the ratio carries no information — in a
+/// one-chunk corpus every term scores df/N = 1, so the strict rule
+/// would drop every word of the only document and a two-word query
+/// would retrieve nothing from a two-document index. BM25's idf
+/// already discounts common terms at this scale, so until there are
+/// enough chunks for "in more than half the corpus" to mean
+/// something, nothing is dropped for being common.
+pub const STOPWORD_MIN_CHUNKS: u64 = 8;
 
 pub(crate) struct TenantRow {
     pub id: String,
@@ -46,7 +95,11 @@ pub(crate) struct ApiKeyRow {
     pub created_at: String,
 }
 
-pub(crate) struct SourceRow {
+/// A source document's row: what `sg_sources` holds. Public because
+/// [`insert_source_with_chunks`] is the bulk-ingest primitive — callers
+/// outside the crate (the benchmark suite, future import tools) construct
+/// it directly rather than going through the HTTP handler.
+pub struct SourceRow {
     pub id: String,
     pub tenant_id: String,
     pub title: String,
@@ -215,11 +268,24 @@ fn posting_rows_statements(postings: &[(&str, &str, &str, u32)]) -> Vec<Statemen
         .collect()
 }
 
-/// The source row, its chunks and the chunks' postings land in **one**
-/// `batch_atomic`: a half-indexed source must never be able to exist,
-/// because a source whose postings are missing some terms is worse than
-/// no source — searches quietly return wrong answers instead of nothing.
-pub(crate) async fn insert_source_with_chunks(
+/// The source row, its chunks, the chunks' postings and the corpus
+/// statistics derived from them land in **one** `batch_atomic`: a
+/// half-indexed source must never be able to exist, because a source
+/// whose postings are missing some terms is worse than no source —
+/// searches quietly return wrong answers instead of nothing. A stats row
+/// drifting from the index it describes is the same class of lie (see
+/// `corpus_stats`), so the increments are written by the same batch
+/// that writes what they count.
+///
+/// Exposed for bulk ingest: this is the one way to put documents into
+/// the index, and it carries the whole statistics contract with it.
+///
+/// # Errors
+/// When the batch cannot be applied in full — a duplicate source id, a
+/// database outage — `batch_atomic` rolls everything back, so the source,
+/// its chunks, its postings and the statistics increments all land or
+/// none do.
+pub async fn insert_source_with_chunks(
     db: &dyn Database,
     source: &SourceRow,
     chunks: &[Chunk],
@@ -271,8 +337,236 @@ pub(crate) fn source_with_chunks_statements(
         &windows,
     ));
     statements.extend(posting_insert_statements(&source.tenant_id, &windows));
+    // After the rows they count: every id here was inserted by this very
+    // batch (a clash on any of them fails the chunk primary key and rolls
+    // the batch back), so the increments count exactly what landed.
+    statements.extend(stats_add_statements(&source.tenant_id, &windows));
 
     statements
+}
+
+/// The chunks a statistics adjustment covers, always read back out of
+/// `sg_chunks` inside the statement itself — never trusted from Rust —
+/// so an adjustment counts exactly the rows that exist when its batch
+/// runs, whatever a concurrent request committed in between.
+enum ChunkSet<'a> {
+    /// These chunk ids, at most [`ROWS_PER_STATEMENT`] of them (the
+    /// callers batch).
+    Ids(&'a [String]),
+    /// Every chunk of one source.
+    Source(&'a str),
+}
+
+/// `SELECT id FROM sg_chunks WHERE tenant_id = ? AND <set>`: the set's
+/// chunks as they exist, for an `IN (…)` over postings.
+fn chunk_ids_in(tenant_id: &str, set: &ChunkSet<'_>) -> SelectStatement {
+    let mut select = Query::select();
+    select.column(iden("id")).from(iden("sg_chunks"));
+    chunk_set_filter(&mut select, tenant_id, set);
+    select
+}
+
+/// Narrows a select over `sg_chunks` to one tenant's chunks in `set`.
+fn chunk_set_filter(select: &mut SelectStatement, tenant_id: &str, set: &ChunkSet<'_>) {
+    select.and_where(Expr::col(iden("tenant_id")).eq(tenant_id));
+    match set {
+        ChunkSet::Ids(ids) => {
+            select.and_where(Expr::col(iden("id")).is_in(ids.iter().map(String::as_str)));
+        }
+        ChunkSet::Source(source_id) => {
+            select.and_where(Expr::col(iden("source_id")).eq(*source_id));
+        }
+    }
+}
+
+/// A scalar subquery, for arithmetic in an `UPDATE … SET`.
+fn scalar(select: SelectStatement) -> SimpleExpr {
+    SimpleExpr::SubQuery(None, Box::new(select.into_sub_query_statement()))
+}
+
+/// The statistics increments for chunks this batch has **already
+/// written** (rows and postings): one `sg_terms` upsert adding each
+/// term's count of the set's postings to its df, and one
+/// `sg_tenant_stats` upsert adding the set's chunk count and total
+/// length — both counted in SQL from the rows themselves, batched
+/// [`ROWS_PER_STATEMENT`] ids per statement pair.
+///
+/// ```sql
+/// INSERT INTO sg_terms (tenant_id, term, df)
+/// SELECT tenant_id, term, COUNT(chunk_id) FROM sg_postings
+/// WHERE tenant_id = ? AND chunk_id IN (SELECT id FROM sg_chunks WHERE …)
+/// GROUP BY tenant_id, term
+/// ON CONFLICT (tenant_id, term) DO UPDATE SET df = sg_terms.df + excluded.df
+/// ```
+///
+/// The grouping merges the set's many rows per term into one out-row, so
+/// a statement never upserts the same key twice (Postgres refuses to
+/// affect one row twice in a statement), and the `WHERE` before
+/// `GROUP BY` keeps SQLite from reading the upsert's `ON` as a join.
+fn stats_add_statements(tenant_id: &str, chunks: &[&Chunk]) -> Vec<Statement> {
+    let ids: Vec<String> = chunks.iter().map(|chunk| chunk.id.clone()).collect();
+    ids.chunks(ROWS_PER_STATEMENT)
+        .flat_map(|group| stats_add_for(tenant_id, &ChunkSet::Ids(group)))
+        .collect()
+}
+
+/// [`stats_add_statements`] for one set.
+fn stats_add_for(tenant_id: &str, set: &ChunkSet<'_>) -> Vec<Statement> {
+    let mut term_counts = Query::select();
+    term_counts
+        .column(iden("tenant_id"))
+        .column(iden("term"))
+        .expr(Func::count(Expr::col(iden("chunk_id"))))
+        .from(iden("sg_postings"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden("chunk_id")).in_subquery(chunk_ids_in(tenant_id, set)))
+        .group_by_col(iden("tenant_id"))
+        .group_by_col(iden("term"));
+    let mut add_terms = Query::insert();
+    add_terms
+        .into_table(iden("sg_terms"))
+        .columns([iden("tenant_id"), iden("term"), iden("df")])
+        .select_from(term_counts)
+        .expect("the select feeds exactly the three insert columns")
+        .on_conflict(
+            OnConflict::columns([iden("tenant_id"), iden("term")])
+                .value(
+                    iden("df"),
+                    Expr::col((iden("sg_terms"), iden("df")))
+                        .add(Expr::col((iden("excluded"), iden("df")))),
+                )
+                .to_owned(),
+        );
+
+    let mut chunk_counts = Query::select();
+    chunk_counts
+        .column(iden("tenant_id"))
+        .expr(Func::count(Expr::col(iden("id"))))
+        .expr(Func::sum(Expr::col(iden("term_count"))))
+        .from(iden("sg_chunks"));
+    chunk_set_filter(&mut chunk_counts, tenant_id, set);
+    chunk_counts.group_by_col(iden("tenant_id"));
+    let mut add_tenant = Query::insert();
+    add_tenant
+        .into_table(iden("sg_tenant_stats"))
+        .columns([iden("tenant_id"), iden("n_chunks"), iden("total_len")])
+        .select_from(chunk_counts)
+        .expect("the select feeds exactly the three insert columns")
+        .on_conflict(
+            OnConflict::column(iden("tenant_id"))
+                .value(
+                    iden("n_chunks"),
+                    Expr::col((iden("sg_tenant_stats"), iden("n_chunks")))
+                        .add(Expr::col((iden("excluded"), iden("n_chunks")))),
+                )
+                .value(
+                    iden("total_len"),
+                    Expr::col((iden("sg_tenant_stats"), iden("total_len")))
+                        .add(Expr::col((iden("excluded"), iden("total_len")))),
+                )
+                .to_owned(),
+        );
+
+    vec![
+        Statement::render(&add_terms),
+        Statement::render(&add_tenant),
+    ]
+}
+
+/// The statistics decrements for chunks this batch is **about to
+/// delete** (or, for the re-index, to re-tokenize): placed before the
+/// deletes, because they count the rows the deletes remove. Per set:
+///
+/// 1. `UPDATE sg_terms SET df = df - (the set's postings of that term)`
+///    for every term the set's postings carry;
+/// 2. `DELETE` those terms' rows whose df reached zero — a term nobody
+///    indexes any more is absent, exactly as if it never had been;
+/// 3. `UPDATE sg_tenant_stats` minus the set's chunk count and length;
+/// 4. `DELETE` the tenant's row once it counts no chunk.
+///
+/// Every count is a subquery over the live rows in the same batch, so
+/// the decrement is exactly what the following deletes take away.
+fn stats_remove_for(tenant_id: &str, set: &ChunkSet<'_>) -> Vec<Statement> {
+    // The terms the set's postings carry.
+    let mut set_terms = Query::select();
+    set_terms
+        .column(iden("term"))
+        .from(iden("sg_postings"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden("chunk_id")).in_subquery(chunk_ids_in(tenant_id, set)));
+
+    // One term's share of the set, correlated to the row being updated.
+    let mut term_share = Query::select();
+    term_share
+        .expr(Func::count(Expr::col((iden("p"), iden("chunk_id")))))
+        .from_as(iden("sg_postings"), iden("p"))
+        .and_where(Expr::col((iden("p"), iden("tenant_id"))).eq(tenant_id))
+        .and_where(Expr::col((iden("p"), iden("term"))).equals((iden("sg_terms"), iden("term"))))
+        .and_where(
+            Expr::col((iden("p"), iden("chunk_id"))).in_subquery(chunk_ids_in(tenant_id, set)),
+        );
+    let mut lower_terms = Query::update();
+    lower_terms
+        .table(iden("sg_terms"))
+        .value(iden("df"), Expr::col(iden("df")).sub(scalar(term_share)))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden("term")).in_subquery(set_terms.clone()));
+
+    let mut drop_terms = Query::delete();
+    drop_terms
+        .from_table(iden("sg_terms"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden("df")).lte(0))
+        .and_where(Expr::col(iden("term")).in_subquery(set_terms));
+
+    let mut set_count = Query::select();
+    set_count
+        .expr(Func::count(Expr::col(iden("id"))))
+        .from(iden("sg_chunks"));
+    chunk_set_filter(&mut set_count, tenant_id, set);
+    let mut set_len = Query::select();
+    set_len
+        .expr(Func::coalesce([
+            Func::sum(Expr::col(iden("term_count"))).into(),
+            Expr::value(0_i64),
+        ]))
+        .from(iden("sg_chunks"));
+    chunk_set_filter(&mut set_len, tenant_id, set);
+    let mut lower_tenant = Query::update();
+    lower_tenant
+        .table(iden("sg_tenant_stats"))
+        .values([
+            (
+                iden("n_chunks"),
+                Expr::col(iden("n_chunks")).sub(scalar(set_count)),
+            ),
+            (
+                iden("total_len"),
+                Expr::col(iden("total_len")).sub(scalar(set_len)),
+            ),
+        ])
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id));
+
+    let mut drop_tenant = Query::delete();
+    drop_tenant
+        .from_table(iden("sg_tenant_stats"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden("n_chunks")).lte(0));
+
+    vec![
+        Statement::render(&lower_terms),
+        Statement::render(&drop_terms),
+        Statement::render(&lower_tenant),
+        Statement::render(&drop_tenant),
+    ]
+}
+
+/// [`stats_remove_for`] over a list of chunk ids, batched
+/// [`ROWS_PER_STATEMENT`] ids per statement group.
+fn stats_remove_statements(tenant_id: &str, ids: &[String]) -> Vec<Statement> {
+    ids.chunks(ROWS_PER_STATEMENT)
+        .flat_map(|group| stats_remove_for(tenant_id, &ChunkSet::Ids(group)))
+        .collect()
 }
 
 /// One source as the source-management routes show it: the row plus how
@@ -590,6 +884,11 @@ pub(crate) fn replace_source_statements(
         .and_where(Expr::col(iden("tenant_id")).eq(source.tenant_id.as_str()));
     statements.push(Statement::render(&update_source));
 
+    // The statistics leave before the rows they count: the decrements
+    // read the vanished windows' postings, so they must run while those
+    // still exist.
+    statements.extend(stats_remove_statements(&source.tenant_id, &vanished));
+
     // Postings before their chunks: no foreign keys enforce the order
     // today, but the index is a projection of the rows — never the other
     // way round.
@@ -634,6 +933,8 @@ pub(crate) fn replace_source_statements(
         &added,
     ));
     statements.extend(posting_insert_statements(&source.tenant_id, &added));
+    // Kept windows keep their postings, so only the added ones count in.
+    statements.extend(stats_add_statements(&source.tenant_id, &added));
 
     statements
 }
@@ -656,6 +957,11 @@ pub(crate) async fn delete_source(
 /// The statements [`delete_source`] executes, exposed so a connector page
 /// that answered 404/410 can drop its source together with its page row.
 pub(crate) fn delete_source_statements(tenant_id: &str, source_id: &str) -> Vec<Statement> {
+    // The decrements first, by the same by-source subquery the deletes
+    // use, so they count exactly the windows about to go — a concurrent
+    // replace's windows included.
+    let mut statements = stats_remove_for(tenant_id, &ChunkSet::Source(source_id));
+
     let mut delete_postings = Query::delete();
     delete_postings
         .from_table(iden("sg_postings"))
@@ -683,11 +989,12 @@ pub(crate) fn delete_source_statements(tenant_id: &str, source_id: &str) -> Vec<
         .and_where(Expr::col(iden("id")).eq(source_id))
         .and_where(Expr::col(iden("tenant_id")).eq(tenant_id));
 
-    vec![
+    statements.extend([
         Statement::render(&delete_postings),
         Statement::render(&delete_chunks),
         Statement::render(&delete_row),
-    ]
+    ]);
+    statements
 }
 
 /// One chunk the re-index sweep must rewrite: who owns it, and the
@@ -771,13 +1078,22 @@ async fn reindex_chunk(db: &dyn Database, stale: &StaleChunk) -> Result<(), DbEr
         .and_where(Expr::col(iden("id")).eq(stale.id.as_str()))
         .and_where(Expr::col(iden("tenant_id")).eq(stale.tenant_id.as_str()));
 
-    let mut statements = vec![
+    // The chunk's old contribution to the statistics leaves before its
+    // postings and term count change, and its new one enters after: the
+    // term set and the length both move with the tokenizer, so df and
+    // the tenant's total length are re-derived from the rewritten rows.
+    // A chunk a concurrent delete removed matches nothing on either side.
+    let this_chunk = [stale.id.clone()];
+    let set = ChunkSet::Ids(&this_chunk);
+    let mut statements = stats_remove_for(&stale.tenant_id, &set);
+    statements.extend([
         Statement::render(&delete_postings),
         Statement::render(&restamp),
-    ];
+    ]);
     // Postings before the restamp, matching ingest's order: the index is
     // a projection of the rows, never the other way round.
     statements.extend(posting_rows_statements(&postings));
+    statements.extend(stats_add_for(&stale.tenant_id, &set));
     db.batch_atomic(&statements).await
 }
 
@@ -806,23 +1122,17 @@ pub async fn reindex_stale_chunks(db: &dyn Database, limit: usize) -> Result<usi
 }
 
 /// Chunk count and mean document length for one tenant's index — the two
-/// numbers Okapi BM25 needs before it can score anything. An empty index
-/// is `Corpus { chunk_count: 0, avg_length: 0.0 }`, not an error.
+/// numbers Okapi BM25 needs before it can score anything — read from the
+/// tenant's single `sg_tenant_stats` row, which every write path keeps in
+/// step with `sg_chunks` inside its own batch. An empty index (no row) is
+/// `Corpus { chunk_count: 0, avg_length: 0.0 }`, not an error, and one
+/// primary-key read whatever the corpus size — never a `COUNT`/`AVG` over
+/// the chunks themselves.
 pub(crate) async fn corpus_stats(db: &dyn Database, tenant_id: &str) -> Result<Corpus, DbError> {
     let mut select = Query::select();
     select
-        .expr_as(
-            Func::count(Expr::col(iden("id"))),
-            Alias::new("chunk_count"),
-        )
-        .expr_as(
-            Func::coalesce(vec![
-                Func::avg(Expr::col(iden("term_count"))).into(),
-                Expr::value(0.0_f64),
-            ]),
-            Alias::new("avg_length"),
-        )
-        .from(iden("sg_chunks"))
+        .columns(["n_chunks", "total_len"])
+        .from(iden("sg_tenant_stats"))
         .and_where(Expr::col(iden("tenant_id")).eq(tenant_id));
     let rows = db.query(&Statement::render(&select)).await?;
     Ok(rows.rows.first().map_or_else(
@@ -830,29 +1140,72 @@ pub(crate) async fn corpus_stats(db: &dyn Database, tenant_id: &str) -> Result<C
             chunk_count: 0,
             avg_length: 0.0,
         },
-        |row| Corpus {
-            chunk_count: row.get("chunk_count").unwrap_or(0),
-            avg_length: row.get("avg_length").unwrap_or(0.0),
+        |row| {
+            let n_chunks: u64 = row.get("n_chunks").unwrap_or(0);
+            let total_len: u64 = row.get("total_len").unwrap_or(0);
+            // Counts as f64: a corpus near 2^53 chunks would lose a
+            // precision no score could show.
+            #[expect(clippy::cast_precision_loss)]
+            let avg_length = if n_chunks > 0 {
+                total_len as f64 / n_chunks as f64
+            } else {
+                0.0
+            };
+            Corpus {
+                chunk_count: n_chunks,
+                avg_length,
+            }
         },
     ))
 }
 
-/// The index rows for every query term of one tenant, joined back to
-/// `sg_chunks` for the document length.
-///
-/// **No `LIMIT` on this query, ever.** `bm25::rank` derives each term's
-/// document frequency from the postings it is handed, so a truncated
-/// fetch silently corrupts ranking: rarer terms would look rarer than
-/// they are and win they should not. If this query ever needs a bound, it
-/// needs a different correctness story first.
-pub(crate) async fn postings_for(
+/// The persisted document frequencies for `terms` — one `sg_terms` row
+/// per term at most, all primary-key reads. Terms with no row are not
+/// indexed by this tenant and simply come back absent; the caller treats
+/// an absent term as df 0 and drops it before fetching postings.
+pub(crate) async fn term_dfs(
     db: &dyn Database,
     tenant_id: &str,
     terms: &[String],
-) -> Result<Vec<Posting>, DbError> {
+) -> Result<HashMap<String, u64>, DbError> {
     if terms.is_empty() {
-        return Ok(Vec::new());
+        return Ok(HashMap::new());
     }
+    let mut select = Query::select();
+    select
+        .columns(["term", "df"])
+        .from(iden("sg_terms"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden("term")).is_in(terms.iter().map(String::as_str)));
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows
+        .rows
+        .iter()
+        .filter_map(|row| Some((row.get::<String>("term")?, row.get::<u64>("df")?)))
+        .collect())
+}
+
+/// One term's index rows for one tenant, joined back to `sg_chunks` for
+/// the document length: at most `limit` postings, the term's top chunks
+/// by `tf` (`chunk_id` ascending breaks ties, so the fetch is
+/// deterministic), served by `idx_sg_postings_tenant_term_tf` in exactly
+/// that order — an index search, no sort, no full-index scan.
+///
+/// **The fetch is bounded, and the bound is honest, because df and N do
+/// not come from these rows.** `bm25::rank` takes each term's df from
+/// `sg_terms` and N from `sg_tenant_stats`, both exact whatever subset of
+/// postings is read; a truncated fetch cannot deflate an idf. What
+/// truncation costs is a contribution, not a wrong weight: a chunk
+/// outside a term's top `limit` by tf is ranked without that term.
+/// Per query, the reads are bounded by the query: 1 stats row, at most
+/// [`MAX_QUERY_TERMS`] df rows, and at most [`MAX_QUERY_TERMS`] ×
+/// [`MAX_POSTINGS_PER_TERM`] posting rows, however large the corpus.
+pub(crate) async fn postings_for(
+    db: &dyn Database,
+    tenant_id: &str,
+    term: &str,
+    limit: usize,
+) -> Result<Vec<Posting>, DbError> {
     let mut select = Query::select();
     select
         .expr_as(Expr::col((iden("p"), iden("term"))), Alias::new("term"))
@@ -875,7 +1228,10 @@ pub(crate) async fn postings_for(
                 .and(Expr::col((iden("c"), iden("tenant_id"))).eq(tenant_id)),
         )
         .and_where(Expr::col((iden("p"), iden("tenant_id"))).eq(tenant_id))
-        .and_where(Expr::col((iden("p"), iden("term"))).is_in(terms.to_vec()));
+        .and_where(Expr::col((iden("p"), iden("term"))).eq(term))
+        .order_by((iden("p"), iden("tf")), Order::Desc)
+        .order_by((iden("p"), iden("chunk_id")), Order::Asc)
+        .limit(u64::try_from(limit).unwrap_or(u64::MAX));
     let rows = db.query(&Statement::render(&select)).await?;
     Ok(rows
         .rows
@@ -893,8 +1249,8 @@ pub(crate) async fn postings_for(
 
 /// Bodies, source ids and source titles for the top-ranked chunk ids.
 /// The id list is the ranker's shortlist (at most the `limit` clamp), so
-/// the `IN` here stays small — unlike [`postings_for`], which must not be
-/// bounded at all.
+/// the `IN` here stays small — like [`postings_for`], one bounded read
+/// among a query's fixed budget, never a scan of the index.
 pub(crate) async fn chunks_by_id(
     db: &dyn Database,
     tenant_id: &str,

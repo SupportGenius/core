@@ -53,6 +53,11 @@ getrandom = { workspace = true }
 # The parity leg (Postgres) needs the `postgres` feature on the kit.
 cratefield-testing = { workspace = true, features = ["postgres"] }
 pollster = { workspace = true }
+# The scoring-parity tests compare response scores bit for bit with an
+# in-process rank. serde_json's default float parser is fast but can be
+# one ULP off; `float_roundtrip` makes the test-side parse exact, so a
+# mismatch means the fetch, not the JSON, moved the number.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 # `ServiceExt::oneshot` drives the router without a network; pinned to
 # the same line cratefield-testing builds against so one tower compiles.
 tower = { version = "0.5.3", features = ["util"] }
