@@ -29,7 +29,7 @@
 //!   bounded [`RetryPolicy`] converts a retryable failure that has spent
 //!   its budget into the same dead-letter outcome.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1393,7 +1393,22 @@ fn rank_candidates(draft: &str, candidates: &[Ticket]) -> Vec<Candidate> {
         avg_length,
     };
 
-    let mut ranked = bm25::rank(&query_terms, &postings, &corpus, &bm25::Params::default());
+    // Document frequency over the candidate set: `term_stats` yields each
+    // term once per candidate, so a term's posting count is its df. The
+    // set is the whole corpus here, so nothing is truncated and these are
+    // exact (support's persisted-statistics path is the bounded one).
+    let mut df: HashMap<String, u64> = HashMap::new();
+    for posting in &postings {
+        *df.entry(posting.term.clone()).or_default() += 1;
+    }
+
+    let mut ranked = bm25::rank(
+        &query_terms,
+        &postings,
+        &df,
+        &corpus,
+        &bm25::Params::default(),
+    );
     ranked.retain(|scored| scored.score > 0.0);
     ranked.truncate(CANDIDATE_LIMIT);
     ranked
