@@ -111,12 +111,23 @@ pub const CRONS: &[&str] = &[CRON_ESCALATION_OUTBOX, CRON_DAILY];
 /// more than one cron.
 const WAITLIST_CRONS: &[&str] = &[CRON_DAILY];
 
+/// The crons the support module's scheduled sweeps (the stale-chunk
+/// re-index, the upload `extract` drain and abandoned-upload collection,
+/// and the connector re-sync, which re-enqueues every URL a connector
+/// knows) run on: the daily tick, where they ran before the five-minute
+/// escalation tick existed. Ungated, the re-sync would re-crawl every
+/// connector 288 times a day. A handoff never waits on these — it is
+/// escalation's own drain that the five-minute tick serves.
+const SUPPORT_CRONS: &[&str] = &[CRON_DAILY];
+
 /// Every cron the composition gates a module on ([`OnCron`]): an
 /// expression that module's scheduled work is only safe on. An operator's
 /// `CRONS` override that drops one of these switches that work off with no
 /// error anywhere, so the native binary checks an override against this
 /// list before it boots (see [`missing_gated_crons`]). Today the waitlist
-/// retention purge is the only gated module.
+/// retention purge and the support sweeps are the gated modules, and both
+/// run on the daily tick ([`WAITLIST_CRONS`] and [`SUPPORT_CRONS`] are the
+/// same single expression).
 pub const GATED_CRONS: &[&str] = WAITLIST_CRONS;
 
 /// [`CRONS`] as the owned strings `cratefield_runtime_native`'s
@@ -178,13 +189,17 @@ pub fn waitlist() -> OnCron<Waitlist> {
 
 /// The `support` module as this venture composes it: the module's own
 /// behaviour, plus the [`EscalationHandoff`] sink so an escalating turn
-/// files an escalation ticket.
+/// files an escalation ticket, wrapped so its scheduled sweeps run on the
+/// daily cron only (see [`SUPPORT_CRONS`]).
 ///
 /// Public so a test can stand the same module up in a harness without
 /// reaching into the private sink.
 #[must_use]
-pub fn support() -> Support {
-    Support::new().with_handoff(Arc::new(EscalationHandoff))
+pub fn support() -> OnCron<Support> {
+    OnCron::new(
+        Support::new().with_handoff(Arc::new(EscalationHandoff)),
+        SUPPORT_CRONS,
+    )
 }
 
 /// The `escalation` module as this venture composes it. A thin wrapper
