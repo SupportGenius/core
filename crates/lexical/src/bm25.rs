@@ -33,7 +33,7 @@ pub struct Posting {
     pub chunk_id: String,
     /// The indexed term. Compared exactly against the query terms, so
     /// both sides must have gone through the same
-    /// [`tokenize`](crate::chunk::tokenize) — the shared tokenizer is what
+    /// [`tokenize`](crate::tokenize) — the shared tokenizer is what
     /// guarantees that.
     pub term: String,
     /// How often the term occurs in the chunk.

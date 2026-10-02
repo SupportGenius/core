@@ -16,6 +16,11 @@ sha2 = { workspace = true }
 http = { workspace = true }
 # Shared workspace crate: tenant API keys over the Signer port.
 tenancy = { path = "../tenancy" }
+# Shared workspace crate: the one tokenizer and Okapi BM25, moved out of
+# this module so escalation's duplicate scoring can tokenize with the
+# same rules. Re-exported from lib.rs/chunk.rs, so callers here are
+# unchanged.
+lexical = { path = "../lexical" }
 # sea-query stays on 0.32 with the same feature set the published waitlist
 # module uses, so one backend feature union serves the whole graph and
 # `Statement` values round-trip through core unchanged.

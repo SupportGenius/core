@@ -32,7 +32,6 @@
 //! one).
 
 mod answer;
-pub mod bm25;
 pub mod chunk;
 mod handlers;
 mod messages;
@@ -40,6 +39,11 @@ mod store;
 
 pub use answer::DEFAULT_ANSWER_THRESHOLD;
 pub use chunk::tokenize;
+// The tokenizer and BM25 ranker now live in the shared `lexical` crate
+// (escalation's duplicate scoring tokenizes with the same rules); this
+// re-export keeps `module_support::bm25` — and `crate::bm25` inside the
+// module — exactly where callers already expect it.
+pub use lexical::bm25;
 pub use store::reindex_stale_chunks;
 
 use std::sync::Arc;
