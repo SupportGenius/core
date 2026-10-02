@@ -54,6 +54,14 @@ pub const MIGRATION_ESCALATION: SqlMigration = SqlMigration::new(
     include_str!("../migrations/sqlite/0001_escalation.sql"),
 );
 
+/// Duplicate detection (issue #27): the `match_count` column and the
+/// `sg_ticket_links` table the judge stage's duplicate branch writes.
+pub const MIGRATION_DUPLICATES: SqlMigration = SqlMigration::new(
+    "0002",
+    "duplicates",
+    include_str!("../migrations/sqlite/0002_duplicates.sql"),
+);
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -153,6 +161,7 @@ impl Module for Escalation {
         &[
             "sg_tickets",
             "sg_ticket_events",
+            "sg_ticket_links",
             "sg_destinations",
             "sg_escalation_outbox",
             "sg_escalation_inbox",
@@ -213,6 +222,21 @@ impl Module for Escalation {
                 redacted: &[],
                 subject_via: None,
             },
+            // Links a later escalation to the ticket it duplicates. The
+            // identifying value is the *source* ticket's id (the one
+            // being erased), so erasing that escalation removes its link;
+            // the existing `ticket_id` is a tracker reference, not this
+            // person's data.
+            PersonalDataSet {
+                table: "sg_ticket_links",
+                subject: "source_ticket_id",
+                kind: DataKind::Identifier,
+                disposition: Disposition::Erase,
+                description: "A link from your escalation to an existing filed ticket it \
+                              duplicates: the two ids and the conversation id.",
+                redacted: &[],
+                subject_via: None,
+            },
             PersonalDataSet::none(
                 "sg_destinations",
                 "Per-tenant tracker configuration: which tracker a tenant files into and a \
@@ -240,7 +264,7 @@ impl Module for Escalation {
     }
 
     fn migrations(&self) -> Migrations {
-        const MIGRATIONS: [SqlMigration; 1] = [MIGRATION_ESCALATION];
+        const MIGRATIONS: [SqlMigration; 2] = [MIGRATION_ESCALATION, MIGRATION_DUPLICATES];
         // The array is the apply order; this refuses a gap, a duplicate
         // or an entry out of order at build time.
         const _: () = cratefield_core::assert_migration_set(&MIGRATIONS);
@@ -400,7 +424,7 @@ mod tests {
         );
         assert!(module.optional().contains(&Port::Mailer));
         let tables = module.tables();
-        assert_eq!(tables.len(), 5);
+        assert_eq!(tables.len(), 6);
         for table in tables {
             assert!(table.starts_with("sg_"), "{table} is not a sg_ table");
         }
@@ -424,12 +448,14 @@ mod tests {
     }
 
     #[test]
-    fn the_migration_set_is_exactly_the_one_migration() {
+    fn the_migration_set_is_the_escalation_and_duplicates_pair() {
         let migrations = module().migrations();
-        assert_eq!(migrations.sqlite.len(), 1);
+        assert_eq!(migrations.sqlite.len(), 2);
         assert_eq!(migrations.sqlite[0].id, "0001");
+        assert_eq!(migrations.sqlite[1].id, "0002");
         assert!(migrations.postgres.is_empty());
         assert!(migrations.sqlite[0].sql.contains("CREATE TABLE"));
+        assert!(migrations.sqlite[1].sql.contains("sg_ticket_links"));
     }
 
     #[test]

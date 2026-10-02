@@ -48,6 +48,10 @@ tracing = { workspace = true }
 # feature set cratefield-core uses, so nothing new enters the graph.
 axum = { version = "0.8.9", default-features = false }
 async-trait = { workspace = true }
+# The shared tokenizer and BM25 ranker: the judge stage scores the
+# ticket's draft against already-filed candidate tickets so the model is
+# shown the plausible duplicates, not asked to recall them from nothing.
+lexical = { path = "../lexical" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

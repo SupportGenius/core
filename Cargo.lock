@@ -2031,6 +2031,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lexical"
+version = "0.1.0"
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2200,6 +2204,7 @@ dependencies = [
  "cratefield-testing",
  "hmac 0.13.0",
  "http",
+ "lexical",
  "module-escalation",
  "pollster",
  "sea-query",
@@ -2224,6 +2229,7 @@ dependencies = [
  "cratefield-testing",
  "getrandom 0.4.3",
  "http",
+ "lexical",
  "lopdf",
  "pollster",
  "sea-query",

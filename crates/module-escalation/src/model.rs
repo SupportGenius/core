@@ -114,6 +114,9 @@ pub enum Status {
     NeedsInfo,
     /// The judge rejected it as not a defect.
     Rejected,
+    /// The judge found an existing filed ticket this duplicates; this
+    /// ticket is linked to it instead of being filed again.
+    Duplicate,
     /// The file stage exhausted its retries; parked for a human.
     DeadLetter,
 }
@@ -130,6 +133,7 @@ impl Status {
             Status::Filed => "filed",
             Status::NeedsInfo => "needs_info",
             Status::Rejected => "rejected",
+            Status::Duplicate => "duplicate",
             Status::DeadLetter => "dead_letter",
         }
     }
@@ -149,6 +153,7 @@ impl std::str::FromStr for Status {
             "filed" => Ok(Status::Filed),
             "needs_info" => Ok(Status::NeedsInfo),
             "rejected" => Ok(Status::Rejected),
+            "duplicate" => Ok(Status::Duplicate),
             "dead_letter" => Ok(Status::DeadLetter),
             _ => Err(crate::error::Error::Decode(format!(
                 "unknown ticket status `{raw}`"
@@ -165,18 +170,23 @@ pub enum Verdict {
     File,
     /// Plausibly real but under-specified; ask the customer.
     NeedsInfo,
-    /// Not a defect (a question, a duplicate, working as intended).
+    /// Not a defect (a question, working as intended).
     Reject,
+    /// A real defect already tracked by one of the candidate tickets the
+    /// judge was shown; link to it instead of filing a second one.
+    Duplicate,
 }
 
 impl Verdict {
-    /// The stored/log form (`"file"`, `"needs_info"`, `"reject"`).
+    /// The stored/log form (`"file"`, `"needs_info"`, `"reject"`,
+    /// `"duplicate"`).
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Verdict::File => "file",
             Verdict::NeedsInfo => "needs_info",
             Verdict::Reject => "reject",
+            Verdict::Duplicate => "duplicate",
         }
     }
 }
@@ -190,6 +200,7 @@ impl std::str::FromStr for Verdict {
             "file" => Ok(Verdict::File),
             "needs_info" => Ok(Verdict::NeedsInfo),
             "reject" => Ok(Verdict::Reject),
+            "duplicate" => Ok(Verdict::Duplicate),
             _ => Err(crate::error::Error::Decode(format!(
                 "unknown ticket verdict `{raw}`"
             ))),
@@ -259,7 +270,10 @@ pub struct Judgment {
     pub is_defect: bool,
     /// The reproduction steps actually reproduce something.
     pub reproducible: bool,
-    /// An existing ticket this duplicates, when the judge recognized one.
+    /// The id of an existing ticket this duplicates, when the judge
+    /// recognized one among the candidates it was shown. Validated
+    /// against those candidates: an id the judge was not shown is
+    /// ignored.
     pub duplicate_of: Option<String>,
     /// The drafted severity is proportionate to the described impact.
     pub severity_ok: bool,
@@ -300,7 +314,7 @@ impl Judgment {
                 "pii_clean": { "type": "boolean" },
                 "verdict": {
                     "type": "string",
-                    "enum": ["file", "needs_info", "reject"]
+                    "enum": ["file", "needs_info", "reject", "duplicate"]
                 },
                 "reasons": {
                     "type": "array",
@@ -375,6 +389,13 @@ pub enum EventKind {
     /// The judge asked the customer for more information. `detail`
     /// carries the questions/reasons.
     NeedsInfo,
+    /// The judge found the draft duplicates an already-filed ticket;
+    /// `detail` carries the existing ticket's id and tracker reference.
+    Linked,
+    /// The judge named a `duplicate_of` that was not among the
+    /// candidates it was shown; the name is ignored and `detail` records
+    /// the rejected id and the candidates that were on offer.
+    DuplicateIgnored,
 }
 
 impl EventKind {
@@ -400,6 +421,8 @@ impl EventKind {
             EventKind::NotifySkipped => "notify_skipped",
             EventKind::Rejected => "rejected",
             EventKind::NeedsInfo => "needs_info",
+            EventKind::Linked => "linked",
+            EventKind::DuplicateIgnored => "duplicate_ignored",
         }
     }
 }
@@ -428,6 +451,8 @@ impl std::str::FromStr for EventKind {
             "notify_skipped" => Ok(EventKind::NotifySkipped),
             "rejected" => Ok(EventKind::Rejected),
             "needs_info" => Ok(EventKind::NeedsInfo),
+            "linked" => Ok(EventKind::Linked),
+            "duplicate_ignored" => Ok(EventKind::DuplicateIgnored),
             _ => Err(crate::error::Error::Decode(format!(
                 "unknown event kind `{raw}`"
             ))),
@@ -493,6 +518,9 @@ pub struct Ticket {
     pub external_id: Option<String>,
     /// The tracker's ticket URL, written by the file stage.
     pub external_url: Option<String>,
+    /// How many later tickets have linked to this one as a duplicate.
+    /// Incremented by the judge stage's duplicate branch; zero otherwise.
+    pub match_count: i64,
     /// RFC 3339.
     pub created_at: String,
     /// RFC 3339; every write refreshes it.
@@ -564,6 +592,7 @@ mod tests {
             Status::Filed,
             Status::NeedsInfo,
             Status::Rejected,
+            Status::Duplicate,
             Status::DeadLetter,
         ] {
             assert_eq!(status.as_str().parse::<Status>(), Ok(status));
@@ -602,6 +631,8 @@ mod tests {
             EventKind::NotifySkipped,
             EventKind::Rejected,
             EventKind::NeedsInfo,
+            EventKind::Linked,
+            EventKind::DuplicateIgnored,
         ] {
             assert_eq!(kind.as_str().parse::<EventKind>(), Ok(kind));
             let wire = serde_json::to_string(&kind).expect("serialize");
@@ -687,7 +718,7 @@ mod tests {
         );
         assert_eq!(
             schema["properties"]["verdict"]["enum"],
-            json!(["file", "needs_info", "reject"])
+            json!(["file", "needs_info", "reject", "duplicate"])
         );
     }
 

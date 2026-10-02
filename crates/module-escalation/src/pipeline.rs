@@ -29,9 +29,11 @@
 //!   bounded [`RetryPolicy`] converts a retryable failure that has spent
 //!   its budget into the same dead-letter outcome.
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
+use lexical::{bm25, tokenize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -68,6 +70,11 @@ pub(crate) const INBOX_TABLE: &str = "sg_escalation_inbox";
 /// several times over, short enough that a crashed drainer does not wedge
 /// the row for long.
 const LEASE_SECS: u64 = 300;
+
+/// How many candidate tickets the judge is shown. Enough to cover a real
+/// cluster of reports about one defect, short enough that the brief stays
+/// a brief.
+const CANDIDATE_LIMIT: usize = 5;
 
 // ---------------------------------------------------------------------------
 // RetryPolicy
@@ -481,17 +488,22 @@ impl Pipeline {
     /// One strong-model call with the [`Judgment`] schema, carrying the
     /// drafted ticket *and* the original transcript — the judge checks
     /// `reproducible` and `pii_clean` against the source, not against the
-    /// draft's word. The `judge_completed` audit row carries the full
-    /// judgment, reasons and all, in every branch.
+    /// draft's word. The brief also lists the already-filed tickets the
+    /// draft might duplicate (see [`Pipeline::candidates`]), so the judge
+    /// picks from names rather than recalling them; the ids shown ride in
+    /// the `judge_completed` audit row so `commit_judgment` can validate
+    /// the judge's `duplicate_of` against exactly what it saw. That row
+    /// carries the full judgment, reasons and all, in every branch.
     async fn run_judge(
         &self,
         record: &OutboxRecord,
         ticket: &Ticket,
         at: &str,
     ) -> Result<(), Error> {
+        let candidates = self.candidates(ticket).await?;
         let prompt = Prompt::new(ModelTier::Strong)
             .system(JUDGE_SYSTEM)
-            .user(judge_brief(ticket))
+            .user(judge_brief(ticket, &candidates))
             .json_schema(Judgment::json_schema());
 
         let completion = match self.model.complete(&prompt).await {
@@ -520,6 +532,14 @@ impl Pipeline {
 
         let mut detail = serde_json::to_value(&judgment).map_err(Error::from)?;
         insert_detail(&mut detail, "model", json!(completion.model));
+        // The candidate ids, in the order they were shown: the record of
+        // what the judge could legitimately name, and the set
+        // `commit_judgment` validates `duplicate_of` against.
+        let shown: Vec<&str> = candidates
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect();
+        insert_detail(&mut detail, "candidates", json!(shown));
         let judge_completed = store::insert_event_stmt(
             &self.idgen.ulid(),
             &ticket.id,
@@ -530,22 +550,42 @@ impl Pipeline {
             &detail,
         );
 
-        self.commit_judgment(record, ticket, &judgment, judge_completed, at)
+        self.commit_judgment(record, ticket, &judgment, &candidates, judge_completed, at)
             .await
     }
 
-    /// Commits the judge's verdict — one of three all-or-nothing batches:
-    /// on to the file stage, parked as rejected, or parked with a question
-    /// for the customer and on to the notify stage.
+    /// The already-filed tickets the draft might duplicate, scored by
+    /// BM25 against the draft and capped at [`CANDIDATE_LIMIT`]. Reads
+    /// the tenant's filed tickets back (see
+    /// [`store::candidate_tickets`]) and ranks them in memory — the
+    /// corpus is one tenant's most recently active tickets, so there is
+    /// nothing to index server-side.
+    async fn candidates(&self, ticket: &Ticket) -> Result<Vec<Candidate>, Error> {
+        let tickets = store::candidate_tickets(&*self.db, &ticket.tenant_id, &ticket.id).await?;
+        Ok(rank_candidates(&draft_text(ticket), &tickets))
+    }
+
+    /// Commits the judge's verdict — one all-or-nothing batch per
+    /// outcome: on to the file stage, linked to an existing filed ticket,
+    /// parked as rejected, or parked with a question for the customer and
+    /// on to the notify stage.
+    ///
+    /// The judge's `duplicate_of` is validated here, the way a citation
+    /// is: only an id from `candidates` (the exact list the brief showed,
+    /// also recorded in `judge_completed`) is honoured. A `duplicate`
+    /// verdict naming anything else — or nothing — falls back to filing,
+    /// because a duplicate report that files is a duplicate ticket, but a
+    /// report dropped on a bad id is a defect lost.
     async fn commit_judgment(
         &self,
         record: &OutboxRecord,
         ticket: &Ticket,
         judgment: &Judgment,
+        candidates: &[Candidate],
         judge_completed: Statement,
         at: &str,
     ) -> Result<(), Error> {
-        // Two of the three branches enqueue the stage the verdict leads to.
+        // Two of the branches enqueue the stage the verdict leads to.
         let enqueue = |stage: Stage| {
             store::enqueue_stage_stmt(
                 &self.outbox,
@@ -559,17 +599,19 @@ impl Pipeline {
 
         match judgment.verdict {
             Verdict::File => {
-                let batch = [
+                self.commit_file(record, ticket, judgment, judge_completed, None, at)
+                    .await
+            }
+            Verdict::Duplicate => {
+                self.commit_duplicate_verdict(
+                    record,
+                    ticket,
+                    judgment,
+                    candidates,
                     judge_completed,
-                    store::update_ticket_judgment_stmt(&ticket.id, judgment, at),
-                    store::update_ticket_status_stmt(&ticket.id, Status::Filing, at),
-                    store::update_ticket_stage_stmt(&ticket.id, Stage::File, at),
-                    enqueue(Stage::File),
-                    store::outbox_complete_stmt(OUTBOX_TABLE, &record.id),
-                ];
-                self.commit(&batch).await?;
-                self.defer_next();
-                Ok(())
+                    at,
+                )
+                .await
             }
             Verdict::Reject => {
                 // The rejection's audit row records *why*: the judge's own
@@ -633,6 +675,161 @@ impl Pipeline {
                 Ok(())
             }
         }
+    }
+
+    /// Resolves a `duplicate` verdict: link when the judge named a shown
+    /// candidate that still exists, otherwise file — always recording a
+    /// `duplicate_ignored` event, so the trail shows the verdict was a
+    /// duplicate and *what* it named (a rejected id, or none at all). A
+    /// report dropped on a bad id is a defect lost, so a rejected link
+    /// falls back to filing.
+    async fn commit_duplicate_verdict(
+        &self,
+        record: &OutboxRecord,
+        ticket: &Ticket,
+        judgment: &Judgment,
+        candidates: &[Candidate],
+        judge_completed: Statement,
+        at: &str,
+    ) -> Result<(), Error> {
+        let target = judgment
+            .duplicate_of
+            .as_deref()
+            .filter(|id| candidates.iter().any(|candidate| candidate.id == *id));
+        // Re-read the row rather than trusting the candidate snapshot:
+        // link rows name it, so it must still exist.
+        let existing = match target {
+            Some(id) => store::load_ticket(&*self.db, id).await?,
+            None => None,
+        };
+        if let Some(existing) = existing {
+            self.commit_duplicate(record, ticket, judgment, judge_completed, &existing, at)
+                .await
+        } else {
+            let ignored = self.duplicate_ignored_stmt(
+                ticket,
+                judgment.duplicate_of.as_deref(),
+                candidates,
+                at,
+            );
+            self.commit_file(record, ticket, judgment, judge_completed, Some(ignored), at)
+                .await
+        }
+    }
+
+    /// The `file` path, shared by a plain `file` verdict and by a
+    /// `duplicate` verdict that had to fall back (invalid or missing
+    /// target). `ignored` is the `duplicate_ignored` event for that
+    /// fallback — so the trail shows the duplicate verdict was seen and
+    /// what (if anything) it named.
+    async fn commit_file(
+        &self,
+        record: &OutboxRecord,
+        ticket: &Ticket,
+        judgment: &Judgment,
+        judge_completed: Statement,
+        ignored: Option<Statement>,
+        at: &str,
+    ) -> Result<(), Error> {
+        let mut batch = vec![judge_completed];
+        batch.extend(ignored);
+        batch.extend([
+            store::update_ticket_judgment_stmt(&ticket.id, judgment, at),
+            store::update_ticket_status_stmt(&ticket.id, Status::Filing, at),
+            store::update_ticket_stage_stmt(&ticket.id, Stage::File, at),
+            store::enqueue_stage_stmt(
+                &self.outbox,
+                &self.idgen.ulid(),
+                &ticket.id,
+                &ticket.tenant_id,
+                Stage::File,
+                at,
+            ),
+            store::outbox_complete_stmt(OUTBOX_TABLE, &record.id),
+        ]);
+        self.commit(&batch).await?;
+        self.defer_next();
+        Ok(())
+    }
+
+    /// The `duplicate` path: this ticket is not filed. Instead it is
+    /// linked to the existing filed ticket, that ticket's `match_count`
+    /// is bumped, and the customer is notified (through the notify stage,
+    /// exactly as a filing is). The duplicate's own `external_id`/
+    /// `external_url` are copied from the existing ticket so the notify
+    /// stage can name and link it without loading the other row. No
+    /// `Tracker::file` call happens anywhere on this path.
+    async fn commit_duplicate(
+        &self,
+        record: &OutboxRecord,
+        ticket: &Ticket,
+        judgment: &Judgment,
+        judge_completed: Statement,
+        existing: &Ticket,
+        at: &str,
+    ) -> Result<(), Error> {
+        let detail = json!({
+            "duplicate_of": existing.id,
+            "external_id": existing.external_id,
+            "url": existing.external_url,
+        });
+        let linked = store::insert_event_stmt(
+            &self.idgen.ulid(),
+            &ticket.id,
+            stage_seq(Stage::Judge, 1),
+            at,
+            Stage::Judge,
+            EventKind::Linked,
+            &detail,
+        );
+        let batch = [
+            judge_completed,
+            linked,
+            store::update_ticket_judgment_stmt(&ticket.id, judgment, at),
+            store::update_ticket_duplicate_stmt(&ticket.id, existing, at),
+            store::update_ticket_status_stmt(&ticket.id, Status::Duplicate, at),
+            store::update_ticket_stage_stmt(&ticket.id, Stage::Notify, at),
+            store::insert_ticket_link_stmt(existing, &ticket.id, &ticket.conversation_id, at),
+            store::increment_match_count_stmt(&existing.id, at),
+            store::enqueue_stage_stmt(
+                &self.outbox,
+                &self.idgen.ulid(),
+                &ticket.id,
+                &ticket.tenant_id,
+                Stage::Notify,
+                at,
+            ),
+            store::outbox_complete_stmt(OUTBOX_TABLE, &record.id),
+        ];
+        self.commit(&batch).await?;
+        self.defer_next();
+        Ok(())
+    }
+
+    /// The audit row for a `duplicate` verdict that fell back to filing:
+    /// the row records the id the judge named (JSON `null` when it named
+    /// none) and the candidates that were on offer.
+    fn duplicate_ignored_stmt(
+        &self,
+        ticket: &Ticket,
+        duplicate_of: Option<&str>,
+        candidates: &[Candidate],
+        at: &str,
+    ) -> Statement {
+        let shown: Vec<&str> = candidates
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect();
+        let detail = json!({ "duplicate_of": duplicate_of, "candidates": shown });
+        store::insert_event_stmt(
+            &self.idgen.ulid(),
+            &ticket.id,
+            stage_seq(Stage::Judge, 1),
+            at,
+            Stage::Judge,
+            EventKind::DuplicateIgnored,
+            &detail,
+        )
     }
 
     // ------------------------------------------------------------------
@@ -1157,7 +1354,11 @@ fn stage_already_committed(ticket: &Ticket, stage: Stage) -> bool {
     ticket.stage.ordinal() > stage.ordinal()
         || matches!(
             ticket.status,
-            Status::Filed | Status::Rejected | Status::NeedsInfo | Status::DeadLetter
+            Status::Filed
+                | Status::Rejected
+                | Status::NeedsInfo
+                | Status::Duplicate
+                | Status::DeadLetter
         )
 }
 
@@ -1276,6 +1477,28 @@ pub(crate) fn compose_notify_message(ticket: &Ticket) -> (String, String) {
             };
             (subject, message)
         }
+        Status::Duplicate => {
+            // Linking only ever targets a candidate, and a candidate is a
+            // `status = 'filed'` ticket (see `store::candidate_tickets`),
+            // so the existing ticket is filed and that is the status the
+            // customer is shown, alongside the same reference and link a
+            // filing would have given them.
+            let subject = format!("Update on your support request: {title}");
+            let message = match (&ticket.external_id, &ticket.external_url) {
+                (Some(id), Some(url)) => format!(
+                    "This is already tracked by our engineering team as {id} (status: {}).\n\nTracker link: {url}\n\nWe will follow up here when there is news.",
+                    Status::Filed.as_str()
+                ),
+                (Some(id), None) => format!(
+                    "This is already tracked by our engineering team as {id} (status: {}).\n\nWe will follow up here when there is news.",
+                    Status::Filed.as_str()
+                ),
+                _ => "This is already tracked by our engineering team; we will follow up here \
+                      when there is news."
+                    .to_owned(),
+            };
+            (subject, message)
+        }
         Status::NeedsInfo => (
             "We need a little more information".to_owned(),
             ticket
@@ -1315,11 +1538,22 @@ const JUDGE_SYSTEM: &str = "You are an independent judge of a drafted defect tic
      not write it. Check the draft against the original transcript: is this a defect in our \
      product, do the reproduction steps actually reproduce something, is the severity \
      proportionate, does the draft carry customer personal data that must not reach a tracker? \
-     Answer only with JSON matching the given schema, and always give your reasons.";
+     If the brief lists existing tickets and this draft is the same defect as one of them, set \
+     `verdict` to `duplicate` and `duplicate_of` to that ticket's id from the list — never any \
+     other id, and never when it is not the same defect. Answer only with JSON matching the \
+     given schema, and always give your reasons.";
 
-/// What the judge's prompt carries: the draft and the transcript it must
-/// be checked against.
-fn judge_brief(ticket: &Ticket) -> String {
+/// One duplicate candidate as the judge's brief shows it: the filed
+/// ticket's id (the only value a valid `duplicate_of` may carry) and its
+/// title.
+struct Candidate {
+    id: String,
+    title: String,
+}
+
+/// What the judge's prompt carries: the draft, the candidate tickets it
+/// might duplicate, and the transcript it must be checked against.
+fn judge_brief(ticket: &Ticket, candidates: &[Candidate]) -> String {
     use std::fmt::Write as _;
 
     let mut brief = String::from("Drafted ticket:\n");
@@ -1334,9 +1568,104 @@ fn judge_brief(ticket: &Ticket) -> String {
     if let Some(severity) = ticket.severity {
         let _ = writeln!(brief, "\nDrafted severity: {}", severity.name());
     }
+    if !candidates.is_empty() {
+        brief.push_str("\nExisting filed tickets (name one in `duplicate_of` only if it is the same defect):\n");
+        for candidate in candidates {
+            let _ = writeln!(brief, "[{}] {}", candidate.id, candidate.title);
+        }
+    }
     brief.push_str("\nOriginal transcript:\n");
     brief.push_str(&ticket.transcript);
     brief
+}
+
+/// The text a ticket is tokenized on for duplicate scoring: its title
+/// and body, the two drafted fields that say what it is about.
+fn draft_text(ticket: &Ticket) -> String {
+    let title = ticket.title.as_deref().unwrap_or_default();
+    let body = ticket.body_markdown.as_deref().unwrap_or_default();
+    format!("{title}\n{body}")
+}
+
+/// Ranks `candidates` against `draft` by BM25 over title+body, keeping
+/// the top [`CANDIDATE_LIMIT`] with a positive score (best first).
+///
+/// The corpus is the candidate set itself — `N` its size, `avg_length`
+/// the mean token count — so the ranking is self-contained and needs no
+/// server-side index. Pure: no database, no clock.
+fn rank_candidates(draft: &str, candidates: &[Ticket]) -> Vec<Candidate> {
+    let query_terms = tokenize(draft);
+    if query_terms.is_empty() || candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut postings: Vec<bm25::Posting> = Vec::new();
+    let mut total_length: u64 = 0;
+    for candidate in candidates {
+        let (terms, length) = term_stats(&draft_text(candidate));
+        total_length += u64::from(length);
+        for (term, tf) in terms {
+            postings.push(bm25::Posting {
+                chunk_id: candidate.id.clone(),
+                term,
+                tf,
+                length,
+            });
+        }
+    }
+
+    // A candidate set is a handful of tickets, nowhere near 2^53, so the
+    // precision these casts lose cannot surface in a score.
+    #[expect(clippy::cast_precision_loss)]
+    let avg_length = total_length as f64 / candidates.len() as f64;
+    let corpus = bm25::Corpus {
+        chunk_count: candidates.len() as u64,
+        avg_length,
+    };
+
+    // Document frequency over the candidate set: `term_stats` yields each
+    // term once per candidate, so a term's posting count is its df. The
+    // set is the whole corpus here, so nothing is truncated and these are
+    // exact (support's persisted-statistics path is the bounded one).
+    let mut df: HashMap<String, u64> = HashMap::new();
+    for posting in &postings {
+        *df.entry(posting.term.clone()).or_default() += 1;
+    }
+
+    let mut ranked = bm25::rank(
+        &query_terms,
+        &postings,
+        &df,
+        &corpus,
+        &bm25::Params::default(),
+    );
+    ranked.retain(|scored| scored.score > 0.0);
+    ranked.truncate(CANDIDATE_LIMIT);
+    ranked
+        .into_iter()
+        .filter_map(|scored| {
+            let candidate = candidates.iter().find(|c| c.id == scored.chunk_id)?;
+            Some(Candidate {
+                id: candidate.id.clone(),
+                title: candidate
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "(untitled)".to_owned()),
+            })
+        })
+        .collect()
+}
+
+/// Terms and their frequencies for one string, sorted by term — the
+/// per-document half of the in-memory postings [`rank_candidates`]
+/// builds.
+fn term_stats(text: &str) -> (Vec<(String, u32)>, u32) {
+    let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+    for term in tokenize(text) {
+        *counts.entry(term).or_default() += 1;
+    }
+    let length = counts.values().sum();
+    (counts.into_iter().collect(), length)
 }
 
 /// Inserts a key into an event `detail` that serialised from a struct —
@@ -1493,6 +1822,7 @@ mod tests {
             customer_question: Some("which build is this?".to_owned()),
             external_id: Some("acme/api#7".to_owned()),
             external_url: Some("https://github.test/acme/api/7".to_owned()),
+            match_count: 0,
             created_at: "2026-09-19T00:00:00Z".to_owned(),
             updated_at: "2026-09-19T00:00:00Z".to_owned(),
         }

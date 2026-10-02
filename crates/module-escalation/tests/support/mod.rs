@@ -63,6 +63,8 @@ pub(crate) const REJECT_REASON: &str =
     "the customer is asking how to use a gift card, not reporting a defect";
 /// The judge stage's single reason on the `needs_info` verdict, verbatim.
 pub(crate) const NEEDS_INFO_REASON: &str = "which build number is the customer on?";
+/// The judge stage's single reason on the `duplicate` verdict, verbatim.
+pub(crate) const DUPLICATE_REASON: &str = "this is the same defect as an existing filed ticket";
 
 // ---------------------------------------------------------------------------
 // Fakes' payloads
@@ -162,6 +164,21 @@ pub(crate) fn needs_info_judgment() -> serde_json::Value {
     })
 }
 
+/// The `Judgment` that links the ticket to `duplicate_of` — the id of an
+/// existing filed ticket the judge was shown as a candidate.
+#[must_use]
+pub(crate) fn duplicate_judgment(duplicate_of: &str) -> serde_json::Value {
+    serde_json::json!({
+        "is_defect": true,
+        "reproducible": true,
+        "duplicate_of": duplicate_of,
+        "severity_ok": true,
+        "pii_clean": true,
+        "verdict": "duplicate",
+        "reasons": [DUPLICATE_REASON],
+    })
+}
+
 /// RFC 3339 of a whole-second instant.
 #[must_use]
 pub(crate) fn format_at(at: time::OffsetDateTime) -> String {
@@ -178,17 +195,27 @@ pub(crate) fn migrated_db() -> Arc<SqliteDatabase> {
     let db = SqliteDatabase::in_memory().expect("in-memory database");
     db.apply_migrations(
         "module-escalation",
-        std::slice::from_ref(&module_escalation::MIGRATION_ESCALATION),
+        &[
+            module_escalation::MIGRATION_ESCALATION,
+            module_escalation::MIGRATION_DUPLICATES,
+        ],
     )
     .expect("migration applies");
     Arc::new(db)
 }
 
-/// Seeds `tenant`'s tracker destination — the file stage's destination and
-/// the credential *reference* it resolves through the Config port.
+/// Seeds the tenant's tracker destination — the file stage's destination
+/// and the credential *reference* it resolves through the Config port.
 pub(crate) fn seed_destination(db: &SqliteDatabase, destination: &Destination) {
+    seed_destination_for(db, TENANT, destination);
+}
+
+/// Seeds a specific tenant's tracker destination. The destination is
+/// per-tenant (`sg_destinations` is keyed by `tenant_id`), so a
+/// cross-tenant test needs one row per tenant it escalates for.
+pub(crate) fn seed_destination_for(db: &SqliteDatabase, tenant: &str, destination: &Destination) {
     let stmt = store::put_destination_stmt(
-        TENANT,
+        tenant,
         destination,
         CREDENTIAL_REF,
         &format_at(time::OffsetDateTime::from_unix_timestamp(EPOCH).expect("epoch")),
@@ -366,7 +393,44 @@ pub(crate) fn ticket(fixture: &Fixture) -> Ticket {
 /// The fixture's audit trail, in `(seq, at, id)` order.
 #[must_use]
 pub(crate) fn events(fixture: &Fixture) -> Vec<TicketEvent> {
-    pollster::block_on(store::ticket_events(&*fixture.db, &fixture.ticket_id)).expect("events read")
+    events_for(&fixture.db, &fixture.ticket_id)
+}
+
+/// One ticket's audit trail, by id — for tests with more than one ticket.
+#[must_use]
+pub(crate) fn events_for(db: &SqliteDatabase, ticket_id: &str) -> Vec<TicketEvent> {
+    pollster::block_on(store::ticket_events(db, ticket_id)).expect("events read")
+}
+
+/// Loads any ticket by id — the multi-ticket counterpart of [`ticket`].
+#[must_use]
+pub(crate) fn ticket_by_id(db: &SqliteDatabase, ticket_id: &str) -> Ticket {
+    pollster::block_on(store::load_ticket(db, ticket_id))
+        .expect("ticket read")
+        .expect("ticket row exists")
+}
+
+/// Every `sg_ticket_links` row as `(ticket_id, conversation_id,
+/// source_ticket_id)`, in ticket-id order.
+#[must_use]
+pub(crate) fn ticket_links(db: &SqliteDatabase) -> Vec<(String, String, String)> {
+    let stmt = Statement::new(
+        "SELECT ticket_id, conversation_id, source_ticket_id FROM sg_ticket_links \
+         ORDER BY ticket_id, conversation_id",
+    );
+    let rows = pollster::block_on(db.query(&stmt)).expect("link rows read");
+    rows.rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String>("ticket_id").expect("ticket_id decodes"),
+                row.get::<String>("conversation_id")
+                    .expect("conversation_id decodes"),
+                row.get::<String>("source_ticket_id")
+                    .expect("source_ticket_id decodes"),
+            )
+        })
+        .collect()
 }
 
 /// The trail as `(stage topic, event kind)` pairs — the readable shape an

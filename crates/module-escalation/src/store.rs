@@ -38,7 +38,7 @@ fn iden(name: &str) -> Alias {
 }
 
 /// The columns `sg_tickets` reads come back in, in decode order.
-const TICKET_COLUMNS: [&str; 17] = [
+const TICKET_COLUMNS: [&str; 18] = [
     "id",
     "tenant_id",
     "conversation_id",
@@ -54,6 +54,7 @@ const TICKET_COLUMNS: [&str; 17] = [
     "customer_question",
     "external_id",
     "external_url",
+    "match_count",
     "created_at",
     "updated_at",
 ];
@@ -96,6 +97,7 @@ pub fn insert_ticket_stmt(ticket: &Ticket) -> Statement {
             ticket.customer_question.clone().into(),
             ticket.external_id.clone().into(),
             ticket.external_url.clone().into(),
+            ticket.match_count.into(),
             ticket.created_at.clone().into(),
             ticket.updated_at.clone().into(),
         ]);
@@ -195,6 +197,77 @@ pub fn update_ticket_filed_stmt(ticket_id: &str, filed: &Filed, at: &str) -> Sta
             (iden("external_url"), filed.url.clone().into()),
             (iden("updated_at"), at.to_owned().into()),
         ])
+        .and_where(Expr::col(iden("id")).eq(ticket_id));
+    Statement::render(&update)
+}
+
+/// Points a duplicate ticket at the tracker reference of the existing
+/// ticket it duplicates — so the notify stage can name and link it
+/// without loading the other row — and refreshes `updated_at`. The
+/// duplicate is never filed itself, so this is where its `external_id`
+/// and `external_url` come from.
+#[must_use]
+pub fn update_ticket_duplicate_stmt(ticket_id: &str, existing: &Ticket, at: &str) -> Statement {
+    let mut update = Query::update();
+    update
+        .table(iden("sg_tickets"))
+        .values([
+            (iden("external_id"), existing.external_id.clone().into()),
+            (iden("external_url"), existing.external_url.clone().into()),
+            (iden("updated_at"), at.to_owned().into()),
+        ])
+        .and_where(Expr::col(iden("id")).eq(ticket_id));
+    Statement::render(&update)
+}
+
+/// Records one `sg_ticket_links` row: the duplicate ticket — and the
+/// conversation it came from — is now linked to an existing filed ticket.
+/// `source_ticket_id` is the primary key, so re-linking the same duplicate
+/// ticket (a redelivered judge stage) is a no-op rather than a second row
+/// — and a second ticket from the *same* conversation still gets its own
+/// row.
+#[must_use]
+pub fn insert_ticket_link_stmt(
+    existing: &Ticket,
+    source_ticket_id: &str,
+    conversation_id: &str,
+    at: &str,
+) -> Statement {
+    let mut insert = Query::insert();
+    insert
+        .into_table(iden("sg_ticket_links"))
+        .columns([
+            "tenant_id",
+            "ticket_id",
+            "conversation_id",
+            "source_ticket_id",
+            "created_at",
+        ])
+        .values_panic([
+            existing.tenant_id.clone().into(),
+            existing.id.clone().into(),
+            conversation_id.to_owned().into(),
+            source_ticket_id.to_owned().into(),
+            at.to_owned().into(),
+        ])
+        .on_conflict(
+            sea_query::OnConflict::columns([iden("source_ticket_id")])
+                .do_nothing()
+                .to_owned(),
+        );
+    Statement::render(&insert)
+}
+
+/// Bumps an existing ticket's `match_count` by one — one more later
+/// ticket has linked to it as a duplicate — and refreshes `updated_at`,
+/// as every ticket write does.
+#[must_use]
+pub fn increment_match_count_stmt(ticket_id: &str, at: &str) -> Statement {
+    let mut update = Query::update();
+    update
+        .table(iden("sg_tickets"))
+        .value(iden("match_count"), Expr::col(iden("match_count")).add(1))
+        .value(iden("updated_at"), at)
         .and_where(Expr::col(iden("id")).eq(ticket_id));
     Statement::render(&update)
 }
@@ -405,6 +478,52 @@ pub async fn find_ticket_by_conversation(
     rows.first().map(ticket_from).transpose()
 }
 
+/// How many of a tenant's most recently active filed tickets enter the
+/// candidate pool before BM25 ranking narrows them to the brief's short
+/// list (see `pipeline::CANDIDATE_LIMIT`).
+const CANDIDATE_POOL: u64 = 200;
+
+/// The filed tickets a draft could duplicate: the tenant's *other* filed
+/// tickets, most recently active first, capped at [`CANDIDATE_POOL`].
+///
+/// A successful file is the only writer of `external_id`, so requiring it
+/// (alongside `status = 'filed'`) keeps the tracker-reached tickets and
+/// nothing else — rejected, needs-info, duplicate and dead-lettered rows
+/// never get one. The local store does not track whether the external
+/// issue is still open, so "open or recently closed" is approximated by
+/// the most recently *active* filed tickets: `updated_at DESC` with a
+/// fixed-size pool. A `match_count` bump refreshes `updated_at` (see
+/// [`increment_match_count_stmt`]), so a ticket still collecting
+/// duplicates stays hot in the pool.
+///
+/// The tracker destination is per-tenant — `sg_destinations` is keyed by
+/// `tenant_id` alone — so same-tenant **is** same-destination; there is
+/// no second key to scope on. `exclude_ticket_id` drops the ticket
+/// currently being judged.
+///
+/// # Errors
+///
+/// As [`load_ticket`].
+pub async fn candidate_tickets(
+    db: &dyn Database,
+    tenant_id: &str,
+    exclude_ticket_id: &str,
+) -> Result<Vec<Ticket>, Error> {
+    let mut query = select_tickets();
+    query
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden("id")).ne(exclude_ticket_id))
+        .and_where(Expr::col(iden("status")).eq(Status::Filed.as_str()))
+        .and_where(Expr::col(iden("external_id")).is_not_null())
+        // Newest first, so the bounded pool keeps the freshest tickets;
+        // `id` breaks an `updated_at` tie deterministically.
+        .order_by(iden("updated_at"), Order::Desc)
+        .order_by(iden("id"), Order::Desc)
+        .limit(CANDIDATE_POOL);
+    let rows = db.query(&Statement::render(&query)).await?;
+    rows.rows.iter().map(ticket_from).collect()
+}
+
 /// Loads a tenant's tracker destination and the Config key its credential
 /// lives under. The secret itself never reaches the store; resolve
 /// `credential_ref` through the Config port at file-time.
@@ -514,6 +633,9 @@ fn ticket_from(row: &Row) -> Result<Ticket, Error> {
         customer_question: optional_text(row, "customer_question")?,
         external_id: optional_text(row, "external_id")?,
         external_url: optional_text(row, "external_url")?,
+        match_count: row.get::<i64>("match_count").ok_or_else(|| {
+            Error::Decode("column `match_count` missing or not an integer".to_owned())
+        })?,
         created_at: required_text(row, "created_at")?,
         updated_at: required_text(row, "updated_at")?,
     })
@@ -688,7 +810,7 @@ mod tests {
         let db = cratefield_adapter_sqlite::SqliteDatabase::in_memory().expect("in-memory db");
         db.apply_migrations(
             "module-escalation",
-            std::slice::from_ref(&crate::MIGRATION_ESCALATION),
+            &[crate::MIGRATION_ESCALATION, crate::MIGRATION_DUPLICATES],
         )
         .expect("migration applies");
         db
@@ -712,6 +834,7 @@ mod tests {
             customer_question: None,
             external_id: None,
             external_url: None,
+            match_count: 0,
             created_at: "2026-09-19T00:00:00Z".to_owned(),
             updated_at: "2026-09-19T00:00:00Z".to_owned(),
         }
