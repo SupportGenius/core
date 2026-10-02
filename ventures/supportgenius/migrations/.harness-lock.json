@@ -12,8 +12,24 @@
     "sha256": "b41235ce26089af596f376a22b8d55e2e6ba8fe3c2f01b6e59d2a027d2a12772"
   },
   "support/0004": {
-    "file": "0010_support_0004_widget_settings.sql",
-    "sha256": "c6c487b395bdf963bb3e9bcb19016ba75e823af0cd99d3995b7bbfe22f6f7729"
+    "file": "0010_support_0004_internationalization.sql",
+    "sha256": "515f0f1624ff39358acad28d900cfb572fa371cf42a3186432e10a34aa56515d"
+  },
+  "support/0005": {
+    "file": "0011_support_0005_uploads.sql",
+    "sha256": "173038ac5186ef000bd263150d14946108c561a2eb58d394996f82fda9db3b60"
+  },
+  "support/0006": {
+    "file": "0012_support_0006_connectors.sql",
+    "sha256": "5e96dea62cd0fe36885a81898f6cb231f0223d341604bdb9eb981bb05ea6c9c6"
+  },
+  "support/0007": {
+    "file": "0013_support_0007_search_stats.sql",
+    "sha256": "1d145a34d79f19c37451102f7078cb51fbf932b246087c2e9a47169afd150967"
+  },
+  "support/0008": {
+    "file": "0014_support_0008_widget_settings.sql",
+    "sha256": "4e3457305c59fc196acad62eef26ef2084f3bfd4f2d1dd10529466877e11d192"
   },
   "waitlist/0001": {
     "file": "0001_waitlist_0001_init.sql",

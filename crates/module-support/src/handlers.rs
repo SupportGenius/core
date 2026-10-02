@@ -22,21 +22,26 @@ use cratefield_core::{
 
 use crate::bm25;
 use crate::chunk::{Chunker, tokenize};
+use crate::connectors::{self, ConnectorConfig, Kind};
 use crate::messages;
-use crate::store::{self, ApiKeyRow, ChunkRow, STATUS_ACTIVE, SourceRow, TenantRow};
+use crate::store::{self, ApiKeyRow, ChunkRow, ConnectorRow, STATUS_ACTIVE, SourceRow, TenantRow};
+use crate::uploads;
 use crate::widget;
 
-/// The inline `text` ceiling for `POST /sources`. Not arbitrary: `/v1/*`
-/// request bodies are already capped at 64 KiB
-/// (`cratefield_core::MAX_BODY_BYTES`), and `Blob::signed_url` is
-/// GET-only, so there is no presigned upload path a larger document could
-/// arrive through. 48 KiB keeps a maximal document inside a maximal
-/// request with room for the rest of the JSON.
+/// The inline `text` ceiling for `POST /sources`, and one part's ceiling
+/// for the chunked-upload routes (`uploads::PART_BYTES`). Not arbitrary:
+/// `/v1/*` request bodies are already capped at 64 KiB
+/// (`cratefield_core::MAX_BODY_BYTES`) and `Blob::signed_url` is GET-only,
+/// so the only way a larger document arrives is as upload parts, one
+/// request each. 48 KiB keeps a maximal document — or part — inside a
+/// maximal request with room for the rest of the JSON.
 pub(crate) const MAX_TEXT_BYTES: usize = 48 * 1024;
 
 /// Tenant display name ceiling, in bytes of UTF-8. A name is prose for a
-/// dashboard, not a document; anything past this is a mistake.
-const MAX_NAME_BYTES: usize = 200;
+/// dashboard, not a document; anything past this is a mistake. The
+/// upload routes borrow it for `filename` (a document's name is prose
+/// for a search hit, not a path).
+pub(crate) const MAX_NAME_BYTES: usize = 200;
 
 /// `limit` handling for `GET /search`: default 10, hard range 1..=50.
 const DEFAULT_LIMIT: u32 = 10;
@@ -116,6 +121,14 @@ pub(crate) fn router(
             "/sources/{source_id}",
             get(get_source).put(put_source).delete(delete_source),
         )
+        .route("/uploads", post(uploads::create_upload))
+        .route("/uploads/{upload_id}/parts/{n}", put(uploads::put_part))
+        .route(
+            "/uploads/{upload_id}/complete",
+            post(uploads::complete_upload),
+        )
+        .route("/uploads/{upload_id}", get(uploads::get_upload))
+        .route("/connectors", post(create_connector))
         .route("/search", get(search))
         .route("/messages", post(messages::post_message))
         .route("/widget/messages", post(widget::post_widget_message))
@@ -184,21 +197,22 @@ pub(crate) async fn authenticate(
 /// matters is the tenant's, and an IP bucket would let one office full of
 /// colleagues exhaust each other.
 ///
-/// The limiter is the only backstop on `/search` and `/messages`: `/search`
-/// is a full-corpus postings fetch and BM25 rank per request (since
-/// `store::postings_for` is deliberately unbounded — a `LIMIT` would
-/// corrupt ranking; see its docs), and `/messages` adds a paid model call.
+/// The limiter is a budget guard, not the cost story: since the corpus
+/// statistics moved into `sg_terms`/`sg_tenant_stats`, a `/search` request
+/// reads a fixed budget of rows no matter how large the tenant's corpus
+/// grows — one stats row, at most [`store::MAX_QUERY_TERMS`] df rows, at
+/// most that many postings fetches of [`store::MAX_POSTINGS_PER_TERM`]
+/// rows each, and the result's chunk rows (the invariant is spelled out on
+/// [`store::postings_for`]). `/messages` adds a paid model call on top.
 /// `FailClosed` therefore governs a *transport failure of a limiter that
 /// is present*: once one is composed, a flaky limiter denies rather than
-/// waving the corpus scan (or the model call) through. It does **not**
+/// waving the request (or the model call) through. It does **not**
 /// manufacture a backstop from nothing — an *absent* limiter resolves to
 /// `RateLimit::Allowed` (`check_rate_limit` short-circuits on `None`),
 /// independent of `FailClosed`. So this guard only bites when the
 /// composition actually mounts a `RateLimiter`: the Cloudflare Worker does,
 /// unconditionally (`RATE_LIMITER` in wrangler.toml), and the native binary
-/// does when `REDIS_URL` is set — which it requires in production. The
-/// limiter is the effective per-tenant ceiling; bounding `postings_for`
-/// itself is a separate correctness problem and is not attempted here.
+/// does when `REDIS_URL` is set — which it requires in production.
 ///
 /// `Some` is the 429 response the handler returns verbatim.
 pub(crate) async fn guard_rate_limit(ctx: &ModuleContext, tenant_id: &str) -> Option<Response> {
@@ -523,9 +537,274 @@ async fn ingest_source(
     }
 }
 
+/// One `POST /connectors` body. The kind decides which fields are
+/// required; the rest are optional with the documented defaults.
+#[derive(Deserialize)]
+struct ConnectorBody {
+    kind: String,
+    url: Option<String>,
+    owner: Option<String>,
+    repo: Option<String>,
+    path_glob: Option<String>,
+    r#ref: Option<String>,
+    credential_ref: Option<String>,
+    max_pages: Option<i64>,
+    max_bytes: Option<i64>,
+    max_depth: Option<i64>,
+}
+
+/// Validates a connector body's kind-specific fields into the
+/// [`ConnectorConfig`] stored with the row. Every problem is a 400 naming
+/// the field; this is the shape the route documents, and the only place a
+/// body field is interpreted.
+fn connector_kind_config(
+    body: &ConnectorBody,
+    request_id: &str,
+) -> Result<(Kind, ConnectorConfig), Problem> {
+    let kind = Kind::parse(body.kind.trim()).ok_or_else(|| {
+        Problem::validation_failed(format!(
+            "kind: expected \"sitemap\", \"url_prefix\" or \"github\", got {:?}",
+            body.kind
+        ))
+        .instance(request_id)
+    })?;
+    let config = match kind {
+        Kind::Sitemap | Kind::UrlPrefix => {
+            let url = body.url.clone().unwrap_or_default();
+            let usable = url.parse::<http::Uri>().is_ok_and(|uri| {
+                matches!(uri.scheme_str(), Some("http" | "https")) && uri.authority().is_some()
+            });
+            if !usable {
+                return Err(Problem::validation_failed(
+                    "url: required, an absolute http(s) URL — the sitemap's address, or the \
+                     prefix's seed page",
+                )
+                .instance(request_id));
+            }
+            ConnectorConfig::Web { url }
+        }
+        Kind::Github => {
+            let clean = |raw: Option<&str>| -> Option<String> {
+                let trimmed = raw?.trim();
+                (!trimmed.is_empty()
+                    && !trimmed.contains('/')
+                    && !trimmed.chars().any(char::is_whitespace))
+                .then(|| trimmed.to_owned())
+            };
+            let Some(owner) = clean(body.owner.as_deref()) else {
+                return Err(Problem::validation_failed(
+                    "owner: required for a github connector, the repository's owner with no \
+                     slashes or spaces",
+                )
+                .instance(request_id));
+            };
+            let Some(repo) = clean(body.repo.as_deref()) else {
+                return Err(Problem::validation_failed(
+                    "repo: required for a github connector, the repository's name with no \
+                     slashes or spaces",
+                )
+                .instance(request_id));
+            };
+            let optional = |raw: Option<&str>| -> Option<String> {
+                let trimmed = raw?.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_owned())
+            };
+            // `ref` defaults to the repository's default branch when
+            // absent; when present it must be one usable git ref — no
+            // empty value, whitespace, `?`/`#` (they would splice a query
+            // or fragment into the API URLs), `..` (git's own range
+            // separator) or control characters.
+            let bad_ref = || {
+                Problem::validation_failed(
+                    "ref: when present, a git ref — no empty value, whitespace, \"?\", \
+                     \"#\", \"..\" or control characters",
+                )
+                .instance(request_id)
+            };
+            let r#ref = match body.r#ref.as_deref().map(str::trim) {
+                None => None,
+                Some("") => return Err(bad_ref()),
+                Some(git_ref)
+                    if git_ref.contains(['?', '#'])
+                        || git_ref.contains("..")
+                        || git_ref.chars().any(|c| c.is_whitespace() || c.is_control()) =>
+                {
+                    return Err(bad_ref());
+                }
+                Some(git_ref) => Some(git_ref.to_owned()),
+            };
+            ConnectorConfig::Github {
+                owner,
+                repo,
+                path_glob: optional(body.path_glob.as_deref()),
+                r#ref,
+            }
+        }
+    };
+    Ok((kind, config))
+}
+
+/// The ports `POST /connectors` runs on, in [`connector_ports`]' order.
+type ConnectorPorts = (
+    Arc<dyn HttpClient>,
+    Arc<dyn Database>,
+    Arc<dyn Clock>,
+    Arc<dyn IdGen>,
+);
+
+/// Collects those ports, or says which one is missing. The `HttpClient`
+/// check doubles as the route's not-ready answer and comes before any
+/// validation output and before any write: a connector row without an
+/// `HttpClient` is a crawl that can never start, and the caller should
+/// hear that from the platform shape, not from a job that silently does
+/// nothing.
+fn connector_ports(ctx: &ModuleContext) -> Result<ConnectorPorts, Problem> {
+    let http: Arc<dyn HttpClient> = ctx.ports.http.clone().ok_or_else(|| {
+        Problem::not_ready(
+            "connectors need the HttpClient port; this deployment did not configure one. \
+             Use the {\"text\"} form of POST /sources instead.",
+        )
+    })?;
+    let db: Arc<dyn Database> = ctx
+        .ports
+        .db
+        .clone()
+        .ok_or_else(|| Problem::internal().with_detail("required port Db is missing"))?;
+    let clock: Arc<dyn Clock> = ctx
+        .ports
+        .clock
+        .clone()
+        .ok_or_else(|| Problem::internal().with_detail("required port Clock is missing"))?;
+    let id_gen: Arc<dyn IdGen> = ctx
+        .ports
+        .id_gen
+        .clone()
+        .ok_or_else(|| Problem::internal().with_detail("required port IdGen is missing"))?;
+    Ok((http, db, clock, id_gen))
+}
+
+/// The effective caps a connector row stores: absent fields take the
+/// documented defaults, and nothing may exceed the hard maxima (or fall
+/// below the minimum of 1 — a cap of zero would be a connector that
+/// cannot run at all, which the caller should say with a deletion, not
+/// a typo).
+fn clamped_caps(body: &ConnectorBody) -> (i64, i64, i64) {
+    (
+        body.max_pages
+            .unwrap_or(connectors::DEFAULT_MAX_PAGES)
+            .clamp(1, connectors::MAX_MAX_PAGES),
+        body.max_bytes
+            .unwrap_or(connectors::DEFAULT_MAX_BYTES)
+            .clamp(1, connectors::MAX_MAX_BYTES),
+        body.max_depth
+            .unwrap_or(connectors::DEFAULT_MAX_DEPTH)
+            .clamp(1, connectors::MAX_MAX_DEPTH),
+    )
+}
+
+/// `POST /connectors` — register a crawl root (issue #29): a sitemap, a
+/// URL prefix, or a GitHub repository. The row and its seed fetch job
+/// land in one atomic batch, so a connector that exists always has work
+/// queued; the fetches then run on the module's `scheduled` hook (cron),
+/// with the `Defer` port pulling the first sweep into this request where
+/// the platform allows it.
+///
+/// Caps are clamped, not rejected — a caller asking for a million pages
+/// gets the maximum, which keeps one tenant's typo from being a
+/// deployment incident. The response is the created connector's id and
+/// effective caps; the crawl itself is asynchronous from here.
+async fn create_connector(
+    scope: Scope,
+    State(state): State<Arc<ModuleState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Problem> {
+    let ctx = &state.ctx;
+    // Guards before body parsing, as everywhere above: a 4xx from an
+    // extractor would tell an unauthenticated caller the route's shape.
+    let tenant_id = authenticate(ctx, &headers).await?;
+    if let Some(rate_limited) = guard_rate_limit(ctx, &tenant_id).await {
+        return Ok(rate_limited);
+    }
+    let body: ConnectorBody = serde_json::from_slice(&body).map_err(|_| {
+        Problem::validation_failed(
+            "body: expected a JSON object with a \"kind\" of \"sitemap\", \"url_prefix\" \
+             or \"github\"",
+        )
+        .instance(&scope.request_id)
+    })?;
+
+    let (http, db, clock, id_gen) = connector_ports(ctx)?;
+    let (kind, config) = connector_kind_config(&body, &scope.request_id)?;
+    // The credential is a *reference* to a Config key (the escalation
+    // module's rule): the secret itself never appears in a request, a
+    // row or a response.
+    let credential_ref = body
+        .credential_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+    let (max_pages, max_bytes, max_depth) = clamped_caps(&body);
+
+    let now = store::iso_now(clock.as_ref());
+    let connector = ConnectorRow {
+        id: id_gen.ulid(),
+        tenant_id: tenant_id.clone(),
+        kind: kind.as_str().to_owned(),
+        config: serde_json::to_string(&config)
+            .map_err(|_| Problem::internal().with_detail("connector config did not serialize"))?,
+        credential_ref,
+        max_pages,
+        max_bytes,
+        max_depth,
+        created_at: now.clone(),
+    };
+    let runner = connectors::Runner::new(
+        db.clone(),
+        http,
+        ctx.ports.config.clone(),
+        clock,
+        id_gen.clone(),
+        Some(scope.defer.clone()),
+    );
+    let job = connectors::seed_job(&connector, &config);
+    let payload = serde_json::to_string(&job)
+        .map_err(|_| Problem::internal().with_detail("seed job did not serialize"))?;
+    // The row and its first job: one batch, so the connector cannot
+    // exist for even a moment without work queued.
+    db.batch_atomic(&[
+        store::insert_connector_stmt(&connector),
+        store::enqueue_fetch_stmt(
+            runner.outbox(),
+            &id_gen.ulid(),
+            &payload,
+            &connector.id,
+            &now,
+        ),
+    ])
+    .await?;
+    // An execution opportunity for the seed (and whatever it discovers),
+    // durable either way: the scheduled re-sync is the backstop.
+    runner.defer_sweep();
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "connector_id": connector.id,
+            "kind": kind.as_str(),
+            "seed_url": config.seed_url(),
+            "max_pages": connector.max_pages,
+            "max_bytes": connector.max_bytes,
+            "max_depth": connector.max_depth,
+        })),
+    )
+        .into_response())
+}
+
 /// Title fallback: an absent or whitespace title becomes `Untitled`,
 /// which is what a result list should say rather than an empty string.
-fn clean_title(raw: Option<String>) -> String {
+pub(crate) fn clean_title(raw: Option<String>) -> String {
     match raw {
         Some(title) => {
             let trimmed = title.trim();
@@ -576,7 +855,7 @@ async fn fetch_text(http: &dyn HttpClient, url: &str) -> Result<String, Problem>
 /// set of entities that survive in prose, and collapses whitespace. It
 /// makes no attempt at structure, semantics or completeness — a page it
 /// mangles still indexes, just badly.
-fn html_to_text(html: &str) -> String {
+pub(crate) fn html_to_text(html: &str) -> String {
     let scripts_dropped = drop_block(html, "<script", "</script>");
     let blocks_dropped = drop_block(&scripts_dropped, "<style", "</style>");
     let without_tags = strip_tags(&blocks_dropped);
@@ -620,8 +899,10 @@ fn strip_tags(html: &str) -> String {
 }
 
 /// The five entities a prose corpus actually contains; the rest are
-/// dropped with their markup and were noise anyway.
-fn decode_entities(text: &str) -> String {
+/// dropped with their markup and were noise anyway. `pub(crate)` for the
+/// connectors' sitemap parser, whose `<loc>` values are escaped the same
+/// way.
+pub(crate) fn decode_entities(text: &str) -> String {
     text.replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
@@ -889,29 +1170,92 @@ pub(crate) struct Retrieved {
     pub score: f64,
 }
 
+/// The query's search terms: tokenised (the indexer's own tokenizer, CJK
+/// and Thai bigrams included), de-duplicated with the first occurrence's
+/// order kept (a repeated term must not double-count, and the
+/// left-to-right order is what fixes the postings fetch order, so scores
+/// are reproducible), and capped at [`store::MAX_QUERY_TERMS`] so a
+/// keyword-stuffed query cannot buy more reads than the invariant allows.
+fn query_terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for term in tokenize(query) {
+        if !terms.contains(&term) {
+            terms.push(term);
+        }
+        if terms.len() == store::MAX_QUERY_TERMS {
+            break;
+        }
+    }
+    terms
+}
+
 /// BM25 retrieval over one tenant's index: the top `k` chunks for `query`,
 /// best first. The one retrieval path — `GET /search` shows its result,
 /// `POST /messages` grounds the model in it — so what a tenant finds by
 /// searching is exactly what an answer can cite.
 ///
+/// Cost is flat in the corpus size: one `sg_tenant_stats` row, one
+/// `sg_terms` row per distinct query term, then — only for terms that
+/// survive the stopword rules — a bounded per-term top-k postings fetch
+/// ([`store::MAX_POSTINGS_PER_TERM`]), and the result's chunk rows.
+/// Ranking stays exact under that truncation because df and N come from
+/// the persisted statistics, not from the fetched rows (see
+/// [`bm25::rank`]).
+///
 /// A query that tokenises to nothing retrieves nothing, without touching
-/// the database. A ranked id whose chunk row is gone (a source deleted or
-/// replaced by a concurrent request between the postings fetch and the
-/// row read) is skipped rather than failing the request.
+/// the database — and a query whose every term is dropped (df 0, or a
+/// stopword by ratio) retrieves nothing without a postings fetch. A
+/// ranked id whose chunk row is gone (a source deleted or replaced by a
+/// concurrent request between the postings fetch and the row read) is
+/// skipped rather than failing the request.
 pub(crate) async fn retrieve(
     db: &dyn Database,
     tenant_id: &str,
     query: &str,
     k: usize,
 ) -> Result<Vec<Retrieved>, cratefield_core::DbError> {
-    let terms = tokenize(query);
+    let terms = query_terms(query);
     if terms.is_empty() {
         return Ok(Vec::new());
     }
 
+    // The statistics reads: N and avg length from the one tenant row, df
+    // for the query's terms from their `sg_terms` rows. Both are primary
+    // -key lookups; neither scans anything.
     let corpus = store::corpus_stats(db, tenant_id).await?;
-    let postings = store::postings_for(db, tenant_id, &terms).await?;
-    let mut ranked = bm25::rank(&terms, &postings, &corpus, &bm25::Params::default());
+    let dfs = store::term_dfs(db, tenant_id, &terms).await?;
+
+    // Two reasons to drop a term before paying for its postings. df 0:
+    // the term indexes no chunk here, so it has no rows and no idf. Too
+    // common: past [`store::STOPWORD_DF_RATIO`] of the corpus a term is a
+    // stopword — below [`store::STOPWORD_MIN_CHUNKS`] the ratio is
+    // information-free (one chunk in two makes 0.5 of any small tenant),
+    // so the rule waits for a corpus worth measuring, and idf already
+    // discounts what the ratio would.
+    // df and N as f64: counts, and a corpus near 2^53 chunks would lose
+    // a precision nobody could observe in a 0.5 comparison.
+    #[expect(clippy::cast_precision_loss)]
+    let too_common = |df: u64| df as f64 / corpus.chunk_count as f64 > store::STOPWORD_DF_RATIO;
+    let kept: Vec<String> = terms
+        .into_iter()
+        .filter(|term| match dfs.get(term) {
+            Some(df) if *df > 0 => {
+                corpus.chunk_count < store::STOPWORD_MIN_CHUNKS || !too_common(*df)
+            }
+            _ => false,
+        })
+        .collect();
+    if kept.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut postings = Vec::new();
+    for term in &kept {
+        postings
+            .extend(store::postings_for(db, tenant_id, term, store::MAX_POSTINGS_PER_TERM).await?);
+    }
+
+    let mut ranked = bm25::rank(&kept, &postings, &dfs, &corpus, &bm25::Params::default());
     ranked.truncate(k);
 
     let top: Vec<String> = ranked
@@ -934,4 +1278,71 @@ pub(crate) async fn retrieve(
             })
         })
         .collect())
+}
+
+#[cfg(test)]
+mod query_terms_tests {
+    use super::*;
+
+    #[test]
+    fn duplicates_drop_keeping_first_order() {
+        assert_eq!(
+            query_terms("retry the retry login the retry"),
+            vec!["retry", "the", "login"]
+        );
+    }
+
+    #[test]
+    fn the_cap_leaves_the_first_max_query_terms() {
+        // MAX_QUERY_TERMS + 10 distinct tokens: the tail is cut, and what
+        // survives is the head in order — the cap bounds reads, it does
+        // not reorder or reselect.
+        let stuffed = (0..store::MAX_QUERY_TERMS + 10)
+            .map(|i| format!("term{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let expected = (0..store::MAX_QUERY_TERMS)
+            .map(|i| format!("term{i}"))
+            .collect::<Vec<_>>();
+        assert_eq!(query_terms(&stuffed), expected);
+    }
+
+    #[test]
+    fn terms_come_out_exactly_as_the_indexer_tokenises() {
+        // The query goes through the indexer's own tokenizer: a query must
+        // meet its documents in the same alphabet or the postings lookup
+        // misses. Only de-duplication and the cap are added on top.
+        for query in ["Retry! It's the RETRY...", "v2 outage", "!!! ... a"] {
+            let mut expected: Vec<String> = Vec::new();
+            for term in tokenize(query) {
+                if !expected.contains(&term) {
+                    expected.push(term);
+                }
+            }
+            assert_eq!(query_terms(query), expected, "{query}");
+        }
+        assert_eq!(query_terms("v2 outage"), vec!["v2", "outage"]);
+    }
+
+    #[test]
+    fn an_unspaced_run_is_capped_in_bigrams() {
+        // A long CJK run tokenises into one bigram per character, so it is
+        // exactly the query the cap exists for: the head survives, in
+        // order, and never more than MAX_QUERY_TERMS of them.
+        let run: String =
+            "数据库连接超时重试失败请检查网络配置并联系管理员获取帮助文档说明书第一章第二节"
+                .repeat(2);
+        let bigrams = tokenize(&run);
+        assert!(bigrams.len() > store::MAX_QUERY_TERMS, "{bigrams:?}");
+        let terms = query_terms(&run);
+        assert_eq!(terms.len(), store::MAX_QUERY_TERMS);
+        let mut expected: Vec<String> = Vec::new();
+        for term in bigrams {
+            if !expected.contains(&term) {
+                expected.push(term);
+            }
+        }
+        expected.truncate(store::MAX_QUERY_TERMS);
+        assert_eq!(terms, expected);
+    }
 }

@@ -9,6 +9,9 @@ repository.workspace = true
 
 [dependencies]
 cratefield-core = { workspace = true }
+# Canned texts as Fluent catalogs, plus `accept_language` for the
+# turn-language fallback.
+cratefield-i18n = { workspace = true }
 sha2 = { workspace = true }
 http = { workspace = true }
 # Shared workspace crate: tenant API keys over the Signer port.
@@ -24,11 +27,21 @@ bytes = "1"
 axum = { version = "0.8", default-features = false, features = ["query"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# PDF text extraction for the upload extract job (issue #30). Pure Rust
+# with a lean, wasm-safe dependency set at these features (the parser is
+# `pom`, not `nom`), so the same extraction runs in a Worker isolate and
+# in the native binary — no feature gate, no second implementation.
+lopdf = { version = "0.32.0", default-features = false, features = ["pom_parser"] }
+# Structured logs from the extract drain and the abandoned-upload GC —
+# work that happens outside any request.
+tracing = { workspace = true }
 time = { version = "0.3", default-features = false, features = [
     "std",
     "formatting",
     "wasm-bindgen",
 ] }
+# Pure Rust and wasm32-safe: detects the language of an incoming message.
+whatlang = { workspace = true }
 
 # getrandom's wasm_js backend is opt-in per leaf crate on
 # wasm32-unknown-unknown; only the wasm build of this crate needs it
@@ -46,6 +59,11 @@ base64 = "0.23"
 # The test's counting `RateLimiter` implements the `#[async_trait]` port.
 async-trait = { workspace = true }
 pollster = { workspace = true }
+# The scoring-parity tests compare response scores bit for bit with an
+# in-process rank. serde_json's default float parser is fast but can be
+# one ULP off; `float_roundtrip` makes the test-side parse exact, so a
+# mismatch means the fetch, not the JSON, moved the number.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 # `ServiceExt::oneshot` drives the router without a network; pinned to
 # the same line cratefield-testing builds against so one tower compiles.
 tower = { version = "0.5.3", features = ["util"] }

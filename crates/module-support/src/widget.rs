@@ -336,13 +336,22 @@ pub(crate) async fn post_widget_message(
         return Ok(response);
     }
 
-    // 7. The turn — the very function `POST /messages` runs.
+    // 7. The turn — the very function `POST /messages` runs, in the
+    //    language `POST /messages` would pick: the message's own words
+    //    first, the browser's Accept-Language below that.
+    let lang = messages::turn_language(
+        message,
+        headers
+            .get(header::ACCEPT_LANGUAGE)
+            .and_then(|value| value.to_str().ok()),
+    );
     let reply = match messages::run_turn(
         &state,
         &scope,
         &tenant_id,
         message,
         body.conversation_id.as_deref(),
+        lang,
     )
     .await
     {

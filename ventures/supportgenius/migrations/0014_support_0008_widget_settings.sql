@@ -1,6 +1,6 @@
 -- module-support widget settings: the per-tenant origin allowlist the web
 -- widget's CORS-simple routes answer against. Portable SQL only (ADR 0004;
--- linted by `fz doctor`), the same conventions as 0001-0003.
+-- linted by `fz doctor`), the same conventions as 0001-0007.
 --
 -- `widget_origins` is a JSON array of normalized origin strings
 -- (`["https://support.example"]`) as TEXT: a column per allowed origin
