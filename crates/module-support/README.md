@@ -238,9 +238,21 @@ pinned by the workspace's single `cratefield-*` git rev (see the root
   over English documents) is out of scope until hybrid retrieval exists:
   it needs embeddings, i.e. an upstream `VectorIndex` port, and BM25
   over translated terms is not a substitute.
-- **Ranking trusts the caller.** `bm25::rank` computes `df` from the
-  postings it is given, so a `LIMIT` on the SQL that fetches them silently
-  skews every idf. The contract is documented on `rank`.
+- **Ranking is exact on a truncated fetch.** Corpus statistics (N, average
+  length, each term's df) live in the `sg_tenant_stats` and `sg_terms`
+  tables, written by the same batch as the rows they describe on every
+  write path — inline ingest, upload extraction, connector sync (first
+  index, diff-based replace, delete on 404/410), manual replace and
+  delete, and the tokenizer re-index sweep — so `bm25::rank` never
+  derives them from the rows it is handed. That is what makes the
+  per-term fetch safe to bound: `df` and `idf` stay exact even though
+  only each term's top 128 rows by tf are read. The query path costs a
+  fixed budget of rows — one stats row, at most 32 df rows, at most 32
+  bounded postings fetches, the result's chunk rows — regardless of how
+  large the tenant's corpus grows, and a term in more than half of a
+  tenant's chunks (once it has at least 8) is dropped as a stopword
+  before its postings are read. The contract is documented on `rank`
+  and `postings_for`.
 
 ## Not built yet
 

@@ -174,21 +174,22 @@ pub(crate) async fn authenticate(
 /// matters is the tenant's, and an IP bucket would let one office full of
 /// colleagues exhaust each other.
 ///
-/// The limiter is the only backstop on `/search` and `/messages`: `/search`
-/// is a full-corpus postings fetch and BM25 rank per request (since
-/// `store::postings_for` is deliberately unbounded — a `LIMIT` would
-/// corrupt ranking; see its docs), and `/messages` adds a paid model call.
+/// The limiter is a budget guard, not the cost story: since the corpus
+/// statistics moved into `sg_terms`/`sg_tenant_stats`, a `/search` request
+/// reads a fixed budget of rows no matter how large the tenant's corpus
+/// grows — one stats row, at most [`store::MAX_QUERY_TERMS`] df rows, at
+/// most that many postings fetches of [`store::MAX_POSTINGS_PER_TERM`]
+/// rows each, and the result's chunk rows (the invariant is spelled out on
+/// [`store::postings_for`]). `/messages` adds a paid model call on top.
 /// `FailClosed` therefore governs a *transport failure of a limiter that
 /// is present*: once one is composed, a flaky limiter denies rather than
-/// waving the corpus scan (or the model call) through. It does **not**
+/// waving the request (or the model call) through. It does **not**
 /// manufacture a backstop from nothing — an *absent* limiter resolves to
 /// `RateLimit::Allowed` (`check_rate_limit` short-circuits on `None`),
 /// independent of `FailClosed`. So this guard only bites when the
 /// composition actually mounts a `RateLimiter`: the Cloudflare Worker does,
 /// unconditionally (`RATE_LIMITER` in wrangler.toml), and the native binary
-/// does when `REDIS_URL` is set — which it requires in production. The
-/// limiter is the effective per-tenant ceiling; bounding `postings_for`
-/// itself is a separate correctness problem and is not attempted here.
+/// does when `REDIS_URL` is set — which it requires in production.
 ///
 /// `Some` is the 429 response the handler returns verbatim.
 pub(crate) async fn guard_rate_limit(ctx: &ModuleContext, tenant_id: &str) -> Option<Response> {
@@ -1146,29 +1147,92 @@ pub(crate) struct Retrieved {
     pub score: f64,
 }
 
+/// The query's search terms: tokenised (the indexer's own tokenizer, CJK
+/// and Thai bigrams included), de-duplicated with the first occurrence's
+/// order kept (a repeated term must not double-count, and the
+/// left-to-right order is what fixes the postings fetch order, so scores
+/// are reproducible), and capped at [`store::MAX_QUERY_TERMS`] so a
+/// keyword-stuffed query cannot buy more reads than the invariant allows.
+fn query_terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for term in tokenize(query) {
+        if !terms.contains(&term) {
+            terms.push(term);
+        }
+        if terms.len() == store::MAX_QUERY_TERMS {
+            break;
+        }
+    }
+    terms
+}
+
 /// BM25 retrieval over one tenant's index: the top `k` chunks for `query`,
 /// best first. The one retrieval path — `GET /search` shows its result,
 /// `POST /messages` grounds the model in it — so what a tenant finds by
 /// searching is exactly what an answer can cite.
 ///
+/// Cost is flat in the corpus size: one `sg_tenant_stats` row, one
+/// `sg_terms` row per distinct query term, then — only for terms that
+/// survive the stopword rules — a bounded per-term top-k postings fetch
+/// ([`store::MAX_POSTINGS_PER_TERM`]), and the result's chunk rows.
+/// Ranking stays exact under that truncation because df and N come from
+/// the persisted statistics, not from the fetched rows (see
+/// [`bm25::rank`]).
+///
 /// A query that tokenises to nothing retrieves nothing, without touching
-/// the database. A ranked id whose chunk row is gone (a source deleted or
-/// replaced by a concurrent request between the postings fetch and the
-/// row read) is skipped rather than failing the request.
+/// the database — and a query whose every term is dropped (df 0, or a
+/// stopword by ratio) retrieves nothing without a postings fetch. A
+/// ranked id whose chunk row is gone (a source deleted or replaced by a
+/// concurrent request between the postings fetch and the row read) is
+/// skipped rather than failing the request.
 pub(crate) async fn retrieve(
     db: &dyn Database,
     tenant_id: &str,
     query: &str,
     k: usize,
 ) -> Result<Vec<Retrieved>, cratefield_core::DbError> {
-    let terms = tokenize(query);
+    let terms = query_terms(query);
     if terms.is_empty() {
         return Ok(Vec::new());
     }
 
+    // The statistics reads: N and avg length from the one tenant row, df
+    // for the query's terms from their `sg_terms` rows. Both are primary
+    // -key lookups; neither scans anything.
     let corpus = store::corpus_stats(db, tenant_id).await?;
-    let postings = store::postings_for(db, tenant_id, &terms).await?;
-    let mut ranked = bm25::rank(&terms, &postings, &corpus, &bm25::Params::default());
+    let dfs = store::term_dfs(db, tenant_id, &terms).await?;
+
+    // Two reasons to drop a term before paying for its postings. df 0:
+    // the term indexes no chunk here, so it has no rows and no idf. Too
+    // common: past [`store::STOPWORD_DF_RATIO`] of the corpus a term is a
+    // stopword — below [`store::STOPWORD_MIN_CHUNKS`] the ratio is
+    // information-free (one chunk in two makes 0.5 of any small tenant),
+    // so the rule waits for a corpus worth measuring, and idf already
+    // discounts what the ratio would.
+    // df and N as f64: counts, and a corpus near 2^53 chunks would lose
+    // a precision nobody could observe in a 0.5 comparison.
+    #[expect(clippy::cast_precision_loss)]
+    let too_common = |df: u64| df as f64 / corpus.chunk_count as f64 > store::STOPWORD_DF_RATIO;
+    let kept: Vec<String> = terms
+        .into_iter()
+        .filter(|term| match dfs.get(term) {
+            Some(df) if *df > 0 => {
+                corpus.chunk_count < store::STOPWORD_MIN_CHUNKS || !too_common(*df)
+            }
+            _ => false,
+        })
+        .collect();
+    if kept.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut postings = Vec::new();
+    for term in &kept {
+        postings
+            .extend(store::postings_for(db, tenant_id, term, store::MAX_POSTINGS_PER_TERM).await?);
+    }
+
+    let mut ranked = bm25::rank(&kept, &postings, &dfs, &corpus, &bm25::Params::default());
     ranked.truncate(k);
 
     let top: Vec<String> = ranked
@@ -1191,4 +1255,71 @@ pub(crate) async fn retrieve(
             })
         })
         .collect())
+}
+
+#[cfg(test)]
+mod query_terms_tests {
+    use super::*;
+
+    #[test]
+    fn duplicates_drop_keeping_first_order() {
+        assert_eq!(
+            query_terms("retry the retry login the retry"),
+            vec!["retry", "the", "login"]
+        );
+    }
+
+    #[test]
+    fn the_cap_leaves_the_first_max_query_terms() {
+        // MAX_QUERY_TERMS + 10 distinct tokens: the tail is cut, and what
+        // survives is the head in order — the cap bounds reads, it does
+        // not reorder or reselect.
+        let stuffed = (0..store::MAX_QUERY_TERMS + 10)
+            .map(|i| format!("term{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let expected = (0..store::MAX_QUERY_TERMS)
+            .map(|i| format!("term{i}"))
+            .collect::<Vec<_>>();
+        assert_eq!(query_terms(&stuffed), expected);
+    }
+
+    #[test]
+    fn terms_come_out_exactly_as_the_indexer_tokenises() {
+        // The query goes through the indexer's own tokenizer: a query must
+        // meet its documents in the same alphabet or the postings lookup
+        // misses. Only de-duplication and the cap are added on top.
+        for query in ["Retry! It's the RETRY...", "v2 outage", "!!! ... a"] {
+            let mut expected: Vec<String> = Vec::new();
+            for term in tokenize(query) {
+                if !expected.contains(&term) {
+                    expected.push(term);
+                }
+            }
+            assert_eq!(query_terms(query), expected, "{query}");
+        }
+        assert_eq!(query_terms("v2 outage"), vec!["v2", "outage"]);
+    }
+
+    #[test]
+    fn an_unspaced_run_is_capped_in_bigrams() {
+        // A long CJK run tokenises into one bigram per character, so it is
+        // exactly the query the cap exists for: the head survives, in
+        // order, and never more than MAX_QUERY_TERMS of them.
+        let run: String =
+            "数据库连接超时重试失败请检查网络配置并联系管理员获取帮助文档说明书第一章第二节"
+                .repeat(2);
+        let bigrams = tokenize(&run);
+        assert!(bigrams.len() > store::MAX_QUERY_TERMS, "{bigrams:?}");
+        let terms = query_terms(&run);
+        assert_eq!(terms.len(), store::MAX_QUERY_TERMS);
+        let mut expected: Vec<String> = Vec::new();
+        for term in bigrams {
+            if !expected.contains(&term) {
+                expected.push(term);
+            }
+        }
+        expected.truncate(store::MAX_QUERY_TERMS);
+        assert_eq!(terms, expected);
+    }
 }
