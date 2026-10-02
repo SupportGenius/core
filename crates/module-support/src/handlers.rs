@@ -7,7 +7,7 @@
 use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -52,7 +52,8 @@ const MAX_EXTERNAL_ID_BYTES: usize = 512;
 
 /// Every way key authentication can fail — no header, a malformed key, a
 /// valid signature from a revoked kid, a key naming a tenant that does
-/// not exist, a tenant that is not active — answers with this one
+/// not exist, a tenant that is not active, a key whose own id has no (or
+/// another tenant's) `sg_api_keys` row — answers with this one
 /// indistinguishable 401. Which of these it is would be a handout to
 /// anyone probing the API; the holder of a genuine key never needs the
 /// distinction, because re-minting fixes all of them the same way.
@@ -73,6 +74,19 @@ const EXTERNAL_ID_CONFLICT: ProblemDef = ProblemDef {
     title: "external_id already in use",
     description: "Another source of this tenant already carries the external_id the request \
                   tried to set.",
+};
+
+/// `409` for `DELETE /keys/{kid}` on the tenant's only remaining key:
+/// deleting it would leave the tenant unable to authenticate at all, so
+/// the delete is refused. Mint the replacement first, then delete the old
+/// key — the last key is replaceable, never removable outright.
+const LAST_KEY_CONFLICT: ProblemDef = ProblemDef {
+    slug: "last-api-key",
+    status: StatusCode::CONFLICT,
+    title: "Cannot delete the last API key",
+    description: "This is the tenant's only remaining API key; deleting it would lock the \
+                  tenant out of every key-guarded route. Mint its replacement first, then \
+                  delete this one.",
 };
 
 pub(crate) struct ModuleState {
@@ -101,6 +115,8 @@ pub(crate) fn router(
         )
         .route("/search", get(search))
         .route("/messages", post(messages::post_message))
+        .route("/keys", get(list_keys).post(create_key))
+        .route("/keys/{kid}", delete(delete_key))
         .with_state(state)
 }
 
@@ -118,7 +134,10 @@ pub(crate) fn required_port<'a, T: ?Sized>(
 /// the tenant id every downstream query must filter on. Revoked kids come
 /// from module config (`SUPPORT_REVOKED_KIDS`, parsed by
 /// [`tenancy::parse_revoked_kids`]); the tenant row must exist and be
-/// active. All failure paths collapse into [`UNAUTHORIZED`].
+/// active; and the verified key's own id must have a row in `sg_api_keys`
+/// for that tenant — the row is the source of truth, so deleting it
+/// revokes the key immediately with no config change. All failure paths
+/// collapse into [`UNAUTHORIZED`].
 pub(crate) async fn authenticate(
     ctx: &ModuleContext,
     headers: &HeaderMap,
@@ -147,7 +166,17 @@ pub(crate) async fn authenticate(
     };
     let db = required_port(ctx.ports.db.as_deref(), "Db")?;
     match store::find_tenant(db, &tenant_key.tenant_id).await {
-        Ok(Some(tenant)) if tenant.status == STATUS_ACTIVE => Ok(tenant.id),
+        Ok(Some(tenant)) if tenant.status == STATUS_ACTIVE => {
+            // The signature is valid, but the key only authenticates while
+            // its own row exists: a key id never recorded, or one whose row
+            // the tenant deleted via `DELETE /keys/{kid}`, is refused the
+            // same 401 as junk.
+            match store::find_api_key(db, &tenant.id, &tenant_key.key_id).await {
+                Ok(Some(_)) => Ok(tenant.id),
+                Ok(None) => Err(unauthorized()),
+                Err(err) => Err(err.into()),
+            }
+        }
         Ok(_) => Err(unauthorized()),
         // A database outage is an infrastructure failure, not evidence
         // about the key: it gets the 500 the `DbError` carries, not the
@@ -238,8 +267,15 @@ struct TenantBody {
 /// The response carries the minted key **exactly once**: the key is a
 /// bearer credential over the `Signer` port and nothing about it — not
 /// the key, not its MAC — is stored, so this response cannot be replayed
-/// later. Lose it and the tenant mints a new one (or the operator re-runs
-/// this endpoint against the same tenant with a future admin route).
+/// later. Lose it and the tenant mints another with `POST /keys`, using
+/// any key it still holds.
+///
+/// The `kid` in the response is the key's own id — the same value `GET
+/// /keys` shows and `DELETE /keys/{kid}` takes — **not** the signing-key
+/// generation the token was signed with. Everything key-addressed in this
+/// module is per key, so `kid` means the per-key id throughout; the
+/// signing generation is the `tenancy` config override
+/// ([`tenancy::REVOKED_KIDS_KEY`]), a layer beneath this API.
 async fn create_tenant(
     scope: Scope,
     State(state): State<Arc<ModuleState>>,
@@ -286,7 +322,7 @@ async fn create_tenant(
         &ApiKeyRow {
             id: id_gen.ulid(),
             tenant_id: tenant.id.clone(),
-            kid: minted.kid.clone(),
+            kid: minted.key_id.clone(),
             label: store::FIRST_KEY_LABEL.to_owned(),
             created_at,
         },
@@ -299,10 +335,168 @@ async fn create_tenant(
             "tenant_id": tenant.id,
             "name": name,
             "api_key": minted.key,
-            "kid": minted.kid,
+            "kid": minted.key_id,
         })),
     )
         .into_response())
+}
+
+// ---------------------------------------------------------------------
+// API key management: a tenant lists, mints and deletes its own keys,
+// authenticating with one of them. The row in `sg_api_keys` is the source
+// of truth — deleting it revokes the key on the very next request, no
+// config change needed. The plaintext key is shown exactly once, at mint;
+// every read shows only the key's own id, its label and its timestamp.
+// ---------------------------------------------------------------------
+
+/// The optional body of `POST /keys`: `{"label": "…"}`. An absent body is
+/// valid and means the default label.
+#[derive(Deserialize, Default)]
+struct CreateKeyBody {
+    label: Option<String>,
+}
+
+/// The label a `POST /keys` request asked for: absent (or an empty body)
+/// is [`store::DEFAULT_KEY_LABEL`], otherwise the label is trimmed and
+/// held to the same byte ceiling a tenant name gets. The guards have
+/// already run, so a malformed body is a real 400 here, not a leak.
+fn parse_label(scope: &Scope, body: &Bytes) -> Result<String, Problem> {
+    let bad = || {
+        Problem::validation_failed(format!(
+            "body: expected a JSON object with an optional string \"label\", \
+             1..={MAX_NAME_BYTES} bytes"
+        ))
+        .instance(&scope.request_id)
+    };
+    let parsed: CreateKeyBody = if body.is_empty() {
+        CreateKeyBody::default()
+    } else {
+        serde_json::from_slice(body).map_err(|_| bad())?
+    };
+    match parsed.label {
+        None => Ok(store::DEFAULT_KEY_LABEL.to_owned()),
+        Some(label) => {
+            let trimmed = label.trim();
+            if trimmed.is_empty() || trimmed.len() > MAX_NAME_BYTES {
+                return Err(bad());
+            }
+            Ok(trimmed.to_owned())
+        }
+    }
+}
+
+/// `GET /keys` — the tenant's own API keys, oldest first, each shown as
+/// `{kid, label, created_at}` where `kid` is the key's own id (the one
+/// `DELETE /keys/{kid}` takes). Nothing secret is stored, so there is
+/// nothing secret to show: the key material and its MAC live only in the
+/// mint response.
+async fn list_keys(
+    State(state): State<Arc<ModuleState>>,
+    headers: HeaderMap,
+) -> Result<Response, Problem> {
+    let auth = match authorize(&state.ctx, &headers).await {
+        Authed::Ready(auth) => auth,
+        Authed::Done(done) => return Ok(done),
+    };
+    let keys: Vec<Value> = store::list_api_keys(auth.db, &auth.tenant_id)
+        .await?
+        .iter()
+        .map(|key| {
+            json!({
+                "kid": key.kid,
+                "label": key.label,
+                "created_at": key.created_at,
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "keys": keys })).into_response())
+}
+
+/// `POST /keys` — mint another API key for the authenticated tenant,
+/// labelled `{"label"}` (default `"key"`). Like `POST /admin/tenants`, the
+/// response carries the plaintext key **exactly once** under `api_key`,
+/// alongside its `kid`, `label` and `created_at`; only the row is
+/// remembered, so the response cannot be replayed later.
+async fn create_key(
+    scope: Scope,
+    State(state): State<Arc<ModuleState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, Problem> {
+    // The guards run before the body is parsed, exactly as on every other
+    // key-guarded route: a malformed body must not earn a 4xx that would
+    // tell an unauthenticated caller the route exists.
+    let auth = match authorize(&state.ctx, &headers).await {
+        Authed::Ready(auth) => auth,
+        Authed::Done(done) => return Ok(done),
+    };
+    let label = parse_label(&scope, &body)?;
+    let clock: &dyn Clock = required_port(auth.ctx.ports.clock.as_deref(), "Clock")?;
+    let id_gen: &dyn IdGen = required_port(auth.ctx.ports.id_gen.as_deref(), "IdGen")?;
+    let signer: &dyn Signer = required_port(auth.ctx.ports.signer.as_deref(), "Signer")?;
+
+    let minted = tenancy::mint(signer, &auth.tenant_id)
+        .map_err(|_| Problem::internal().with_detail("api key minting failed"))?;
+    let created_at = store::iso_now(clock);
+    store::insert_api_key(
+        auth.db,
+        &ApiKeyRow {
+            id: id_gen.ulid(),
+            tenant_id: auth.tenant_id.clone(),
+            kid: minted.key_id.clone(),
+            label: label.clone(),
+            created_at: created_at.clone(),
+        },
+    )
+    .await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "kid": minted.key_id,
+            "label": label,
+            "created_at": created_at,
+            "api_key": minted.key,
+        })),
+    )
+        .into_response())
+}
+
+/// `DELETE /keys/{kid}` — delete one of the tenant's own keys; `204` with
+/// no body. An unknown kid, or another tenant's, is the same `404` and
+/// deletes nothing. A delete that would leave the tenant with no key at
+/// all is `409` ([`LAST_KEY_CONFLICT`]): locking the tenant out is never
+/// what a key-management call should do, so a key is replaced by minting
+/// its successor first, never removed outright while it is the last.
+///
+/// The last-key check and the delete are one statement
+/// ([`store::delete_api_key`]) so two concurrent deletes cannot both pass
+/// the check and empty the tenant; the `0`-rows case is then told apart by
+/// a read (the row is gone → `404`, the row is still there → `409`).
+async fn delete_key(
+    scope: Scope,
+    State(state): State<Arc<ModuleState>>,
+    Path(kid): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, Problem> {
+    let auth = match authorize(&state.ctx, &headers).await {
+        Authed::Ready(auth) => auth,
+        Authed::Done(done) => return Ok(done),
+    };
+    if store::delete_api_key(auth.db, &auth.tenant_id, &kid).await? > 0 {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    // Nothing was removed: either the id is unknown or another tenant's
+    // (`404`), or it is this tenant's last key, which the `EXISTS` guard
+    // refused (`409`). Which one it is, is whether the row is still there.
+    if store::find_api_key(auth.db, &auth.tenant_id, &kid)
+        .await?
+        .is_some()
+    {
+        Err(Problem::new(&LAST_KEY_CONFLICT).instance(&scope.request_id))
+    } else {
+        Err(Problem::not_found().instance(&scope.request_id))
+    }
 }
 
 /// One `POST /sources` / `PUT /sources/{id}` body: inline text, or a URL

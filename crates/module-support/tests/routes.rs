@@ -32,6 +32,7 @@ const ADMIN: &str = "/v1/support/admin/tenants";
 const SOURCES: &str = "/v1/support/sources";
 const SEARCH: &str = "/v1/support/search";
 const MESSAGES: &str = "/v1/support/messages";
+const KEYS: &str = "/v1/support/keys";
 const PROBLEMS: &str = "https://factory0.ventures/problems/";
 
 /// A buffered response: every route here answers JSON (success or
@@ -625,11 +626,17 @@ async fn every_key_failure_answers_the_same_indistinguishable_401() {
         )
         .await;
 
-        // The kit's ring is derived from one fixed test secret, so every
-        // kit's minted key carries the same kid; revoking that kid in a
-        // fresh kit's config makes its freshly minted key fail.
-        let kid = body_str(&tenant, "kid");
-        let revoked_kit = kit_with(dialect, &[("SUPPORT_REVOKED_KIDS", &kid)]);
+        // Every kit is built from one fixed test secret, so the signer's
+        // current key — the generation in the key's `sg_<kid>.` prefix,
+        // *not* the per-key id the response calls `kid` — is the same
+        // everywhere. Revoking that generation in a fresh kit's config
+        // makes its freshly minted key fail the config override, however
+        // many rows it holds.
+        let generation = api_key
+            .strip_prefix("sg_")
+            .and_then(|body| body.split('.').next())
+            .expect("a key carries its signing generation in its prefix");
+        let revoked_kit = kit_with(dialect, &[("SUPPORT_REVOKED_KIDS", generation)]);
         let re_minted = mint_tenant(&revoked_kit, "Matrix").await;
         let revoked = send(
             &revoked_kit.router,
@@ -2737,6 +2744,178 @@ async fn a_german_clarify_is_rendered_in_german() {
             body_str(&body, "answer"),
             "Ich möchte Ihnen eine fundierte Antwort geben statt einer schnellen falschen — \
              könnten Sie die Frage umformulieren oder ein paar Einzelheiten ergänzen?"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// Issue #37: a tenant manages its own API keys at `/keys`. The row in
+// `sg_api_keys` is the source of truth — a key authenticates only while
+// its own row exists, so deleting the row revokes it on the very next
+// request with no config change — and a delete that would leave the
+// tenant with no key at all is refused. Each key carries its own id,
+// bound into the signed subject by `tenancy`; that id is what `kid` names
+// on these routes and what `DELETE /keys/{kid}` addresses.
+// ---------------------------------------------------------------------
+
+/// The issue's done-when, end to end: mint a second key with the first,
+/// delete the first by its own id using the second, and watch the first
+/// die on the very next request while the second keeps working — all with
+/// no config change. Also proves the two keys are genuinely distinct
+/// (each has its own id) and that the listing shows them without secrets.
+#[pollster::test]
+async fn a_tenant_rotates_its_key_and_the_old_one_dies_at_once() {
+    for kit in kits() {
+        let tenant = mint_tenant(&kit, "Rotator").await;
+        let tenant_id = body_str(&tenant, "tenant_id");
+        let key_a = body_str(&tenant, "api_key");
+        let a_id = body_str(&tenant, "kid");
+
+        // Mint B with A.
+        let created = send(
+            &kit.router,
+            Method::POST,
+            KEYS,
+            Some(&key_a),
+            Some(&json!({ "label": "rotated" }).to_string()),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+        let key_b = body_str(&created.body, "api_key");
+        let b_id = body_str(&created.body, "kid");
+        assert_ne!(a_id, b_id, "each key has its own id");
+        assert_eq!(created.body["label"], "rotated");
+        assert!(
+            created.body["created_at"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "the mint names its created_at: {}",
+            created.body
+        );
+
+        // Both authenticate while both rows exist.
+        for key in [&key_a, &key_b] {
+            assert_eq!(search(&kit, key, "q=anything").await.status, StatusCode::OK);
+        }
+
+        // The listing shows the tenant's keys by their own ids and never a
+        // secret. Under the harness's fixed clock both keys share one
+        // `created_at`, so the tiebreak (the row's ULID) may order them
+        // either way: assert the ordering *contract* — non-decreasing
+        // created_at — and that both keys are listed, not which tie wins.
+        let listed = send(&kit.router, Method::GET, KEYS, Some(&key_b), None).await;
+        assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
+        let keys = listed.body["keys"].as_array().expect("keys array");
+        let created: Vec<&str> = keys
+            .iter()
+            .map(|key| key["created_at"].as_str().expect("created_at"))
+            .collect();
+        assert!(
+            created.windows(2).all(|pair| pair[0] <= pair[1]),
+            "keys are oldest first: {created:?}"
+        );
+        let mut ids: Vec<&str> = keys
+            .iter()
+            .map(|key| key["kid"].as_str().expect("kid"))
+            .collect();
+        ids.sort_unstable();
+        let mut expected = [a_id.as_str(), b_id.as_str()];
+        expected.sort_unstable();
+        assert_eq!(ids, expected, "both keys are listed");
+        assert!(!listed.body.to_string().contains(&key_a), "no secret (A)");
+        assert!(!listed.body.to_string().contains(&key_b), "no secret (B)");
+
+        // Delete A's key id, authenticated with B.
+        let deleted = send(
+            &kit.router,
+            Method::DELETE,
+            &format!("{KEYS}/{a_id}"),
+            Some(&key_b),
+            None,
+        )
+        .await;
+        assert_eq!(deleted.status, StatusCode::NO_CONTENT, "{}", deleted.body);
+
+        // A is refused on the very next request — no config change, no
+        // redeploy — while B keeps working.
+        let after = search(&kit, &key_a, "q=anything").await;
+        assert_eq!(after.status, StatusCode::UNAUTHORIZED, "{}", after.body);
+        assert_eq!(after.problem_type(), format!("{PROBLEMS}unauthorized"));
+        assert_eq!(
+            search(&kit, &key_b, "q=anything").await.status,
+            StatusCode::OK
+        );
+
+        // Exactly one row remains, and it is B's.
+        assert_eq!(count_of(&kit, "sg_api_keys"), 1);
+        assert_eq!(
+            text_column(
+                &kit,
+                &format!("SELECT kid AS v FROM sg_api_keys WHERE tenant_id = '{tenant_id}'")
+            ),
+            [b_id]
+        );
+    }
+}
+
+/// One tenant's key id is not another tenant's to delete — foreign and
+/// unknown ids get the same 404 — and a tenant's last key is never
+/// deletable, because that would lock it out of every key-guarded route.
+#[pollster::test]
+async fn a_foreign_or_unknown_kid_is_404_and_the_last_key_cannot_be_deleted() {
+    for kit in kits() {
+        let a = mint_tenant(&kit, "Owner").await;
+        let key_a = body_str(&a, "api_key");
+        let a_id = body_str(&a, "kid");
+        let b = mint_tenant(&kit, "Other").await;
+        let key_b = body_str(&b, "api_key");
+        let b_id = body_str(&b, "kid");
+        assert_ne!(a_id, b_id);
+
+        // A's key id, deleted by B: not B's to delete, so the same 404 an
+        // unknown id gets — and A's key still works.
+        let foreign = send(
+            &kit.router,
+            Method::DELETE,
+            &format!("{KEYS}/{a_id}"),
+            Some(&key_b),
+            None,
+        )
+        .await;
+        assert_eq!(foreign.status, StatusCode::NOT_FOUND, "{}", foreign.body);
+        assert_eq!(count_of(&kit, "sg_api_keys"), 2);
+        assert_eq!(
+            search(&kit, &key_a, "q=anything").await.status,
+            StatusCode::OK
+        );
+
+        // An id nobody holds: the same 404, and nothing is removed.
+        let unknown = send(
+            &kit.router,
+            Method::DELETE,
+            &format!("{KEYS}/no-such-kid"),
+            Some(&key_b),
+            None,
+        )
+        .await;
+        assert_eq!(unknown.status, StatusCode::NOT_FOUND, "{}", unknown.body);
+        assert_eq!(count_of(&kit, "sg_api_keys"), 2);
+
+        // Deleting the tenant's only key is refused; the key survives.
+        let last = send(
+            &kit.router,
+            Method::DELETE,
+            &format!("{KEYS}/{b_id}"),
+            Some(&key_b),
+            None,
+        )
+        .await;
+        assert_eq!(last.status, StatusCode::CONFLICT, "{}", last.body);
+        assert_eq!(last.problem_type(), format!("{PROBLEMS}last-api-key"));
+        assert_eq!(count_of(&kit, "sg_api_keys"), 2);
+        assert_eq!(
+            search(&kit, &key_b, "q=anything").await.status,
+            StatusCode::OK
         );
     }
 }

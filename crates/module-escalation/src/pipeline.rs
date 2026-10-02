@@ -46,7 +46,7 @@ use crate::store;
 use cratefield_core::{
     Clock, Completion, Config, Credential, Database, Defer, Filed, IdGen, Inbox, Mailer, Message,
     ModelTier, Outbox, OutboxRecord, Prompt, SendOutcome, Statement, TextModel, TicketDraft,
-    Tracker,
+    Tracker, scrub_text,
 };
 
 /// The inbox table the migration creates; the stages' claim keys live in
@@ -356,9 +356,13 @@ impl Pipeline {
         ticket: &Ticket,
         at: &str,
     ) -> Result<(), Error> {
+        // The transcript is customer-authored text: it may carry an email
+        // address, a signed link, a bearer token. `scrub_text` redacts those
+        // before the text leaves for the model, so the drafter cannot copy a
+        // secret or an address into the draft it writes.
         let prompt = Prompt::new(ModelTier::Fast)
             .system(DRAFT_SYSTEM)
-            .user(&ticket.transcript)
+            .user(scrub_text(&ticket.transcript))
             .json_schema(Drafted::json_schema());
 
         let completion = match self.model.complete(&prompt).await {
@@ -466,9 +470,10 @@ impl Pipeline {
             .await
     }
 
-    /// Commits the judge's verdict — one of three all-or-nothing batches:
-    /// on to the file stage, parked as rejected, or parked with a question
-    /// for the customer and on to the notify stage.
+    /// Commits the judge's verdict — one of four all-or-nothing batches:
+    /// on to the file stage, parked as rejected, blocked for PII (a `file`
+    /// verdict the judge found unclean), or parked with a question for the
+    /// customer and on to the notify stage.
     async fn commit_judgment(
         &self,
         record: &OutboxRecord,
@@ -490,6 +495,13 @@ impl Pipeline {
         };
 
         match judgment.verdict {
+            // A `file` verdict is only honoured when the judge found the
+            // draft free of customer PII, so a `pii_clean: false` verdict
+            // never reaches the file stage.
+            Verdict::File if !judgment.pii_clean => {
+                self.block_for_pii(record, ticket, judgment, judge_completed, at)
+                    .await
+            }
             Verdict::File => {
                 let batch = [
                     judge_completed,
@@ -565,6 +577,43 @@ impl Pipeline {
                 Ok(())
             }
         }
+    }
+
+    /// Parks a ticket the judge would file but found carrying customer PII.
+    /// It is a hard stop, not a fixable verdict: nothing is enqueued, the
+    /// tracker is never touched, and the ticket is parked exactly as a
+    /// rejection is. The audit says why, so this block is distinguishable
+    /// from a plain not-a-defect rejection.
+    async fn block_for_pii(
+        &self,
+        record: &OutboxRecord,
+        ticket: &Ticket,
+        judgment: &Judgment,
+        judge_completed: Statement,
+        at: &str,
+    ) -> Result<(), Error> {
+        let why = json!({
+            "blocked_for_pii": true,
+            "reason": "the judge found customer PII in the draft; it must not reach a tracker",
+            "reasons": judgment.reasons,
+        });
+        let blocked = store::insert_event_stmt(
+            &self.idgen.ulid(),
+            &ticket.id,
+            stage_seq(Stage::Judge, 1),
+            at,
+            Stage::Judge,
+            EventKind::Rejected,
+            &why,
+        );
+        let batch = [
+            judge_completed,
+            blocked,
+            store::update_ticket_judgment_stmt(&ticket.id, judgment, at),
+            store::update_ticket_status_stmt(&ticket.id, Status::Rejected, at),
+            store::outbox_complete_stmt(OUTBOX_TABLE, &record.id),
+        ];
+        self.commit(&batch).await
     }
 
     // ------------------------------------------------------------------
@@ -1105,7 +1154,10 @@ fn judge_brief(ticket: &Ticket) -> String {
         let _ = writeln!(brief, "\nDrafted severity: {}", severity.name());
     }
     brief.push_str("\nOriginal transcript:\n");
-    brief.push_str(&ticket.transcript);
+    // The same customer-authored transcript the drafter saw, scrubbed the
+    // same way: no un-redacted address or token rides into the judge prompt
+    // either.
+    brief.push_str(&scrub_text(&ticket.transcript));
     brief
 }
 

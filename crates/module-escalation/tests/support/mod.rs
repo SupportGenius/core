@@ -128,6 +128,20 @@ pub(crate) fn file_judgment() -> serde_json::Value {
     })
 }
 
+/// The `Judgment` that would file the ticket but flags the draft as
+/// carrying customer PII — the verdict the pipeline must never honour.
+#[must_use]
+pub(crate) fn pii_file_judgment() -> serde_json::Value {
+    serde_json::json!({
+        "is_defect": true,
+        "reproducible": true,
+        "severity_ok": true,
+        "pii_clean": false,
+        "verdict": "file",
+        "reasons": ["the draft quotes the customer's email address"],
+    })
+}
+
 /// The `Judgment` that rejects the ticket as not a defect.
 #[must_use]
 pub(crate) fn reject_judgment() -> serde_json::Value {
@@ -237,10 +251,21 @@ pub(crate) struct Fixture {
 /// committed through `batch_atomic`, and the given scripted fakes.
 #[must_use]
 pub(crate) fn fixture(model: FakeTextModel, tracker: FakeTracker) -> Fixture {
+    fixture_with_transcript(model, tracker, TRANSCRIPT)
+}
+
+/// Like [`fixture`], but escalating the given `transcript` — the seam the
+/// scrub test needs to hand the pipeline text that carries an email.
+#[must_use]
+pub(crate) fn fixture_with_transcript(
+    model: FakeTextModel,
+    tracker: FakeTracker,
+    transcript: &str,
+) -> Fixture {
     let db = migrated_db();
     seed_destination(&db);
     let clock = Arc::new(SettableClock::at_unix(EPOCH));
-    let ticket_id = commit_handoff(&db, &clock, TENANT, CONVERSATION, TRANSCRIPT);
+    let ticket_id = commit_handoff(&db, &clock, TENANT, CONVERSATION, transcript);
     Fixture {
         db,
         model,

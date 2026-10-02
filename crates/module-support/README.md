@@ -24,6 +24,9 @@ the optional `RateLimiter` port.
 | `DELETE /sources/{source_id}` | API key | remove a source and its whole index; `204`, no body |
 | `GET /search?q=…&limit=…` | API key | BM25 over the tenant's own index |
 | `POST /messages` | API key | `{"message", "conversation_id"?}` → one support turn |
+| `GET /keys` | API key | the tenant's own API keys — `{kid, label, created_at}` each, oldest first |
+| `POST /keys` | API key | `{"label"?}` → mint another API key for the tenant (shown once, like provisioning) |
+| `DELETE /keys/{kid}` | API key | delete one of the tenant's own keys; `204`, or `404` for a foreign/unknown kid and `409` for the last remaining key |
 
 ### Sources
 
@@ -49,6 +52,17 @@ written. A body `external_id` another source of the same tenant already
 holds is answered `409` rather than written. Listing, reading, replacing
 and deleting all answer `404` — the same `404` — for an id that is
 missing or another tenant's.
+
+### API keys
+
+A tenant manages its own keys with one of them; `kid` on these routes is
+each key's own id. The `sg_api_keys` row is the source of truth: a key
+authenticates only while its row exists, so `DELETE /keys/{kid}` revokes
+it on the very next request, no config change. `POST /keys` shows the new
+key exactly once; `GET /keys` never shows key material, because none is
+stored. A foreign or unknown kid is `404`; the tenant's last remaining
+key is `409` — mint its replacement first. `SUPPORT_REVOKED_KIDS` stays
+the emergency override, revoking a signing generation everywhere at once.
 
 ### `POST /messages`
 
