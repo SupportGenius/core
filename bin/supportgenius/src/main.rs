@@ -15,9 +15,22 @@
 //!                                                # in dev/staging, and the
 //!                                                # binary refuses to boot when
 //!                                                # ENV=production (issues #16/#17)
+//! export BLOB_DIR=/var/lib/supportgenius/blobs   # chunked-upload part storage
+//!                                                # (issue #30); without it the
+//!                                                # upload routes answer
+//!                                                # `503 not-ready`
+//! export CRONS="23 4 * * *"                      # module scheduled hooks: the
+//!                                                # upload GC, the connector
+//!                                                # re-sync, the waitlist purge,
+//!                                                # the escalation retry sweeps
 //! LISTEN_ADDR=127.0.0.1:8080 ./supportgenius
 //! curl -fsS http://127.0.0.1:8080/__health && curl -fsS http://127.0.0.1:8080/__ready
 //! ```
+//!
+//! `CRONS` is comma-separated five-field cron expressions (UTC), the
+//! environment counterpart of a Worker's `[triggers] crons`. Without it,
+//! connector fetches still run when a connector is created (through
+//! `Defer`); they just never re-check their sources.
 //!
 //! `--check-ready` runs the container health check (GET `/__ready`
 //! against the configured listen address, exit 0/1) — distroless ships
@@ -122,6 +135,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!(
             "REDIS_URL unset: RateLimiter and KeyValue ports not configured (fail-open; \
              ENV=production would require Redis here)"
+        );
+    }
+
+    // The Blob port backs the chunked-upload routes (issue #30): a
+    // directory store under `BLOB_DIR`. Without it those routes answer
+    // `503 not-ready` and documents arrive only through the 48 KiB
+    // inline form — a loud degradation, unlike the rate limiter's quiet
+    // fail-open, so it is a warning rather than a boot requirement.
+    if let Some(dir) = config.get("BLOB_DIR").filter(|dir| !dir.is_empty()) {
+        runtime = runtime.blob_arc(cratefield_runtime_native::DirBlob::arc(&dir));
+        tracing::info!(blob_dir = %dir, "blob port configured (directory store)");
+    } else {
+        tracing::warn!(
+            "BLOB_DIR unset: chunked-upload routes answer 503 not-ready (documents arrive \
+             only through the 48 KiB inline form)"
         );
     }
 
