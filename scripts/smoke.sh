@@ -46,21 +46,29 @@ LISTEN_ADDR="127.0.0.1:$PORT"
 BASE_URL="http://$LISTEN_ADDR"
 
 # Random secret so the runtime-native Signer port wires up; without
-# HARNESS_SECRET the harness refuses to build at boot.
+# HARNESS_SECRET the harness refuses to build at boot. ADMIN_TOKEN gates
+# the support module's tenant provisioning (issue #2); it must be at
+# least 32 bytes when set, so it gets the same generator.
 HARNESS_SECRET="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+ADMIN_TOKEN="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
 
 echo "== booting $BIN on $LISTEN_ADDR (log: $LOG)"
 # No REDIS_URL on purpose: the RateLimiter and KeyValue ports stay
 # unconfigured, rate limiting fails open, and the boot log must say so
 # exactly once (asserted below).
 #
-# RESEND_API_KEY and TURNSTILE_SECRET are unset on purpose too: the
-# assertions below branch on the port wiring those secrets choose (a
-# Turnstile secret mounts a real Captcha port; a Resend key makes the
-# plain build attempt real sends), so an ambient secret must not be able
-# to flip the expected outcome.
-env -u REDIS_URL -u RESEND_API_KEY -u TURNSTILE_SECRET \
+# RESEND_API_KEY, TURNSTILE_SECRET and ANTHROPIC_API_KEY are unset on
+# purpose too: the assertions below branch on the port wiring those
+# secrets choose (a Turnstile secret mounts a real Captcha port; a Resend
+# key makes the plain build attempt real sends; an Anthropic key mounts
+# the TextModel port instead of the dev stub), so an ambient secret must
+# not be able to flip the expected outcome. RUST_LOG is unset for the
+# same reason: an ambient level could suppress the WARN lines the
+# assertions grep for (the dev-fakes build is detected by one).
+env -u REDIS_URL -u RESEND_API_KEY -u TURNSTILE_SECRET -u RUST_LOG \
+  -u ANTHROPIC_API_KEY -u SUPPORTGENIUS_MODEL_FAST -u SUPPORTGENIUS_MODEL_STRONG \
   HARNESS_SECRET="$HARNESS_SECRET" \
+  ADMIN_TOKEN="$ADMIN_TOKEN" \
   LISTEN_ADDR="$LISTEN_ADDR" \
   DATABASE_URL="sqlite://$DB" \
   SUPPORTGENIUS_DEV_FAKES=1 \
@@ -160,31 +168,83 @@ printf '%s' "$WAITLIST_BODY" | grep -q '"ok"[[:space:]]*:[[:space:]]*true' ||
   fail "POST /v1/waitlist answered $WAITLIST_STATUS but not {\"ok\":true}; got: $WAITLIST_BODY"
 echo "   POST /v1/waitlist -> $WAITLIST_STATUS (Captcha port: $CAPTCHA_STATE)"
 
-# The support module (source ingest + message reply, issues #2 and #3) is not
-# composed into the binary yet. The guard reads SUPPORT_COMPOSED, decided
-# by an exact `"name":"support"` match in /__health's `modules` array —
-# the previous `grep "support"` was always true because the document
-# contains `"venture":"supportgenius"`, so this block "composed" a module
-# that was not there and POSTed to 404s. Once crates/composition lists
-# module-support, this block activates on its own; when it first runs,
-# re-check the endpoint paths and payload shapes against the module's
-# actual router.
+# The support module (issues #2 and #3): tenant provisioning, source
+# ingest, then one message turn — the full auth chain, asserted exactly.
+# The guard reads SUPPORT_COMPOSED, decided by an exact `"name":"support"`
+# match in /__health's `modules` array — the previous `grep "support"`
+# was always true because the document contains
+# `"venture":"supportgenius"`.
+#
+# /__ready's `text_model` field is NOT asserted here, on purpose: on the
+# Worker the venture decorates the harness's DB-only probe with it
+# (ventures/supportgenius src/lib.rs), but the native runtime's `serve`
+# builds the router internally and offers no venture hook to do the same,
+# so the native /__ready stays DB-only. The message outcome below is the
+# native evidence of the port's state instead.
 if [ "$SUPPORT_COMPOSED" = "yes" ]; then
-  echo "== support module composed: exercising source + message endpoints"
-  S_STATUS="$(code -X POST -H 'Content-Type: application/json' \
-    -d '{"external_id":"smoke-source-1","channel":"email"}' \
-    "$BASE_URL/v1/support/sources")" || S_STATUS="000"
-  case "$S_STATUS" in
-    5* | 000) fail "POST /v1/support/sources returned $S_STATUS" ;;
-    *) echo "   POST /v1/support/sources -> $S_STATUS" ;;
-  esac
-  M_STATUS="$(code -X POST -H 'Content-Type: application/json' \
-    -d '{"source_external_id":"smoke-source-1","body":"smoke test message"}' \
-    "$BASE_URL/v1/support/messages")" || M_STATUS="000"
-  case "$M_STATUS" in
-    5* | 000) fail "POST /v1/support/messages returned $M_STATUS" ;;
-    *) echo "   POST /v1/support/messages -> $M_STATUS" ;;
-  esac
+  echo "== support module composed: provisioning a tenant and ingesting a source"
+  # The auth chain never mixes: the admin token (Bearer $ADMIN_TOKEN,
+  # generated at boot) provisions a tenant and mints its API key; the
+  # key guards everything else. The key is stored nowhere — the mint
+  # response is the only time it is ever sent — so it is carried from
+  # this response in a variable.
+  MINT_RESP="$(curl -s -w $'\n%{http_code}' -X POST -H 'Content-Type: application/json' \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -d '{"name":"smoke"}' \
+    "$BASE_URL/v1/support/admin/tenants")" || MINT_RESP=$'\n000'
+  MINT_STATUS="${MINT_RESP##*$'\n'}"
+  MINT_BODY="${MINT_RESP%$'\n'*}"
+  [ "$MINT_STATUS" = "201" ] ||
+    fail "POST /v1/support/admin/tenants returned $MINT_STATUS, expected exactly 201; got: $MINT_BODY"
+  API_KEY="$(printf '%s' "$MINT_BODY" | python3 -c 'import json, sys; print(json.load(sys.stdin)["api_key"])')" ||
+    fail "tenant response carried no api_key; got: $MINT_BODY"
+
+  # Ingest one real source: `{"text": ...}` (or `{"url": ...}`), with a
+  # stable external_id the re-ingest below could replace in place. The
+  # text is what the message question is answered — and cited — from.
+  S_RESP="$(curl -s -w $'\n%{http_code}' -X POST -H 'Content-Type: application/json' \
+    -H "Authorization: Bearer $API_KEY" \
+    -d '{"title":"Password resets","external_id":"smoke-source-1","text":"To reset your password, open the settings page and choose Sign-in options, then follow the reset link we email you."}' \
+    "$BASE_URL/v1/support/sources")" || S_RESP=$'\n000'
+  S_STATUS="${S_RESP##*$'\n'}"
+  S_BODY="${S_RESP%$'\n'*}"
+  [ "$S_STATUS" = "201" ] ||
+    fail "POST /v1/support/sources returned $S_STATUS, expected exactly 201; got: $S_BODY"
+
+  echo "== POST /v1/support/messages: the outcome depends on which build is running"
+  # The grep below only tells the two build variants apart: the dev-fakes
+  # build logs its stubs' "dev fakes active" warnings, the plain build
+  # warns that SUPPORTGENIUS_DEV_FAKES was set on a build compiled without
+  # the feature. It is the 200-vs-503 status assertion that actually
+  # checks the TextModel wiring: with no ANTHROPIC_API_KEY (unset at boot),
+  # the dev-fakes build's StubTextModel answers from the ingested source
+  # and the plain build has no TextModel port at all.
+  M_RESP="$(curl -s -w $'\n%{http_code}' -X POST -H 'Content-Type: application/json' \
+    -H "Authorization: Bearer $API_KEY" \
+    -d '{"message":"How do I reset my password?"}' \
+    "$BASE_URL/v1/support/messages")" || M_RESP=$'\n000'
+  M_STATUS="${M_RESP##*$'\n'}"
+  M_BODY="${M_RESP%$'\n'*}"
+  if grep -q 'dev fakes active' "$LOG"; then
+    [ "$M_STATUS" = "200" ] ||
+      fail "dev-fakes build: POST /v1/support/messages returned $M_STATUS, expected exactly 200; got: $M_BODY"
+    printf '%s' "$M_BODY" | python3 -c '
+import json, sys
+try:
+    body = json.load(sys.stdin)
+except json.JSONDecodeError:
+    sys.exit(1)
+sys.exit(0 if body.get("outcome") == "answered" and body.get("citations") else 1)
+' ||
+      fail "dev-fakes build: expected outcome=answered with a citation; got: $M_BODY"
+    echo "   POST /v1/support/messages -> 200 outcome=answered (StubTextModel)"
+  else
+    [ "$M_STATUS" = "503" ] ||
+      fail "plain build: POST /v1/support/messages returned $M_STATUS, expected exactly 503; got: $M_BODY"
+    printf '%s' "$M_BODY" | grep -q 'text-model-not-configured' ||
+      fail "plain build: expected the text-model-not-configured problem; got: $M_BODY"
+    echo "   POST /v1/support/messages -> 503 text-model-not-configured (no TextModel port)"
+  fi
 else
   echo "SKIP: module-support not composed yet (issue #2/#3)"
 fi

@@ -20,6 +20,14 @@ repository = "https://github.com/SupportGenius/core"
 # (the modules' `Module` impls are typed against one of them and fail the
 # harness builder), which is a compile error, not a warning.
 cratefield-core = "0.6"
+# Envelope-encrypted per-tenant secrets (issue #23): the escalation
+# module stores each tenant's tracker credential through `Secrets`,
+# which seals it with a key the KMS wraps. `cratefield-kms` is the port
+# the store is built over — the escalation module resolves a provider
+# from config (Worker secret or a development key file) and hands it to
+# `Secrets::new`. Both are pure Rust and wasm-safe.
+cratefield-secrets = "0.3"
+cratefield-kms = "0.2"
 # Fluent catalogs (the support module's canned clarify/handoff texts) and
 # `Accept-Language` parsing for the per-turn language fallback.
 cratefield-i18n = "0.2"
@@ -27,8 +35,17 @@ cratefield-runtime-cloudflare = "0.2"
 cratefield-module-waitlist = "0.2"
 cratefield-adapter-resend = "0.3"
 cratefield-adapter-turnstile = "0.2"
-# The `TextModel` port over the Anthropic Messages API: the `evals`
-# runner's real-model option (`--model anthropic[:ID]`), native-only.
+# The two `Tracker` adapters `module-escalation` files into, and the
+# outbound-webhook module it publishes its escalation events through.
+# Feature-gated in `module-escalation` (`tracker-github`/`tracker-webhook`,
+# both on by default); on the same core 0.6 line as the rest of the set.
+cratefield-adapter-github-issues = "0.2"
+cratefield-adapter-webhook-tracker = "0.2"
+cratefield-module-webhooks = "0.2"
+# The Anthropic `TextModel` adapter (issue #22): wasm-safe, because it
+# runs over the `HttpClient` port rather than reqwest — the same adapter
+# serves the Worker and the static binary, one instance per tier. It is
+# also the `evals` runner's real-model option (`--model anthropic[:ID]`).
 cratefield-adapter-anthropic = "0.2"
 cratefield-testing = "0.3"
 cratefield-cli = "0.3"
@@ -55,6 +72,12 @@ http = "1.5.0"
 pollster = { version = "0.4", features = ["macro"] }
 # Pure Rust and wasm32-safe: content-addressed chunk ids in module-support.
 sha2 = "0.11"
+# The delivery signature `module-webhooks` and
+# `cratefield-adapter-webhook-tracker` sign with (HMAC-SHA256 over
+# `{unix}.{body}`). On the 0.13/digest-0.11 stack beside `sha2` above, so
+# no second digest stack enters the graph; named here so the escalation
+# tests can recompute a signature independently of the code that made it.
+hmac = "0.13.0"
 # Feature set matched to what runtime-native itself uses, so the binary
 # enables exactly what it needs (`macros`, `rt-multi-thread`) on top.
 tokio = { version = "1.53", default-features = false }

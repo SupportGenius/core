@@ -196,6 +196,20 @@ through a builder. It is the `TextModel` port of `cratefield-core`,
 pinned by the workspace's single `cratefield-*` git rev (see the root
 `Cargo.toml`).
 
+**Handing off files a ticket, in the same batch.** `Support` carries an
+optional `HandoffSink` (`Support::new().with_handoff(..)`). On an
+escalating turn the sink's statements — the escalation outbox row, the
+ticket row, the intake audit event — are appended to the turn's own
+`batch_atomic`, and only after it commits is the sink kicked to run the
+escalation pipeline immediately instead of waiting for cron. The seam is a
+trait, not a dependency: support never names `module-escalation`, and the
+*composition*, which depends on both, adapts escalation to the port. With
+`Support::new()` and no sink, a handoff marks `needs_escalation` exactly as
+before and nothing files a ticket. The port declares `Tracker` and
+`Mailer` optional too, because a kicked escalation run reads them and
+support's `ModuleContext` is a filtered view; a deployment with no sink
+never touches them.
+
 ## Retrieval, and its constraints on purpose
 
 - `chunk`: `tokenize` (lowercased alphanumeric terms, the one tokenizer
@@ -256,5 +270,10 @@ pinned by the workspace's single `cratefield-*` git rev (see the root
 
 ## Not built yet
 
-Composing module-escalation so that a handoff also files an escalation in
-the same batch.
+A real `TextModel`/`Tracker` adapter in either link target: the
+composition ships `UnconfiguredTextModel`/`UnconfiguredTracker` (they
+answer `NotConfigured`, so `POST /messages` degrades to `503
+text-model-not-configured`), and an operator wires real ones. The
+escalation module's own migrations also still need collecting by the
+venture's `fz migrations collect` before the ticket tables exist on a
+deployment.

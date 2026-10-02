@@ -15,3 +15,27 @@ workspace = true
 cratefield-core = { workspace = true }
 cratefield-module-waitlist = { workspace = true }
 module-support = { path = "../module-support" }
+# Both modules register here, and this crate adapts escalation to support's
+# handoff port (see `EscalationHandoff`). Not a dependency of either module
+# on the other: only the composition, which already owns the module list,
+# knows both.
+module-escalation = { path = "../module-escalation" }
+# `UnconfiguredTextModel`/`UnconfiguredTracker` implement the async ports
+# the escalation module requires; the attribute must match the one on the
+# traits in `cratefield-core`.
+async-trait = { workspace = true }
+
+[dev-dependencies]
+# The composition's acceptance tests drive a real harness over the
+# published doubles, post a handoff through the support route and drain
+# the deferred escalation run.
+cratefield-testing = { workspace = true }
+cratefield-adapter-sqlite = { workspace = true }
+pollster = { workspace = true }
+axum = { version = "0.8.9", default-features = false }
+http = { workspace = true }
+bytes = { workspace = true }
+# `ServiceExt::oneshot` drives the router without a network; pinned to
+# the same line cratefield-testing builds against so one tower compiles.
+tower = { version = "0.5.3", features = ["util"] }
+serde_json = { workspace = true }

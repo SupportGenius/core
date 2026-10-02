@@ -42,11 +42,15 @@ cratefield-adapter-sqlite = { workspace = true }
 cratefield-adapter-postgres = { workspace = true, optional = true }
 cratefield-adapter-resend = { workspace = true }
 cratefield-adapter-turnstile = { workspace = true }
+# The `TextModel` port, one Anthropic adapter per tier (issue #22).
+cratefield-adapter-anthropic = { workspace = true }
 supportgenius-composition = { path = "../../crates/composition" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 http = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
+# The `dev-fakes` stub reply is built as JSON (`StubTextModel`).
+serde_json = { workspace = true }
 # The `dev-fakes` stubs implement `async_trait` ports.
 async-trait = { workspace = true }
 

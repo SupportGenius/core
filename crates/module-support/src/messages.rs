@@ -1,5 +1,5 @@
 //! `POST /messages` — one support turn — and the admin route that sets a
-//! tenant's answer threshold.
+//! tenant's answer threshold and web widget origin allowlist.
 //!
 //! The turn's ordering is the point: conversation load, clarify count,
 //! retrieval and the model call all happen before the first write, so
@@ -19,8 +19,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use cratefield_core::{
-    Clock, Completion, Database, IdGen, Json, ModelTier, Problem, ProblemDef, Prompt, Scope,
-    TextModel, TextModelError, require_admin,
+    Clock, Completion, Database, Defer, IdGen, Json, ModelTier, ModuleContext, Problem, ProblemDef,
+    Prompt, Scope, Statement, TextModel, TextModelError, require_admin,
 };
 use cratefield_i18n::{Args, Catalog, FluentCatalog, localize};
 
@@ -90,6 +90,39 @@ pub(crate) fn handoff_message(lang: Option<&str>) -> String {
     canned("handoff", lang)
 }
 
+/// The plain-text transcript escalation files with the ticket: the turn's
+/// user message and the handoff notice it answered with, labelled so an
+/// agent reads who said what.
+///
+/// Deliberately the turn's own two messages, not the whole conversation.
+/// The route has loaded no prior messages (it reads counts, not bodies), and
+/// re-reading the transcript just to enrich a ticket would put a second,
+/// failure-prone read on the hot path of every escalating turn. The turn
+/// that escalates — the question that could not be answered and the notice
+/// that says so — is the part an agent needs to start from.
+fn handoff_transcript(message: &str, reply: &str) -> String {
+    format!("Customer: {message}\n\nSupport: {reply}")
+}
+
+/// The turn's one atomic batch: its own statements, then — when this turn
+/// escalates and a [`HandoffSink`](crate::HandoffSink) is composed — the
+/// sink's statements for `transcript`. Appending here is what makes the
+/// answer and the ticket all-or-nothing. `Support::new()` composes no
+/// sink, so this is just the turn and a handoff only marks
+/// `needs_escalation`.
+fn turn_batch(state: &ModuleState, turn: &store::Turn, transcript: Option<&str>) -> Vec<Statement> {
+    let mut statements = store::turn_statements(turn);
+    if let (Some(transcript), Some(sink)) = (transcript, state.handoff.as_deref()) {
+        statements.extend(sink.enqueue(
+            &state.ctx,
+            &turn.tenant_id,
+            &turn.conversation_id,
+            transcript,
+        ));
+    }
+    statements
+}
+
 /// The languages whose BCP-47 primary tag is not whatlang's ISO 639-3
 /// code: everything a support desk is likely to answer in has a
 /// two-letter 639-1 tag, and the catalogs are keyed by those. Unmapped
@@ -132,7 +165,7 @@ const LANG_TAGS: &[(whatlang::Lang, &str)] = &[
 /// the request's own `Accept-Language` answers, first entry wins; with
 /// neither signal, the turn has no language and every language-dependent
 /// choice falls back to English.
-fn turn_language(message: &str, accept_language: Option<&str>) -> Option<String> {
+pub(crate) fn turn_language(message: &str, accept_language: Option<&str>) -> Option<String> {
     if let Some(info) = whatlang::detect(message)
         && info.is_reliable()
     {
@@ -205,7 +238,74 @@ struct MessageBody {
 
 #[derive(Deserialize)]
 struct SettingsBody {
-    answer_threshold: f32,
+    answer_threshold: Option<f32>,
+    widget_origins: Option<Vec<String>>,
+}
+
+/// What one decided turn answers with, whatever route ran it: the fields
+/// `POST /messages` serializes verbatim, and which the widget route
+/// extends with its own tokens.
+pub(crate) struct TurnReply {
+    pub conversation_id: String,
+    pub message_id: String,
+    /// `'answered' | 'clarify' | 'handoff'`.
+    pub outcome: &'static str,
+    /// What the visitor is shown: the model's answer, or the canned
+    /// clarify/handoff message.
+    pub answer: String,
+    /// `[{chunk_id, quote}]` — retrieved-only citations, empty unless the
+    /// outcome is `answered`.
+    pub citations: Vec<Value>,
+    /// The stored confidence percentage, as a fraction.
+    pub confidence: f64,
+    pub needs_escalation: bool,
+}
+
+impl TurnReply {
+    /// The exact `POST /messages` JSON body.
+    pub(crate) fn to_json(&self) -> Value {
+        json!({
+            "conversation_id": self.conversation_id,
+            "message_id": self.message_id,
+            "outcome": self.outcome,
+            "answer": self.answer,
+            "citations": self.citations,
+            "confidence": self.confidence,
+            "needs_escalation": self.needs_escalation,
+        })
+    }
+}
+
+/// Why a turn did not run to its write. `Problem` covers every ordinary
+/// failure; [`TurnFailure::Response`] carries the one answer that must
+/// keep headers — the retryable 503's `Retry-After` — which a `Problem`
+/// has nowhere to put. (Boxed so the `Err` side of a turn result stays
+/// small: a `Response` is header-plus-body plumbing, and the happy path
+/// pays for its size on every call.)
+pub(crate) enum TurnFailure {
+    Problem(Problem),
+    Response(Box<Response>),
+}
+
+impl TurnFailure {
+    pub(crate) fn into_response(self) -> Response {
+        match self {
+            Self::Problem(problem) => problem.into_response(),
+            Self::Response(response) => *response,
+        }
+    }
+}
+
+impl From<Problem> for TurnFailure {
+    fn from(problem: Problem) -> Self {
+        Self::Problem(problem)
+    }
+}
+
+impl From<cratefield_core::DbError> for TurnFailure {
+    fn from(err: cratefield_core::DbError) -> Self {
+        Self::Problem(err.into())
+    }
 }
 
 /// `POST /messages` — `{"message": "…", "conversation_id": "…"?}`. Answers
@@ -237,47 +337,57 @@ pub(crate) async fn post_message(
             .get(header::ACCEPT_LANGUAGE)
             .and_then(|value| value.to_str().ok()),
     );
+    match run_turn(
+        &state,
+        &scope,
+        &tenant_id,
+        message,
+        body.conversation_id.as_deref(),
+        lang,
+    )
+    .await
+    {
+        Ok(reply) => Ok(Json(reply.to_json()).into_response()),
+        Err(failure) => Ok(failure.into_response()),
+    }
+}
 
+/// One support turn, shared by `POST /messages` (tenant API key) and the
+/// widget route (publishable key): conversation load, clarify count,
+/// retrieval, the model call, the decision and the single atomic write.
+/// The ordering inside is the point: everything that can fail happens
+/// before the first write, so every failure leaves the conversation
+/// exactly as it was. Only a decided turn reaches the `batch_atomic`.
+pub(crate) async fn run_turn(
+    state: &ModuleState,
+    scope: &Scope,
+    tenant_id: &str,
+    message: &str,
+    conversation_id: Option<&str>,
+    lang: Option<String>,
+) -> Result<TurnReply, TurnFailure> {
+    let ctx = &state.ctx;
     let clock: &dyn Clock = required_port(ctx.ports.clock.as_deref(), "Clock")?;
     let id_gen: &dyn IdGen = required_port(ctx.ports.id_gen.as_deref(), "IdGen")?;
     let db: &dyn Database = required_port(ctx.ports.db.as_deref(), "Db")?;
 
-    // 1. The conversation, scoped to the tenant: unknown and foreign are
-    //    the same 404, answered before the model is ever asked.
-    let conversation = match body.conversation_id.as_deref() {
-        Some(id) => Some(
-            store::find_conversation(db, &tenant_id, id)
-                .await?
-                .ok_or_else(|| Problem::not_found().instance(&scope.request_id))?,
-        ),
-        None => None,
-    };
-    // 2. The clarify budget already spent, and the message count that
-    //    orders this turn's two messages. Reads: nothing is written until
-    //    the turn is decided, so a failed call below cannot spend either.
-    let counts = match &conversation {
-        Some(conversation) => store::conversation_counts(db, &tenant_id, &conversation.id).await?,
-        None => store::ConversationCounts {
-            messages: 0,
-            clarifies: 0,
-        },
-    };
+    // 1–2. The conversation this turn belongs to (or none) and its counts
+    //      — both reads, taken before any write.
+    let (conversation, counts) =
+        resolve_conversation(db, tenant_id, conversation_id, &scope.request_id).await?;
 
     // 3. Retrieve — the same BM25 path `GET /search` uses.
-    let chunks = retrieve(db, &tenant_id, message, TOP_K).await?;
+    let chunks = retrieve(db, tenant_id, message, TOP_K).await?;
 
     // 4. The tenant's threshold, else the documented default.
-    let threshold = store::tenant_threshold_pct(db, &tenant_id)
+    let threshold = store::tenant_threshold_pct(db, tenant_id)
         .await?
         .map_or(DEFAULT_ANSWER_THRESHOLD, answer::pct_confidence);
 
     // 5. Ask the model. Nothing has been written yet, which is what makes
     //    every failure here consume nothing.
     let prompt = build_prompt(&chunks, message, lang.as_deref());
-    let completion = match ask(state.text_model.as_deref(), &prompt, &scope).await {
-        Ok(completion) => completion,
-        Err(response) => return Ok(*response),
-    };
+    let completion = ask(state.text_model.as_deref(), &prompt, scope).await?;
 
     // 6. Parse. A reply that is not the schema is a bad gateway, and
     //    still nothing written.
@@ -321,7 +431,7 @@ pub(crate) async fn post_message(
     };
     let turn = store::Turn {
         conversation_id: conversation_id.clone(),
-        tenant_id: tenant_id.clone(),
+        tenant_id: tenant_id.to_owned(),
         conversation_existed: conversation.is_some(),
         escalates,
         now,
@@ -336,25 +446,96 @@ pub(crate) async fn post_message(
         citations_json: citations_json(&reply),
         lang: lang.clone(),
     };
-    // A handoff's `Escalation::intake().handoff(...)` statements belong in
-    // this same batch once module-escalation is composed alongside.
-    db.batch_atomic(&store::turn_statements(&turn)).await?;
+    // 9–10. One atomic write for the whole turn, then the kick. See
+    //       [`commit_turn`] for why the two are ordered this way.
+    let transcript = escalates.then(|| handoff_transcript(message, &shown));
+    commit_turn(
+        state,
+        ctx,
+        db,
+        &turn,
+        transcript.as_deref(),
+        scope.defer.clone(),
+    )
+    .await?;
 
     let citations: Vec<Value> = shown_citations
         .iter()
         .map(|citation| json!({ "chunk_id": citation.chunk_id, "quote": citation.quote }))
         .collect();
-    Ok(Json(json!({
-        "conversation_id": conversation_id,
-        "message_id": assistant_message_id,
-        "outcome": decision.outcome.as_str(),
-        "answer": shown,
-        "citations": citations,
+    Ok(TurnReply {
+        conversation_id,
+        message_id: assistant_message_id,
+        outcome: decision.outcome.as_str(),
+        answer: shown,
+        citations,
         // The stored percentage, divided in f64 so 90 reads back as 0.9.
-        "confidence": answer::pct_confidence_f64(confidence_pct),
-        "needs_escalation": needs_escalation,
-    }))
-    .into_response())
+        confidence: answer::pct_confidence_f64(confidence_pct),
+        needs_escalation,
+    })
+}
+
+/// Steps 1–2: the conversation a turn belongs to, scoped to the tenant, and
+/// its counts.
+///
+/// Both are reads — nothing is written until the turn is decided, so a
+/// failure here consumes nothing. `None` is a new conversation; an id that
+/// is unknown or belongs to another tenant is the same 404, answered before
+/// the model is ever asked.
+async fn resolve_conversation(
+    db: &dyn Database,
+    tenant_id: &str,
+    conversation_id: Option<&str>,
+    request_id: &str,
+) -> Result<(Option<ConversationRow>, store::ConversationCounts), Problem> {
+    let conversation = match conversation_id {
+        Some(id) => Some(
+            store::find_conversation(db, tenant_id, id)
+                .await?
+                .ok_or_else(|| Problem::not_found().instance(request_id))?,
+        ),
+        None => None,
+    };
+    // The clarify budget already spent, and the message count that orders
+    // this turn's two messages.
+    let counts = match &conversation {
+        Some(conversation) => store::conversation_counts(db, tenant_id, &conversation.id).await?,
+        None => store::ConversationCounts {
+            messages: 0,
+            clarifies: 0,
+        },
+    };
+    Ok((conversation, counts))
+}
+
+/// Commits the turn's one atomic write, then kicks escalation.
+///
+/// The batch is the turn's own statements plus, when `transcript` is
+/// `Some` (an escalating turn with a [`HandoffSink`](crate::HandoffSink)
+/// composed), the sink's for that transcript — so the "escalated" answer
+/// and the ticket behind it commit or roll back together. The kick runs
+/// only *after* the commit: a failure there costs a delay (the scheduled
+/// drain is the backstop), never the ticket the batch just wrote.
+///
+/// Extracted from [`run_turn`] to keep the turn's ordering readable
+/// as one numbered sequence without the handler tripping the function
+/// length lint.
+async fn commit_turn(
+    state: &ModuleState,
+    ctx: &ModuleContext,
+    db: &dyn Database,
+    turn: &store::Turn,
+    transcript: Option<&str>,
+    defer: Arc<dyn Defer>,
+) -> Result<(), Problem> {
+    db.batch_atomic(&turn_batch(state, turn, transcript))
+        .await?;
+    if transcript.is_some()
+        && let Some(sink) = state.handoff.as_deref()
+    {
+        sink.kick(ctx, defer);
+    }
+    Ok(())
 }
 
 /// The request body, with `message` trimmed and length-checked.
@@ -375,31 +556,28 @@ fn parse_message(body: &[u8]) -> Result<MessageBody, Problem> {
     Ok(body)
 }
 
-/// Calls the model, mapping every failure to the finished response: no
-/// model or `NotConfigured` is `503 text-model-not-configured`,
-/// `Transient` the retryable `503` with `Retry-After`, and a refusal or a
-/// transport failure `502`.
+/// Calls the model, mapping every failure to its problem: no model or
+/// `NotConfigured` is `503 text-model-not-configured`, `Transient` the
+/// retryable `503` with `Retry-After`, and a refusal or a transport
+/// failure `502`. The error side is a [`TurnFailure`] because one leg —
+/// the retryable 503 — must keep its `Retry-After` header, which a
+/// `Problem` cannot carry.
 async fn ask(
     model: Option<&dyn TextModel>,
     prompt: &Prompt,
     scope: &Scope,
-) -> Result<Completion, Box<Response>> {
-    let problem = |def: &ProblemDef| {
-        Box::new(
-            Problem::new(def)
-                .instance(&scope.request_id)
-                .into_response(),
-        )
-    };
+) -> Result<Completion, TurnFailure> {
+    let problem =
+        |def: &ProblemDef| TurnFailure::Problem(Problem::new(def).instance(&scope.request_id));
     let Some(model) = model else {
         return Err(problem(&TEXT_MODEL_NOT_CONFIGURED));
     };
     match model.complete(prompt).await {
         Ok(completion) => Ok(completion),
         Err(TextModelError::NotConfigured) => Err(problem(&TEXT_MODEL_NOT_CONFIGURED)),
-        Err(err @ TextModelError::Transient { .. }) => {
-            Err(Box::new(unavailable(scope, err.retry_after())))
-        }
+        Err(err @ TextModelError::Transient { .. }) => Err(TurnFailure::Response(Box::new(
+            unavailable(scope, err.retry_after()),
+        ))),
         Err(TextModelError::Rejected(_) | TextModelError::Transport(_)) => {
             Err(problem(&TEXT_MODEL_BAD_ANSWER))
         }
@@ -453,10 +631,17 @@ fn unavailable(scope: &Scope, retry_after: Option<Duration>) -> Response {
     response
 }
 
-/// `PUT /admin/tenants/{tenant_id}/settings` — `{"answer_threshold": 0.9}`
-/// sets the tenant's answer threshold (0.0..=1.0, stored as a whole
-/// percentage). Guarded by the harness admin token, exactly like
-/// `POST /admin/tenants`.
+/// `PUT /admin/tenants/{tenant_id}/settings` — `{"answer_threshold": 0.9,
+/// "widget_origins": ["https://support.example"]}` sets the tenant's
+/// answer threshold (0.0..=1.0, stored as a whole percentage) and the
+/// web widget's origin allowlist. At least one field must be present;
+/// updating one leaves the other exactly as it was, in one statement.
+/// The origins are
+/// validated and normalized by [`crate::widget::normalize_widget_origins`]
+/// — the same RFC 6454 serialization the widget routes compare against,
+/// so a stored entry can never drift from what a request must present —
+/// and an empty array is legal, closing the widget. Guarded by the
+/// harness admin token, exactly like `POST /admin/tenants`.
 pub(crate) async fn put_settings(
     scope: Scope,
     State(state): State<Arc<ModuleState>>,
@@ -468,17 +653,34 @@ pub(crate) async fn put_settings(
     require_admin(&*state.ctx.config, &headers)?;
     let body: SettingsBody = serde_json::from_slice(&body).map_err(|_| {
         Problem::validation_failed(
-            "body: expected a JSON object with a number \"answer_threshold\"",
+            "body: expected a JSON object with an optional number \"answer_threshold\" \
+             (0.0..=1.0) and an optional array of origin strings \"widget_origins\"",
         )
         .instance(&scope.request_id)
     })?;
+    if body.answer_threshold.is_none() && body.widget_origins.is_none() {
+        return Err(Problem::validation_failed(
+            "body: set \"answer_threshold\" or \"widget_origins\" — at least one",
+        )
+        .instance(&scope.request_id));
+    }
     // `contains` is false for NaN, so this also rejects it.
-    if !(0.0..=1.0).contains(&body.answer_threshold) {
+    if let Some(threshold) = body.answer_threshold
+        && !(0.0..=1.0).contains(&threshold)
+    {
         return Err(
             Problem::validation_failed("answer_threshold: a number in 0.0..=1.0")
                 .instance(&scope.request_id),
         );
     }
+    // Normalized before anything is read or written: a bad origin is a
+    // 400 and touches nothing.
+    let origins = body
+        .widget_origins
+        .as_deref()
+        .map(crate::widget::normalize_widget_origins)
+        .transpose()
+        .map_err(|detail| Problem::validation_failed(detail).instance(&scope.request_id))?;
 
     let ctx = &state.ctx;
     let clock: &dyn Clock = required_port(ctx.ports.clock.as_deref(), "Clock")?;
@@ -486,12 +688,36 @@ pub(crate) async fn put_settings(
     if store::find_tenant(db, &tenant_id).await?.is_none() {
         return Err(Problem::not_found().instance(&scope.request_id));
     }
-    let pct = answer::confidence_pct(body.answer_threshold);
-    store::upsert_tenant_threshold(db, &tenant_id, pct, &store::iso_now(clock)).await?;
+    // One atomic statement: the field this request omits keeps its
+    // stored value (the store's SET list names only provided fields), a
+    // first-ever row takes the documented default threshold (the column
+    // is NOT NULL) and no allowlist. No read-merge-write, so two admins
+    // setting different fields cannot lose one of the writes.
+    let widget_origins = origins.as_deref().map(|list| {
+        // Serializing a `Vec<String>` cannot fail, but an honest
+        // fallback beats an unreachable: `"[]"` closes the widget.
+        serde_json::to_string(list).unwrap_or_else(|_| "[]".to_owned())
+    });
+    store::upsert_tenant_settings(
+        db,
+        &tenant_id,
+        body.answer_threshold.map(answer::confidence_pct),
+        widget_origins.as_deref(),
+        answer::confidence_pct(DEFAULT_ANSWER_THRESHOLD),
+        &store::iso_now(clock),
+    )
+    .await?;
 
+    // What now stands, read back — not what was sent: the widget
+    // allowlist reads back as the array it is stored as (`[]` when it
+    // is null).
+    let stored = store::find_tenant_settings(db, &tenant_id)
+        .await?
+        .ok_or_else(Problem::internal)?;
     Ok(Json(json!({
         "tenant_id": tenant_id,
-        "answer_threshold": answer::pct_confidence_f64(pct),
+        "answer_threshold": answer::pct_confidence_f64(stored.answer_threshold_pct),
+        "widget_origins": store::parse_widget_origins(stored.widget_origins.as_deref()),
     }))
     .into_response())
 }
