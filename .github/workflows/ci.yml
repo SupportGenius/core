@@ -37,6 +37,11 @@ jobs:
       # first surface wherever someone runs the migration collector.
       - name: fz, with its cli feature
         run: cargo clippy -p supportgenius --all-targets --locked --features cli -- -D warnings
+      # The binary's `dev_fakes.rs` is compiled only under the `dev-fakes`
+      # feature, which the workspace run above never enables — a lint there
+      # would otherwise first surface wherever someone builds the fakes.
+      - name: dev-fakes, with its stub ports
+        run: cargo clippy -p supportgenius-bin --all-targets --locked --features dev-fakes -- -D warnings
 
   test:
     name: test
@@ -48,6 +53,27 @@ jobs:
           toolchain: "1.98.1"
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
+      # The binary's `dev_fakes.rs` — and the tests over it added in this
+      # diff — are compiled only under the `dev-fakes` feature, so the
+      # workspace run above never builds them.
+      - name: supportgenius-bin, with dev fakes
+        run: cargo test -p supportgenius-bin --locked --features dev-fakes
+
+  evals:
+    # The golden set (issue #38), run with the deterministic `fake` model so
+    # the job needs no API key: it fails on a `recall@6` regression against
+    # `evals/baseline.json`, which is why the baseline is committed source.
+    # Its answer numbers measure retrieval-as-answer, not model quality —
+    # real-model runs are committed under `evals/results/` by hand instead.
+    name: evals (golden set, fake model)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98.1"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run -p evals --locked -- --model fake
 
   wasm:
     name: worker-build (ventures/supportgenius)
@@ -116,12 +142,14 @@ jobs:
           fi
 
   conformance:
-    # b50c1d9 was HEAD of Cratefield/harness's main when pinned
-    # (2026-09-28), so the pin can be re-checked against that branch.
+    # 1475d0190b4ef05c20fdd450f3967ce6ec005360 is the harness commit that
+    # published cratefield-core 0.6.0 and every dependent (Cratefield/harness#558,
+    # the 0.6.0 crates.io release). No release tag exists, so the full SHA is
+    # the pin; it is on main.
     name: conformance (module kit)
     needs: detect-modules
     if: needs.detect-modules.outputs.has_modules == 'true'
-    uses: Cratefield/harness/.github/workflows/conformance.yml@b50c1d99b6f29e11a9fd5f116a8cd31275f735c6
+    uses: Cratefield/harness/.github/workflows/conformance.yml@1475d0190b4ef05c20fdd450f3967ce6ec005360
     with:
       module-glob: "crates/module-*"
 

@@ -102,6 +102,7 @@ impl Intake {
             customer_question: None,
             external_id: None,
             external_url: None,
+            match_count: 0,
             created_at: now.clone(),
             updated_at: now.clone(),
         };
@@ -301,7 +302,7 @@ mod tests {
         let db = cratefield_adapter_sqlite::SqliteDatabase::in_memory().expect("in-memory db");
         db.apply_migrations(
             "module-escalation",
-            std::slice::from_ref(&crate::MIGRATION_ESCALATION),
+            &[crate::MIGRATION_ESCALATION, crate::MIGRATION_DUPLICATES],
         )
         .expect("migration applies");
 

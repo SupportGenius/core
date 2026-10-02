@@ -1,0 +1,100 @@
+{"id":"q001","question":"What language are the modules in this harness written in?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"Modules are Rust crates resolved at compile time"}]}
+{"id":"q002","question":"Do separate Factory Zero products share anything with each other while they are running?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"Nothing is shared at runtime between ventures"}]}
+{"id":"q003","question":"Which datastore does the harness use right now on Cloudflare?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"Cloudflare D1 is the database today"}]}
+{"id":"q004","question":"Can the compute and storage layers be swapped out later without rewriting the modules?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"the design keeps compute and storage swappable"}]}
+{"id":"q005","question":"Is a module allowed to reach a Cloudflare binding or a vendor client directly?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"A module never touches a Cloudflare binding"}]}
+{"id":"q006","question":"Do the confirmation and unsubscribe links need the server to keep a session for them?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"Confirmation and unsubscribe links are HMAC-signed tokens, so they need no server-side session"}]}
+{"id":"q007","question":"Who authors the SQL that migrates the databases?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"Migrations are hand-written SQL in a subset that both"}]}
+{"id":"q008","question":"How can I tell whether a crate is meant for the public or is internal to Factory Zero?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"Crate names encode visibility and distribution"}]}
+{"id":"q009","question":"What does the prefix on a crate name tell me about it?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"The prefix says who owns the name and whether it is published"}]}
+{"id":"q010","question":"Where is the source for each harness crate kept?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"Every crate lives in this repository"}]}
+{"id":"q011","question":"How do you check that a module behaves the same on SQLite and on Postgres?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"The parity suite runs module suites against both SQLite and Postgres"}]}
+{"id":"q012","question":"What does the managed control plane do for a customer?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"pick modules, connect Cloudflare and SSO, and get a running harness venture"}]}
+{"id":"q013","question":"Is there a starter template I can copy to begin a new venture?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"There is no template to copy: a new one starts from a manifest"}]}
+{"id":"q014","question":"What happens if two modules both try to own the same route or table?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"when two modules claim the same route prefix or table"}]}
+{"id":"q015","question":"How does a request handler get hold of the request scope?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"Handlers get the request scope as an axum extractor"}]}
+{"id":"q016","question":"Why is it sound to wrap the non-thread-safe JavaScript handles that Workers hand over?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"which is sound because a Workers isolate is single-threaded"}]}
+{"id":"q017","question":"How does the harness turn an incoming JSON body into validated data?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"Bodies deserialize with serde into types whose constructors validate"}]}
+{"id":"q018","question":"Must a public write endpoint carry a captcha token?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"Public write endpoints require a Turnstile token when the"}]}
+{"id":"q019","question":"What happens to the admin routes if no admin token has been configured?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"and are disabled when the token is unset"}]}
+{"id":"q020","question":"Who checks authorization for admin paths that are forwarded to a sidecar?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"Admin paths under a mount are authorized by the host before forwarding"}]}
+{"id":"q021","question":"How are writes that get forwarded to a sidecar throttled?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"Forwarded writes pass the host's rate limiter and fail closed"}]}
+{"id":"q022","question":"Does the signup endpoint let an attacker discover which email addresses are already registered?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"Does not reveal whether the email already existed"}]}
+{"id":"q023","question":"What happens when a security scanner visits every link in one of our emails?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"A mail gateway that fetches every link"}]}
+{"id":"q024","question":"When someone asks for their signup to be erased, how is that carried out?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"Hard delete for deletion requests, keyed on the opaque row id"}]}
+{"id":"q025","question":"Can a product react when someone confirms their waitlist place?","label":"answerable","gold":[{"source":"harness-architecture.md","phrase":"a venture can subscribe that event to also add the address to the signup list"}]}
+{"id":"q026","question":"What stays together when a tenant is backed up or moved?","label":"answerable","gold":[{"source":"harness-secrets.md","phrase":"a tenant backs up, restores, moves and drops as one unit"}]}
+{"id":"q027","question":"Which secret store can module code never reach?","label":"answerable","gold":[{"source":"harness-secrets.md","phrase":"Modules can only ever obtain a tenant store; the global store is unreachable from module code"}]}
+{"id":"q028","question":"How do secrets reach the Cloudflare Worker today?","label":"answerable","gold":[{"source":"harness-secrets.md","phrase":"one Worker, one D1, secrets arrive as wrangler environment"}]}
+{"id":"q029","question":"What is the master key and can it ever be taken out of the KMS?","label":"answerable","gold":[{"source":"harness-secrets.md","phrase":"held by the KMS, never exportable"}]}
+{"id":"q030","question":"How is a store's data key created and wrapped?","label":"answerable","gold":[{"source":"harness-secrets.md","phrase":"generated locally from the OS RNG, wrapped by the KMS at creation"}]}
+{"id":"q031","question":"What happens to a tenant's ciphertext if you delete its wrapped key row?","label":"answerable","gold":[{"source":"harness-secrets.md","phrase":"offboarding a tenant is a crypto-shred"}]}
+{"id":"q032","question":"Does a leaked tenant key expose secrets belonging to anyone else?","label":"answerable","gold":[{"source":"harness-secrets.md","phrase":"a leaked tenant DEK exposes one tenant and no global secret"}]}
+{"id":"q033","question":"Does moving a tenant to a different cluster require moving anything besides its data?","label":"answerable","gold":[{"source":"harness-secrets.md","phrase":"a tenant's backup is self-contained, and a tenant moved to another cluster takes its keys with its data"}]}
+{"id":"q034","question":"What does rotating the master key cost?","label":"answerable","gold":[{"source":"harness-secrets.md","phrase":"one KMS call per store; no secret is re-encrypted"}]}
+{"id":"q035","question":"Which database keeps the wrapped data keys?","label":"answerable","gold":[{"source":"harness-secrets.md","phrase":"each database stores the wrapped DEK for the store inside it"}]}
+{"id":"q036","question":"Why was XChaCha20-Poly1305 picked over the other candidate ciphers?","label":"answerable","gold":[{"source":"harness-secrets.md","phrase":"keeps keys zeroised, exposes AAD cleanly"}]}
+{"id":"q037","question":"How large is the nonce for each secret version and where does it come from?","label":"answerable","gold":[{"source":"harness-secrets.md","phrase":"24 random bytes from the OS RNG per encryption"}]}
+{"id":"q038","question":"What binds a ciphertext to the row it belongs to?","label":"answerable","gold":[{"source":"harness-secrets.md","phrase":"Every ciphertext is sealed with additional authenticated data derived from the row's identity"}]}
+{"id":"q039","question":"What is still outstanding before the release pipeline can publish?","label":"answerable","gold":[{"source":"harness-releasing.md","phrase":"one-time crates.io setup steps that need a human with the owner account"}]}
+{"id":"q040","question":"Does any part of the release checking run without any credentials?","label":"answerable","gold":[{"source":"harness-releasing.md","phrase":"workflow already runs daily with no credentials"}]}
+{"id":"q041","question":"What does the release assistant do on every push to the main branch?","label":"answerable","gold":[{"source":"harness-releasing.md","phrase":"collects the conventional commits since the last release and opens"}]}
+{"id":"q042","question":"What happens the moment a release pull request is merged?","label":"answerable","gold":[{"source":"harness-releasing.md","phrase":"it publishes every crate whose version is not yet on crates.io"}]}
+{"id":"q043","question":"What does the pipeline do about the very first publish of a brand new crate?","label":"answerable","gold":[{"source":"harness-releasing.md","phrase":"When that step lands its first publish is manual, the same as every other new crate"}]}
+{"id":"q044","question":"Why might a breaking change in the core crate fail to reach its dependents?","label":"answerable","gold":[{"source":"harness-releasing.md","phrase":"does not release its dependents, and check that it did"}]}
+{"id":"q045","question":"What does the release tool rewrite when it ships a crate?","label":"answerable","gold":[{"source":"harness-releasing.md","phrase":"when it releases a crate it rewrites that crate's version requirement in every manifest it manages"}]}
+{"id":"q046","question":"Why is the dependent-release cascade so easy to break without noticing?","label":"answerable","gold":[{"source":"harness-releasing.md","phrase":"The cascade is keyed on that rewrite, which makes it easy to suppress by accident"}]}
+{"id":"q047","question":"Is there a setting that switches the cascade on or off?","label":"answerable","gold":[{"source":"harness-releasing.md","phrase":"there is no option to turn the cascade on, off, or up"}]}
+{"id":"q048","question":"If a dependency introduces a breaking change, what version bump does a dependent get?","label":"answerable","gold":[{"source":"harness-releasing.md","phrase":"A cascaded dependent gets a patch bump even when the dependency broke"}]}
+{"id":"q049","question":"Why does the workspace stay green even when the published crates cannot be resolved together?","label":"answerable","gold":[{"source":"harness-releasing.md","phrase":"the workspace compiles against the local 0.5 whatever the published requirements say"}]}
+{"id":"q050","question":"What must happen before trusted publishing can be switched on for a crate?","label":"answerable","gold":[{"source":"harness-releasing.md","phrase":"so the very first release of each crate is manual"}]}
+{"id":"q051","question":"What must the account you publish from have?","label":"answerable","gold":[{"source":"harness-releasing.md","phrase":"Create a scoped token, on an account with a verified email"}]}
+{"id":"q052","question":"What kind of retrieval does the support module do?","label":"answerable","gold":[{"source":"module-support.md","phrase":"Tenants, sources, BM25 retrieval, and conversations answered with citations"}]}
+{"id":"q053","question":"How do documents that are too big for a normal request body get in?","label":"answerable","gold":[{"source":"module-support.md","phrase":"Documents larger than the inline ceiling arrive through the chunked-upload routes"}]}
+{"id":"q054","question":"Are the credentials checked before or after the request body is examined?","label":"answerable","gold":[{"source":"module-support.md","phrase":"Every guard runs before the body is parsed"}]}
+{"id":"q055","question":"Can two different tenants use the same external document key?","label":"answerable","gold":[{"source":"module-support.md","phrase":"The id is unique per tenant, so two tenants may both say"}]}
+{"id":"q056","question":"Where does an extracted upload end up in the index?","label":"answerable","gold":[{"source":"module-support.md","phrase":"and indexes it through the same path as"}]}
+{"id":"q057","question":"What stops an unfinished upload from being kept forever?","label":"answerable","gold":[{"source":"module-support.md","phrase":"upload nobody completed is storage nobody is coming back for"}]}
+{"id":"q058","question":"What happens to an extraction that keeps failing because of infrastructure rather than the document?","label":"answerable","gold":[{"source":"module-support.md","phrase":"is retried with the outbox's own attempt counter, five tries"}]}
+{"id":"q059","question":"What makes the module treat a model answer as trustworthy enough to return?","label":"answerable","gold":[{"source":"module-support.md","phrase":"there is at least one citation, and the confidence is at or above the tenant's threshold"}]}
+{"id":"q060","question":"What does a turn become when the model cites a passage that was never retrieved?","label":"answerable","gold":[{"source":"module-support.md","phrase":"A citation naming a chunk id that was not retrieved for this request downgrades the turn to"}]}
+{"id":"q061","question":"Does a good answer later on undo an earlier escalation?","label":"answerable","gold":[{"source":"module-support.md","phrase":"Once a conversation needs escalation, an answered follow-up does not clear it"}]}
+{"id":"q062","question":"How does the standalone binary keep in step with the Worker deployment?","label":"answerable","gold":[{"source":"supportgenius-binary.md","phrase":"the same modules the Cloudflare Worker serves"}]}
+{"id":"q063","question":"What happens at startup if the signing secret is missing?","label":"answerable","gold":[{"source":"supportgenius-binary.md","phrase":"without it the harness cannot wire the port and the process exits at boot"}]}
+{"id":"q064","question":"How do large document uploads arrive at the service?","label":"answerable","gold":[{"source":"supportgenius-binary.md","phrase":"documents up to 4 MiB arrive in 48 KiB parts"}]}
+{"id":"q065","question":"What happens to rate limiting if Redis is not configured in a development environment?","label":"answerable","gold":[{"source":"supportgenius-binary.md","phrase":"rate limiting fails open by design"}]}
+{"id":"q066","question":"Where does the waitlist keep the addresses people submit?","label":"answerable","gold":[{"source":"supportgenius-worker.md","phrase":"Entries live in this Worker's own D1 database"}]}
+{"id":"q067","question":"What turns a pending waitlist entry into a confirmed one?","label":"answerable","gold":[{"source":"supportgenius-worker.md","phrase":"the link in the confirmation mail turns a pending entry into a confirmed one"}]}
+{"id":"q068","question":"Why can two model tiers from the same vendor not serve as an independent judge?","label":"answerable","gold":[{"source":"supportgenius-worker.md","phrase":"One vendor on both tiers is not an independent judge"}]}
+{"id":"q069","question":"How is an escalated conversation turned into a ticket?","label":"answerable","gold":[{"source":"supportgenius-core.md","phrase":"drafted by one model, checked by an independent one, filed by a router"}]}
+{"id":"q070","question":"Why is the whole cratefield family held at one revision?","label":"answerable","gold":[{"source":"supportgenius-core.md","phrase":"is pinned to that one git rev"}]}
+{"id":"q071","question":"How much does the paid plan cost per agent each month?","label":"unanswerable"}
+{"id":"q072","question":"Which pricing tiers are available for SupportGenius?","label":"unanswerable"}
+{"id":"q073","question":"Do you offer a free trial or a discount for nonprofits?","label":"unanswerable"}
+{"id":"q074","question":"Is there a mobile app I can install on iOS and Android?","label":"unanswerable"}
+{"id":"q075","question":"Can I connect SupportGenius to my Shopify store so product questions pull from my catalogue?","label":"unanswerable"}
+{"id":"q076","question":"Do you have a Python or JavaScript client library I can install?","label":"unanswerable"}
+{"id":"q077","question":"What are the exact BM25 k1 and b parameter values used for ranking?","label":"unanswerable"}
+{"id":"q078","question":"Is there a Terraform provider for provisioning SupportGenius tenants?","label":"unanswerable"}
+{"id":"q079","question":"Can I pin my data to an EU-only region for GDPR?","label":"unanswerable"}
+{"id":"q080","question":"What uptime SLA do you offer and do you credit downtime?","label":"unanswerable"}
+{"id":"q081","question":"Does the support bot answer questions over WhatsApp or SMS?","label":"unanswerable"}
+{"id":"q082","question":"How many sources am I allowed to have in total across my tenant?","label":"unanswerable"}
+{"id":"q083","question":"Can I attach screenshots to a support message?","label":"unanswerable"}
+{"id":"q084","question":"Is there a Chrome extension for the admin console?","label":"unanswerable"}
+{"id":"q085","question":"Is there a WordPress plugin I can install?","label":"unanswerable"}
+{"id":"q086","question":"Which PostgreSQL server versions are supported?","label":"unanswerable"}
+{"id":"q087","question":"Does the admin console have a dark mode setting?","label":"unanswerable"}
+{"id":"q088","question":"How long do you keep the search query logs?","label":"unanswerable"}
+{"id":"q089","question":"Can I schedule a demo with the sales team?","label":"unanswerable"}
+{"id":"q090","question":"Which CDN does SupportGenius serve its API through?","label":"unanswerable"}
+{"id":"q091","question":"I was charged twice this month, please refund the duplicate payment.","label":"needs_person"}
+{"id":"q092","question":"The invoice you sent does not match our contract, fix the billing on our account.","label":"needs_person"}
+{"id":"q093","question":"Delete all the data you hold about our company right now.","label":"needs_person"}
+{"id":"q094","question":"I want to talk to a real person, please stop the bot.","label":"needs_person"}
+{"id":"q095","question":"Our legal team is preparing a claim over this and you should expect formal notice.","label":"needs_person"}
+{"id":"q096","question":"I think my account has been compromised and someone is reading our documents.","label":"needs_person"}
+{"id":"q097","question":"Cancel our subscription and refund the annual fee we just paid.","label":"needs_person"}
+{"id":"q098","question":"We need a signed data processing agreement before our compliance audit next week.","label":"needs_person"}
+{"id":"q099","question":"I am disputing this charge with my bank unless you reverse it today.","label":"needs_person"}
+{"id":"q100","question":"Please transfer this to someone who can change the billing owner on our account.","label":"needs_person"}

@@ -27,6 +27,18 @@
 //! refuses to authenticate one whose row is gone, so deleting that row
 //! revokes the key with no config edit.
 //!
+//! **Two key classes.** A *secret* key ([`mint`]/[`verify`],
+//! `sg_<kid>.…`) is a bearer credential: it names tenants, mutates
+//! indexes and reads every conversation. A *publishable* key
+//! ([`mint_publishable`]/[`verify_publishable`], `sg_pub_<kid>.…`) is the
+//! web-widget credential: it can only ever name its tenant, because the
+//! page that carries it is readable by every visitor. The two share one
+//! inner shape and one revocation list, and a credential of one class
+//! presented at the other's door is refused on the class — a leaked
+//! publishable key must not quietly authenticate as anything but a
+//! widget key, and a secret key pasted into a page must not start
+//! working as one.
+//!
 //! **No cryptography here.** The MAC, the constant-time comparison, the
 //! key ring, expiry and the venture/environment binding all belong to the
 //! `Signer` port. This crate adds only the credential shape and its
@@ -48,6 +60,14 @@ use cratefield_core::{IdGen, Kid, MAX_KID_NAME, Payload, Signer, UlidIdGen};
 /// nothing else, and every other purpose fails here.
 pub const API_KEY_PURPOSE: &str = "tenancy.api-key";
 
+/// The purpose every publishable key is signed with:
+/// `"tenancy.publishable-key"`. Its scoping argument is the same as
+/// [`API_KEY_PURPOSE`]'s — a widget key works against every consumer
+/// module with no re-issue — and the guarantee it buys is likewise the
+/// same one direction: a token with this purpose verifies as a widget
+/// key and as nothing else.
+pub const PUBLISHABLE_KEY_PURPOSE: &str = "tenancy.publishable-key";
+
 /// The display prefix on every key: `sg_`.
 ///
 /// Deliberately unauthenticated. The prefix plus the kid segment is
@@ -58,6 +78,15 @@ pub const API_KEY_PURPOSE: &str = "tenancy.api-key";
 /// [`verify`] demands the MAC'd payload name the same kid the prefix
 /// does, so a lying prefix is refused rather than believed.
 pub const KEY_PREFIX: &str = "sg_";
+
+/// The display prefix on every publishable key: `sg_pub_`.
+///
+/// The one prefix a browser page may carry (the widget refuses anything
+/// else), so its meaning is a promise about *class*, not just shape:
+/// `verify` accepts it and [`verify_publishable`] refuses it. Like
+/// [`KEY_PREFIX`], it is unauthenticated and never trusted on its own —
+/// the MAC'd payload must name the kid the prefix claims.
+pub const PUBLISHABLE_PREFIX: &str = "sg_pub_";
 
 /// The config key under which operators list revoked key ids,
 /// comma-separated: `REVOKED_KIDS = "cur, k-2026-08"`. Both consumer
@@ -165,9 +194,46 @@ impl std::error::Error for KeyError {}
 /// token), and [`KeyError::UnknownKid`] when it signed with a kid this
 /// crate cannot render into the prefix.
 pub fn mint(signer: &dyn Signer, tenant_id: &str) -> Result<MintedKey, KeyError> {
+    mint_over(signer, tenant_id, API_KEY_PURPOSE, KEY_PREFIX)
+}
+
+/// Mints a *publishable* key — the web-widget credential — over the same
+/// `Signer` port.
+///
+/// The shape and the metadata are the secret key's ([`mint`]); what
+/// differs is the purpose ([`PUBLISHABLE_KEY_PURPOSE`]) and the prefix
+/// ([`PUBLISHABLE_PREFIX`]), which together put the credential in the
+/// other class: [`verify_publishable`] accepts it and [`verify`] refuses
+/// it, so a key a page can read can never authenticate at the
+/// secret-keyed doors. The lifetime story is `mint`'s too — the signer's
+/// policy ceiling applies, and an expired widget key is fixed by
+/// re-minting (and re-embedding), not by code.
+///
+/// # Errors
+///
+/// [`KeyError::Invalid`] when the freshly signed token fails the
+/// round-trip verification, and [`KeyError::UnknownKid`] when it signed
+/// with a kid this crate cannot render into the prefix.
+pub fn mint_publishable(signer: &dyn Signer, tenant_id: &str) -> Result<MintedKey, KeyError> {
+    mint_over(
+        signer,
+        tenant_id,
+        PUBLISHABLE_KEY_PURPOSE,
+        PUBLISHABLE_PREFIX,
+    )
+}
+
+/// The one mint: purpose and prefix are the whole difference between the
+/// two key classes, and this is where they are chosen.
+fn mint_over(
+    signer: &dyn Signer,
+    tenant_id: &str,
+    purpose: &str,
+    prefix: &str,
+) -> Result<MintedKey, KeyError> {
     let key_id = UlidIdGen.ulid();
     let token = signer.sign(&Payload {
-        purpose: API_KEY_PURPOSE.to_owned(),
+        purpose: purpose.to_owned(),
         subject: format!("{tenant_id}{SUBJECT_SEPARATOR}{key_id}"),
         // Expiry is the signer's policy call, not ours.
         exp: None,
@@ -175,12 +241,10 @@ pub fn mint(signer: &dyn Signer, tenant_id: &str) -> Result<MintedKey, KeyError>
         // from the round-trip below.
         kid: Kid::Cur,
     });
-    let verified = signer
-        .verify(&token, API_KEY_PURPOSE)
-        .ok_or(KeyError::Invalid)?;
+    let verified = signer.verify(&token, purpose).ok_or(KeyError::Invalid)?;
     let kid = kid_name(&verified.kid).ok_or(KeyError::UnknownKid)?;
     Ok(MintedKey {
-        key: format!("{KEY_PREFIX}{kid}.{token}"),
+        key: format!("{prefix}{kid}.{token}"),
         kid,
         key_id,
         tenant_id: tenant_id.to_owned(),
@@ -198,6 +262,11 @@ pub fn mint(signer: &dyn Signer, tenant_id: &str) -> Result<MintedKey, KeyError>
 /// checked against the *authenticated* kid, so relabelling the prefix
 /// cannot dodge a revoked entry.
 ///
+/// A **publishable** key (`sg_pub_…`) is refused here like any other
+/// junk: this door takes the bearer class only, and a key a page can
+/// read must never name tenants at it. The reverse holds for
+/// [`verify_publishable`].
+///
 /// The signed subject is split into `{tenant_id}.{key_id}`; a token whose
 /// subject carries no key id is [`KeyError::Malformed`].
 ///
@@ -205,23 +274,75 @@ pub fn mint(signer: &dyn Signer, tenant_id: &str) -> Result<MintedKey, KeyError>
 /// under [`REVOKED_KIDS_KEY`] with [`parse_revoked_kids`] as the
 /// emergency override on the signing kid; a consuming module revokes an
 /// individual key by dropping the row for its `key_id` instead.
+/// Comparison is ASCII case-insensitive so a hand-written config entry
+/// cannot silently miss.
 ///
 /// # Errors
 ///
 /// [`KeyError::Malformed`] when the string lacks the
 /// `sg_<kid>.<payload>.<mac>` shape or its subject carries no key id,
-/// [`KeyError::Invalid`] when the signer rejects the credential or the
-/// prefix kid does not match the payload kid, [`KeyError::Revoked`] when
-/// the authenticated kid is on `revoked_kids`, and [`KeyError::UnknownKid`]
-/// when the payload names a kid this crate cannot render.
+/// [`KeyError::Invalid`] when the signer rejects the credential, the
+/// prefix kid does not match the payload kid, or the credential is a
+/// publishable key, [`KeyError::Revoked`] when the authenticated kid is
+/// on `revoked_kids`, and [`KeyError::UnknownKid`] when the payload names
+/// a kid this crate cannot render.
 pub fn verify(
     signer: &dyn Signer,
     presented: &str,
     revoked_kids: &[String],
 ) -> Result<TenantKey, KeyError> {
-    let body = presented
-        .strip_prefix(KEY_PREFIX)
-        .ok_or(KeyError::Malformed)?;
+    verify_over(signer, presented, revoked_kids, API_KEY_PURPOSE, KEY_PREFIX)
+}
+
+/// Verifies a presented **publishable** key and returns the tenant it
+/// authenticates — the [`verify`] rules over the other class: purpose
+/// [`PUBLISHABLE_KEY_PURPOSE`], prefix [`PUBLISHABLE_PREFIX`], the same
+/// `revoked_kids` list (one edit revokes both classes at once), the same
+/// prefix-payload match.
+///
+/// A secret key is refused here, not downgraded: a page-sourced
+/// credential gets exactly the authority `sg_pub_` names and nothing the
+/// holder could have pasted in makes broader.
+///
+/// A publishable key carries a per-key id in its subject like a secret
+/// key does (the same `{tenant_id}.{key_id}` shape), but no module keeps a
+/// row for one today, so it is revoked by kid (`revoked_kids`) or by
+/// expiry — not individually.
+///
+/// # Errors
+///
+/// [`KeyError::Malformed`] when the string lacks the
+/// `sg_pub_<kid>.<payload>.<mac>` shape, [`KeyError::Invalid`] when the
+/// signer rejects the credential, the prefix kid does not match the
+/// payload kid, or the credential is a secret key,
+/// [`KeyError::Revoked`] when the authenticated kid is on
+/// `revoked_kids`, and [`KeyError::UnknownKid`] when the payload names a
+/// kid this crate cannot render.
+pub fn verify_publishable(
+    signer: &dyn Signer,
+    presented: &str,
+    revoked_kids: &[String],
+) -> Result<TenantKey, KeyError> {
+    verify_over(
+        signer,
+        presented,
+        revoked_kids,
+        PUBLISHABLE_KEY_PURPOSE,
+        PUBLISHABLE_PREFIX,
+    )
+}
+
+/// The one verification: purpose and prefix are the whole difference
+/// between the two key classes, and the prefix gate below is what keeps
+/// a credential from crossing between them.
+fn verify_over(
+    signer: &dyn Signer,
+    presented: &str,
+    revoked_kids: &[String],
+    purpose: &str,
+    prefix: &str,
+) -> Result<TenantKey, KeyError> {
+    let body = presented.strip_prefix(prefix).ok_or(KeyError::Malformed)?;
     let (kid_segment, token) = body.split_once('.').ok_or(KeyError::Malformed)?;
     // Kid names can never contain a `.` — that is what makes the split
     // above unambiguous. Enforce the charset before anything else.
@@ -229,10 +350,11 @@ pub fn verify(
         return Err(KeyError::Malformed);
     }
     // Authority is the signer's verdict alone: MAC, purpose, expiry and
-    // the venture/environment binding were stamped on the token there.
-    let payload = signer
-        .verify(token, API_KEY_PURPOSE)
-        .ok_or(KeyError::Invalid)?;
+    // the venture/environment binding were stamped on the token there. A
+    // credential minted for the *other* class carries the other purpose
+    // and is refused here — the class line, enforced on the MAC'd
+    // payload, not the editable prefix.
+    let payload = signer.verify(token, purpose).ok_or(KeyError::Invalid)?;
     let kid = kid_name(&payload.kid).ok_or(KeyError::UnknownKid)?;
     // The payload must name the kid the prefix claimed.
     if kid != kid_segment {
@@ -322,7 +444,10 @@ fn is_kid_name(name: &str) -> bool {
 mod tests {
     use cratefield_core::{HmacSigner, KeyRing, Kid, MAX_KID_NAME, Payload, Signer};
 
-    use crate::{KEY_PREFIX, KeyError, bearer, kid_name, mint, parse_revoked_kids, verify};
+    use crate::{
+        KEY_PREFIX, KeyError, PUBLISHABLE_PREFIX, bearer, kid_name, mint, mint_publishable,
+        parse_revoked_kids, verify, verify_publishable,
+    };
 
     /// Exactly [`cratefield_core::MIN_SECRET_BYTES`] long.
     const SECRET: &str = "0123456789abcdef0123456789abcdef";
@@ -588,5 +713,109 @@ mod tests {
         assert_eq!(parse_revoked_kids("cur"), vec!["cur"]);
         assert!(parse_revoked_kids("").is_empty());
         assert!(parse_revoked_kids(" , , ").is_empty());
+    }
+
+    // ----- Publishable keys: the web-widget class -------------------------
+
+    /// `sg_pub_<kid>.<payload>.<mac>`, split the way [`segments`] is.
+    fn pub_segments(key: &str) -> (&str, &str, &str) {
+        let body = key
+            .strip_prefix(PUBLISHABLE_PREFIX)
+            .expect("publishable prefix present");
+        let parts: Vec<&str> = body.split('.').collect();
+        assert_eq!(parts.len(), 3, "sg_pub_<kid>.<payload>.<mac>");
+        (parts[0], parts[1], parts[2])
+    }
+
+    #[test]
+    fn a_publishable_key_round_trips_to_its_tenant() {
+        let signer = signer();
+        let minted = mint_publishable(&signer, "tenant-alpha").expect("mint");
+        assert!(minted.key.starts_with(PUBLISHABLE_PREFIX), "{}", minted.key);
+        assert_eq!(minted.tenant_id, "tenant-alpha");
+
+        let key = verify_publishable(&signer, &minted.key, &[]).expect("verify");
+        assert_eq!(key.tenant_id, "tenant-alpha");
+        assert_eq!(key.kid, minted.kid);
+    }
+
+    #[test]
+    fn the_two_key_classes_never_cross() {
+        let signer = signer();
+        let secret = mint(&signer, "t1").expect("mint");
+        let public = mint_publishable(&signer, "t1").expect("mint");
+        assert!(secret.key.starts_with(KEY_PREFIX));
+        assert!(public.key.starts_with(PUBLISHABLE_PREFIX));
+
+        // A page-sourced key at the bearer door is refused, not downgraded
+        // — and it is refused on the class (the MAC'd purpose), so no
+        // prefix edit can smuggle it through either door.
+        assert_eq!(verify(&signer, &public.key, &[]), Err(KeyError::Invalid));
+        assert_eq!(
+            verify_publishable(&signer, &secret.key, &[]),
+            Err(KeyError::Malformed),
+            "no sg_pub_ prefix: shape, before the signer is even asked"
+        );
+
+        // Relabelling a publishable key as `sg_` keeps the class line: the
+        // purpose in the MAC still names the publishable class.
+        let (kid, payload, mac) = pub_segments(&public.key);
+        let relabelled = format!("{KEY_PREFIX}{kid}.{payload}.{mac}");
+        assert_eq!(verify(&signer, &relabelled, &[]), Err(KeyError::Invalid));
+        assert_eq!(
+            verify_publishable(&signer, &relabelled, &[]),
+            Err(KeyError::Malformed)
+        );
+    }
+
+    #[test]
+    fn publishable_key_tampering_and_revocation_follow_the_secret_rules() {
+        let signer = signer();
+        let minted = mint_publishable(&signer, "t1").expect("mint");
+        let (kid, payload, mac) = pub_segments(&minted.key);
+
+        let relabelled = format!("{PUBLISHABLE_PREFIX}zzz.{payload}.{mac}");
+        assert_eq!(
+            verify_publishable(&signer, &relabelled, &[]),
+            Err(KeyError::Invalid)
+        );
+        let payload_tampered = format!("{PUBLISHABLE_PREFIX}{kid}.{}.{mac}", flip(payload));
+        assert_eq!(
+            verify_publishable(&signer, &payload_tampered, &[]),
+            Err(KeyError::Invalid)
+        );
+
+        // The shared revocation list: one entry revokes both classes.
+        assert_eq!(
+            verify_publishable(&signer, &minted.key, std::slice::from_ref(&minted.kid)),
+            Err(KeyError::Revoked)
+        );
+        assert!(verify_publishable(&signer, &minted.key, &[]).is_ok());
+    }
+
+    #[test]
+    fn a_token_with_another_purpose_is_not_a_publishable_key() {
+        let signer = signer();
+        // The secret class again: right prefix family, wrong purpose.
+        let secret = mint(&signer, "t1").expect("mint");
+        let (_, payload, mac) = segments(&secret.key);
+        let disguised = format!("{PUBLISHABLE_PREFIX}cur.{payload}.{mac}");
+        assert_eq!(
+            verify_publishable(&signer, &disguised, &[]),
+            Err(KeyError::Invalid)
+        );
+
+        // And a plain foreign-purpose token under the publishable prefix.
+        let foreign = signer.sign(&Payload {
+            purpose: "support.thread.read".to_owned(),
+            subject: "t1".to_owned(),
+            exp: None,
+            kid: Kid::Cur,
+        });
+        let disguised = format!("{PUBLISHABLE_PREFIX}cur.{foreign}");
+        assert_eq!(
+            verify_publishable(&signer, &disguised, &[]),
+            Err(KeyError::Invalid)
+        );
     }
 }

@@ -2,7 +2,9 @@
 
 The SupportGenius support module: a Cratefield `Module` named `support`,
 mounted at `/v1/support`. Tenants, sources, BM25 retrieval, and
-conversations answered with citations.
+conversations answered with citations. Documents larger than the inline
+ceiling arrive through the chunked-upload routes (issue #30), which turn
+a manual or PDF into a searchable source.
 
 ## Routes
 
@@ -22,6 +24,11 @@ the optional `RateLimiter` port.
 | `GET /sources/{source_id}` | API key | one source, in the list's item shape |
 | `PUT /sources/{source_id}` | API key | replace a source's content and metadata, body shaped like `POST /sources` |
 | `DELETE /sources/{source_id}` | API key | remove a source and its whole index; `204`, no body |
+| `POST /uploads` | API key | `{"filename", "content_type", "bytes"}` → `201 {id, part_bytes, …}` |
+| `PUT /uploads/{id}/parts/{n}` | API key | raw part bytes (1..=48 KiB), contiguous from 0 |
+| `POST /uploads/{id}/complete` | API key | checks the parts add up, enqueues the `extract` job → `202` |
+| `GET /uploads/{id}` | API key | the upload's status, `received_bytes`, and once extracted its `source_id` |
+| `POST /connectors` | API key | `{"kind": "sitemap" \| "url_prefix", "url"}` or `{"kind": "github", "owner", "repo", "path_glob"?, "ref"?, "credential_ref"?}`, with optional `max_pages`/`max_bytes`/`max_depth` → `201`; the crawl runs asynchronously and re-syncs on cron |
 | `GET /search?q=…&limit=…` | API key | BM25 over the tenant's own index |
 | `POST /messages` | API key | `{"message", "conversation_id"?}` → one support turn |
 | `GET /keys` | API key | the tenant's own API keys — `{kid, label, created_at}` each, oldest first |
@@ -63,6 +70,81 @@ key exactly once; `GET /keys` never shows key material, because none is
 stored. A foreign or unknown kid is `404`; the tenant's last remaining
 key is `409` — mint its replacement first. `SUPPORT_REVOKED_KIDS` stays
 the emergency override, revoking a signing generation everywhere at once.
+
+### Chunked uploads
+
+A manual or policy PDF is bigger than any `/v1/*` request body, so it
+arrives in parts. Open an upload with the filename, content type and
+declared size; `PUT` the bytes one part at a time into the `Blob` port
+(R2 on Workers, a directory when self-hosted); then complete. The parts
+are checked for contiguity against the declaration, the upload flips to
+`complete`, and the `extract` job is enqueued in the same batch — the
+job reads the parts back, turns the document into text (`text/plain`,
+`text/markdown`, `text/html`, `application/pdf`), and indexes it through
+the same path as `POST /sources`. `GET /uploads/{id}` reports
+`extracted` with the `source_id` once that has run, or `failed` with the
+reason a document could not be read.
+
+The source an upload produces is an ordinary text source: it lists under
+`GET /sources` with `origin` `text`, no `external_id`, the upload's
+filename as its title and the extracted text's size as `bytes`, and it is
+replaced or deleted through `PUT`/`DELETE /sources/{id}` like any other.
+`GET /uploads/{id}` keeps reporting the `source_id` it produced even after
+that source is deleted — the upload row is bookkeeping, not a live link.
+
+Limits, and why:
+
+| Limit | Value | Why |
+| --- | --- | --- |
+| Part size | ≤ 48 KiB (`part_bytes` in the open response) | the same per-request ceiling the inline form has; a part must fit the 64 KiB body cap |
+| Document size | ≤ 4 MiB | far past any manual that belongs in a support index; 86 parts maximum |
+| Per-tenant upload storage | 50 MiB default, `SUPPORT_UPLOAD_QUOTA_BYTES` | counts `open` and `complete` uploads only — extraction returns the bytes |
+| Extracted text | ≤ 2 MiB | the index is sized for manuals; a document whose text expands past this fails the upload |
+| Abandoned-upload lifetime | 24 h, then cron deletes it | an `open` upload nobody completed is storage nobody is coming back for |
+
+The `extract` job runs inline as soon as the `202` is on its way (the
+`Defer` port) and, durably, from cron either way — a deployment that
+never drains it inline still gets the document indexed at the next tick.
+A run that fails on infrastructure (not on the document) is retried with
+the outbox's own attempt counter, five tries, and then the upload is
+failed with the reason. An upload that was never completed is
+garbage-collected by the same cron sweep. All of this needs the `Blob`
+port; without one the upload routes answer `503 not-ready`, and every
+other route is unaffected.
+
+### Connectors
+
+A connector keeps part of the index synced from a sitemap (or sitemap
+index), a URL prefix, or a GitHub repository's files. Creating one stores
+the crawl root and its seed fetch in one batch; the fetches are outbox
+jobs, one URL each, run inline where the `Defer` port allows and on every
+cron tick regardless. A re-sync re-fetches every URL the connector knows
+with its stored `ETag`/`Last-Modified`: a `304` writes nothing, a changed
+body replaces the source in place, and a `404`/`410` deletes it.
+
+Every page a connector indexes is an ordinary source: it lists under
+`GET /sources` with `origin` `url`, its `external_id` is the fetched URL
+(`github:{owner}/{repo}:{path}` for a repository file), `bytes` is the
+indexed text's size, and `updated_at` moves on every re-index while the
+first index date is kept. A source the tenant indexed by hand under the
+same `external_id` is the same document, so the connector adopts and
+replaces it. A connector source deleted through `DELETE /sources/{id}`
+stays deleted until the page next changes.
+
+The fetch policy is an allowlist: a sitemap connector fetches only its own
+scheme and host, a URL-prefix connector only URLs under its prefix, and a
+GitHub connector only `api.github.com` under its owner and repo. GitHub
+fetches authenticate with the Config key named by `credential_ref` — the
+key's *name* is stored, never the token. Caps (clamped, not refused):
+
+| Cap | Default | Maximum |
+| --- | --- | --- |
+| `max_pages` (page rows, navigation rows included) | 200 | 2000 |
+| `max_bytes` (per response) | 1 MiB | 4 MiB |
+| `max_depth` (link hops from the seed) | 3 | 5 |
+
+Without the `HttpClient` port `POST /connectors` answers `503 not-ready`
+and the cron re-sync does nothing.
 
 ### `POST /messages`
 
@@ -128,6 +210,20 @@ through a builder. It is the `TextModel` port of `cratefield-core`,
 pinned by the workspace's single `cratefield-*` git rev (see the root
 `Cargo.toml`).
 
+**Handing off files a ticket, in the same batch.** `Support` carries an
+optional `HandoffSink` (`Support::new().with_handoff(..)`). On an
+escalating turn the sink's statements — the escalation outbox row, the
+ticket row, the intake audit event — are appended to the turn's own
+`batch_atomic`, and only after it commits is the sink kicked to run the
+escalation pipeline immediately instead of waiting for cron. The seam is a
+trait, not a dependency: support never names `module-escalation`, and the
+*composition*, which depends on both, adapts escalation to the port. With
+`Support::new()` and no sink, a handoff marks `needs_escalation` exactly as
+before and nothing files a ticket. The port declares `Tracker` and
+`Mailer` optional too, because a kicked escalation run reads them and
+support's `ModuleContext` is a filtered view; a deployment with no sink
+never touches them.
+
 ## Retrieval, and its constraints on purpose
 
 - `chunk`: `tokenize` (lowercased alphanumeric terms, the one tokenizer
@@ -140,8 +236,10 @@ pinned by the workspace's single `cratefield-*` git rev (see the root
   (ADR 0004, linted by `fz doctor`), and Cloudflare D1 has no vector
   type. Retrieval is lexical only: no embeddings, no semantic matching,
   no reranking.
-- **≤ 48 KiB of text per ingest.** The `/v1/*` body cap leaves no room
-  for more, and URL ingest truncates to the same ceiling.
+- **≤ 48 KiB of text per ingest; 4 MiB per uploaded document.** The
+  `/v1/*` body cap leaves no room for more inline, and URL ingest
+  truncates to the same ceiling. A larger manual or PDF arrives through
+  the upload routes above, in parts.
 - **Unspaced scripts search by bigram.** `tokenize` still splits
   space-delimited text on non-alphanumeric characters, but runs of
   Chinese, Japanese (kanji, hiragana, katakana), Korean and Thai are
@@ -168,11 +266,28 @@ pinned by the workspace's single `cratefield-*` git rev (see the root
   over English documents) is out of scope until hybrid retrieval exists:
   it needs embeddings, i.e. an upstream `VectorIndex` port, and BM25
   over translated terms is not a substitute.
-- **Ranking trusts the caller.** `bm25::rank` computes `df` from the
-  postings it is given, so a `LIMIT` on the SQL that fetches them silently
-  skews every idf. The contract is documented on `rank`.
+- **Ranking is exact on a truncated fetch.** Corpus statistics (N, average
+  length, each term's df) live in the `sg_tenant_stats` and `sg_terms`
+  tables, written by the same batch as the rows they describe on every
+  write path — inline ingest, upload extraction, connector sync (first
+  index, diff-based replace, delete on 404/410), manual replace and
+  delete, and the tokenizer re-index sweep — so `bm25::rank` never
+  derives them from the rows it is handed. That is what makes the
+  per-term fetch safe to bound: `df` and `idf` stay exact even though
+  only each term's top 128 rows by tf are read. The query path costs a
+  fixed budget of rows — one stats row, at most 32 df rows, at most 32
+  bounded postings fetches, the result's chunk rows — regardless of how
+  large the tenant's corpus grows, and a term in more than half of a
+  tenant's chunks (once it has at least 8) is dropped as a stopword
+  before its postings are read. The contract is documented on `rank`
+  and `postings_for`.
 
 ## Not built yet
 
-Composing module-escalation so that a handoff also files an escalation in
-the same batch.
+A real `TextModel`/`Tracker` adapter in either link target: the
+composition ships `UnconfiguredTextModel`/`UnconfiguredTracker` (they
+answer `NotConfigured`, so `POST /messages` degrades to `503
+text-model-not-configured`), and an operator wires real ones. The
+escalation module's own migrations also still need collecting by the
+venture's `fz migrations collect` before the ticket tables exist on a
+deployment.

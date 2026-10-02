@@ -2,28 +2,24 @@
 //! model, checked by an independent one, filed by a router, followed up
 //! until it closes (issue #4, `/workspace/README.md`).
 //!
-//! The crate is three layers:
-//!
-//! - [`model`] is the stage/status vocabulary and the two JSON schemas;
-//!   [`store`] is the sea-query data access; [`intake`] is the
-//!   cross-module handoff that turns a conversation into statements the
-//!   caller commits, which enqueue the first outbox row.
-//! - [`Pipeline`] is the durable stage runner: it claims due outbox rows
-//!   and drives draft → judge → file → notify, one port call and one
-//!   all-or-nothing commit per stage, with an
-//!   [`Inbox`](cratefield_core::Inbox) claim per `ticket:stage` so
-//!   draining twice files once, and a [`RetryPolicy`] that bounds how
-//!   long a transient failure retries before dead-lettering.
-//! - [`Escalation`] wires it into the [`Module`] contract: migrations,
-//!   tables, the personal-data declarations, config validation and the
-//!   scheduled drain.
-//!
-//! There is deliberately **no HTTP surface**: see [`Escalation::router`].
+//! [`model`]/[`store`]/[`intake`] are the vocabulary and data access;
+//! [`Pipeline`] is the durable stage runner (one port call and one
+//! all-or-nothing commit per stage, an inbox claim per `ticket:stage`, a
+//! bounded [`RetryPolicy`]); [`Escalation`] wires it into the [`Module`]
+//! contract. The one HTTP surface is the `destinations` module (issue
+//! #23): a tenant, or an operator acting for one, names the tracker its
+//! escalations file into and the credential to file with, validated once
+//! and stored envelope-encrypted through `cratefield-secrets` under a KMS
+//! resolved from config (`secrets::kms_from_config`).
 
 #![forbid(unsafe_code)]
 
+mod destinations;
 mod pipeline;
+mod secrets;
+mod tenants;
 
+pub mod connectors;
 pub mod error;
 pub mod intake;
 pub mod model;
@@ -32,6 +28,8 @@ pub mod store;
 pub use error::Error;
 pub use intake::{Handoff, Intake};
 pub use pipeline::{Pipeline, RetryPolicy};
+pub use secrets::local_kms_refusal;
+pub use tenants::TenantDirectory;
 
 /// Test doubles the published fakes do not cover: a seeded in-memory
 /// [`cratefield_core::Config`] and a clock a test can move forward. The
@@ -53,15 +51,42 @@ pub const MIGRATION_ESCALATION: SqlMigration = SqlMigration::new(
     include_str!("../migrations/sqlite/0001_escalation.sql"),
 );
 
+/// Duplicate detection (issue #27): the `match_count` column and the
+/// `sg_ticket_links` table the judge stage's duplicate branch writes.
+pub const MIGRATION_DUPLICATES: SqlMigration = SqlMigration::new(
+    "0002",
+    "duplicates",
+    include_str!("../migrations/sqlite/0002_duplicates.sql"),
+);
+
+/// One `cratefield-secrets` migration under this module's own id,
+/// preserving its `transactional` flag. The bytes are the source crate's,
+/// never a copy, so the embedded schema cannot drift from the one the
+/// store is written against (the `control-plane-dashboard` idiom).
+const fn sub_migration(
+    set: &'static [SqlMigration],
+    index: usize,
+    id: &'static str,
+    name: &'static str,
+) -> SqlMigration {
+    let source = &set[index];
+    if source.transactional {
+        SqlMigration::new(id, name, source.sql)
+    } else {
+        SqlMigration::new(id, name, source.sql).non_transactional()
+    }
+}
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use cratefield_core::{
-    AnyError, BoxFuture, Config, ConfigError, DataKind, Disposition, Migrations, Module,
+    AnyError, BoxFuture, Config, ConfigError, DataKind, Defer, Disposition, Migrations, Module,
     ModuleConfig, ModuleContext, PersonalDataSet, Port, SqlMigration, SystemClock, UlidIdGen,
 };
 
 use crate::intake::OUTBOX_TABLE;
+use cratefield_module_webhooks::Webhooks;
 
 /// The SupportGenius escalation module (issue #4).
 ///
@@ -90,8 +115,23 @@ use crate::intake::OUTBOX_TABLE;
 ///     ]
 /// );
 /// ```
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Escalation;
+///
+/// The destination routes additionally need a [`TenantDirectory`]
+/// ([`Escalation::with_tenant_directory`]) to refuse suspended tenants;
+/// without one they refuse every tenant (fail closed).
+#[derive(Clone, Default)]
+pub struct Escalation {
+    /// Who may use the destination routes; `None` refuses everyone.
+    tenants: Option<Arc<dyn TenantDirectory>>,
+}
+
+impl std::fmt::Debug for Escalation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Escalation")
+            .field("tenant_directory", &self.tenants.is_some())
+            .finish()
+    }
+}
 
 impl Escalation {
     /// The module's name as the harness mounts it (`/v1/escalation`).
@@ -103,7 +143,16 @@ impl Escalation {
     /// number of harnesses.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self { tenants: None }
+    }
+
+    /// The directory the destination routes check tenant status against
+    /// (see [`TenantDirectory`]): a suspended or closed tenant is refused
+    /// there the way the rest of the API refuses it.
+    #[must_use]
+    pub fn with_tenant_directory(mut self, tenants: Arc<dyn TenantDirectory>) -> Self {
+        self.tenants = Some(tenants);
+        self
     }
 
     /// The conversation → first-outbox-row handoff.
@@ -140,20 +189,35 @@ impl Module for Escalation {
     /// `Mailer` delivers the notify stage's message; `Clock` and `IdGen`
     /// stamp the outbox rows (core's `SystemClock`/`UlidIdGen` otherwise);
     /// `Defer` lets a finished stage run the one it just enqueued without
-    /// waiting for the next cron tick.
+    /// waiting for the next cron tick; `Signer` verifies the tenant API
+    /// key the destination routes are guarded by, and is optional because
+    /// a composition that never exposes them (a pure cron drainer) needs
+    /// no signer.
     fn optional(&self) -> &'static [Port] {
-        &[Port::Mailer, Port::Clock, Port::IdGen, Port::Defer]
+        &[
+            Port::Mailer,
+            Port::Clock,
+            Port::IdGen,
+            Port::Defer,
+            Port::Signer,
+        ]
     }
 
     /// Every table the migration creates. Duplicates across modules are a
-    /// build error, so this list is the ownership claim.
+    /// build error, so this list is the ownership claim — the five `sg_*`
+    /// tables plus the embedded `cratefield-secrets` schema (the module
+    /// applies it to store tenant credentials; see [`Escalation::migrations`]).
     fn tables(&self) -> &'static [&'static str] {
         &[
             "sg_tickets",
             "sg_ticket_events",
+            "sg_ticket_links",
             "sg_destinations",
             "sg_escalation_outbox",
             "sg_escalation_inbox",
+            "harness_secret_keys",
+            "harness_secrets",
+            "harness_secret_audit",
         ]
     }
 
@@ -161,21 +225,15 @@ impl Module for Escalation {
     ///
     /// `sg_tickets` and `sg_ticket_events` hold the conversation itself —
     /// the transcript and the audit trail that quotes it — so both are
-    /// `Erase`: a person's escalation should be able to disappear with
-    /// them. (Erasure that only removed the ticket would leave a trail of
-    /// events quoting them, so the events go too; they are matched
-    /// through the same ticket id, which is their `ticket_id` column's
-    /// value.)
-    ///
-    /// `sg_escalation_outbox` carries only ids (a stage payload is two
-    /// ids, never the transcript), and its `subject` column *is* the
-    /// ticket id, so a subject erasure reaches it directly.
-    ///
-    /// The other two declare honestly rather than stay silent:
-    /// `sg_destinations` is tenant configuration that names nobody; the
-    /// inbox's identifying value is inside the composite
-    /// `<ticket_id>:<stage>` key, which no `column = ?` predicate can
-    /// reach — core's `unreachable` shape exists for exactly that.
+    /// `Erase`, matched through the ticket id. `sg_escalation_outbox`
+    /// carries only ids and its `subject` column *is* the ticket id, so a
+    /// subject erasure reaches it directly. `sg_destinations` is tenant
+    /// configuration that names nobody, and the inbox's identifying value
+    /// sits inside a composite `<ticket_id>:<stage>` key no `column = ?`
+    /// predicate can reach — core's `unreachable` shape exists for that.
+    /// The embedded secrets tables declare `none` for the same reason the
+    /// harness's own dashboard does: they are keyed to a store and a name,
+    /// never to a person.
     fn personal_data(&self) -> &'static [PersonalDataSet] {
         const SETS: &[PersonalDataSet] = &[
             PersonalDataSet {
@@ -211,11 +269,26 @@ impl Module for Escalation {
                 redacted: &[],
                 subject_via: None,
             },
+            // Links a later escalation to the ticket it duplicates. The
+            // identifying value is the *source* ticket's id (the one
+            // being erased), so erasing that escalation removes its link;
+            // the existing `ticket_id` is a tracker reference, not this
+            // person's data.
+            PersonalDataSet {
+                table: "sg_ticket_links",
+                subject: "source_ticket_id",
+                kind: DataKind::Identifier,
+                disposition: Disposition::Erase,
+                description: "A link from your escalation to an existing filed ticket it \
+                              duplicates: the two ids and the conversation id.",
+                redacted: &[],
+                subject_via: None,
+            },
             PersonalDataSet::none(
                 "sg_destinations",
                 "Per-tenant tracker configuration: which tracker a tenant files into and a \
-                 *reference* to the credential (a config key name, never the secret), keyed \
-                 to the tenant, not to any person.",
+                 *reference* to the credential (a `secret:` name in the encrypted store, never \
+                 the secret itself), keyed to the tenant, not to any person.",
             ),
             // Not `none`: the key embeds the ticket id, which is the
             // subject value — but as `<ticket_id>:<stage>`, so a plain
@@ -233,18 +306,103 @@ impl Module for Escalation {
                  no equality predicate can match it. Nothing else about you is in the row, \
                  and it stops mattering once the step has run.",
             ),
+            // The embedded secrets schema (issue #23), declared rather
+            // than left silent — the same call the harness's own dashboard
+            // makes for these tables.
+            PersonalDataSet::none(
+                "harness_secrets",
+                "A tenant's tracker credential, envelope-encrypted (name, version, \
+                 ciphertext, nonce, timestamp) — never in the clear, keyed to a store and a \
+                 name, not to a person.",
+            ),
+            PersonalDataSet::none(
+                "harness_secret_keys",
+                "The wrapped data keys that protect each store's secrets, with their ids, \
+                 states and the KMS reference that wrapped them. No key material in the \
+                 clear; nothing names a person.",
+            ),
+            PersonalDataSet::none(
+                "harness_secret_audit",
+                "The append-only audit chain of accesses to a store's secrets — action, \
+                 store, name, version, actor (a tenant id or `admin`). It holds no secret \
+                 value by construction.",
+            ),
         ];
         SETS
     }
 
+    /// The module's own `sg_*` migrations, then the `cratefield-secrets`
+    /// schema embedded under this module's ids (issue #23), taken from the
+    /// crate's own `SQLITE_MIGRATIONS`/`POSTGRES_MIGRATIONS` and re-id-ed
+    /// (the `control-plane-dashboard` idiom) so the embedded copy cannot
+    /// drift. The module files are portable SQL, so the postgres set carries
+    /// the same bytes for ids `0001`-`0002`, but the secrets schema is not (BLOB vs
+    /// BYTEA, per-engine triggers), so each set embeds its own dialect's.
+    /// The postgres set must be complete: `select_set` applies it wholesale.
     fn migrations(&self) -> Migrations {
-        const MIGRATIONS: [SqlMigration; 1] = [MIGRATION_ESCALATION];
+        const SQLITE: [SqlMigration; 6] = [
+            MIGRATION_ESCALATION,
+            MIGRATION_DUPLICATES,
+            sub_migration(
+                &cratefield_secrets::SQLITE_MIGRATIONS,
+                0,
+                "0003",
+                "secrets-init",
+            ),
+            sub_migration(
+                &cratefield_secrets::SQLITE_MIGRATIONS,
+                1,
+                "0004",
+                "secrets-audit",
+            ),
+            sub_migration(
+                &cratefield_secrets::SQLITE_MIGRATIONS,
+                2,
+                "0005",
+                "secrets-audit-store",
+            ),
+            sub_migration(
+                &cratefield_secrets::SQLITE_MIGRATIONS,
+                3,
+                "0006",
+                "secrets-store-attribution",
+            ),
+        ];
         // The array is the apply order; this refuses a gap, a duplicate
         // or an entry out of order at build time.
-        const _: () = cratefield_core::assert_migration_set(&MIGRATIONS);
+        const _: () = cratefield_core::assert_migration_set(&SQLITE);
+        const POSTGRES: [SqlMigration; 6] = [
+            MIGRATION_ESCALATION,
+            MIGRATION_DUPLICATES,
+            sub_migration(
+                &cratefield_secrets::POSTGRES_MIGRATIONS,
+                0,
+                "0003",
+                "secrets-init",
+            ),
+            sub_migration(
+                &cratefield_secrets::POSTGRES_MIGRATIONS,
+                1,
+                "0004",
+                "secrets-audit",
+            ),
+            sub_migration(
+                &cratefield_secrets::POSTGRES_MIGRATIONS,
+                2,
+                "0005",
+                "secrets-audit-store",
+            ),
+            sub_migration(
+                &cratefield_secrets::POSTGRES_MIGRATIONS,
+                3,
+                "0006",
+                "secrets-store-attribution",
+            ),
+        ];
+        const _: () = cratefield_core::assert_migration_set(&POSTGRES);
         Migrations {
-            sqlite: &MIGRATIONS,
-            postgres: &[],
+            sqlite: &SQLITE,
+            postgres: &POSTGRES,
         }
     }
 
@@ -277,21 +435,26 @@ impl Module for Escalation {
             }
         }
 
+        // The development file KMS outside an explicit ENV=development:
+        // the routes already fail closed (no KMS, `503`); this makes the
+        // misconfiguration loud wherever config is validated, and the
+        // native binary refuses to boot on it.
+        if let Some(refusal) = secrets::local_kms_refusal(cfg) {
+            errors.push(format!("escalation: {refusal}"));
+        }
+
         errors.into_result()
     }
 
-    /// **Empty, on purpose.** Issue #4's escalation is machinery with no
-    /// public surface: the conversation arrives through the intake
-    /// handoff, and every customer-facing read of a ticket ("your ticket
-    /// was filed, here is the link") belongs to `module-support`
-    /// (issue #2) — the module that owns tenancy and API-key auth, which
-    /// does not exist yet. A ticket-read route here would be mounted
-    /// unauthenticated and un-tenant-scoped, and the first thing it leaks
-    /// is other tenants' support transcripts, verbatim. Returning no
-    /// routes is the honest v0; the routes arrive with the auth module
-    /// they need.
-    fn router(&self, _ctx: ModuleContext) -> axum::Router {
-        axum::Router::new()
+    /// The destination routes (issue #23). Auth runs before the body is
+    /// parsed: the tenant mount checks the `sg_…` API key, the admin mount
+    /// the harness admin token, and only then does a handler read its
+    /// payload — a `Json<T>` extractor would answer a malformed body to an
+    /// unauthenticated caller. The KMS the credential store is built over
+    /// is resolved from config once, here.
+    fn router(&self, ctx: ModuleContext) -> axum::Router {
+        let kms = secrets::kms_from_config(&*ctx.config);
+        destinations::router(Arc::new(ctx), kms, self.tenants.clone())
     }
 
     /// The drain: build a [`Pipeline`] from whatever ports the runtime
@@ -299,6 +462,15 @@ impl Module for Escalation {
     /// [`Pipeline::MAX_SWEEPS`] is spent — bounded, so a row that keeps
     /// re-enqueueing work cannot spin one cron tick forever; the rest
     /// waits for the next tick, which is what cron is for.
+    ///
+    /// **Every** cron drains, deliberately: the venture schedules this on a
+    /// five-minute tick (the recovery path for whatever a handoff's
+    /// best-effort [`kick`](Escalation::kick) left staged) and a daily one
+    /// (the backstop), but the drain is idempotent — each stage is claimed
+    /// through an [`Inbox`](cratefield_core::Inbox) — so draining on a
+    /// trigger the module did not specifically anticipate is harmless,
+    /// while a module that drained on only one of its crons would silently
+    /// stall the moment the schedule changed. `cron` is therefore unused.
     ///
     /// A stage that just finished re-drains immediately through the
     /// `Defer` port (see [`Pipeline`]), so this sweep is the backstop that
@@ -310,52 +482,14 @@ impl Module for Escalation {
         _cron: &'a str,
     ) -> BoxFuture<'a, Result<(), AnyError>> {
         Box::pin(async move {
-            let Some(db) = ctx.ports.db.clone() else {
-                // No database, no outbox, nothing to drain. The module
-                // declares `Port::Db` as required, so a composed venture
-                // always resolves it; a test harness may not.
+            let Some(pipeline) = Self::pipeline(ctx, ctx.ports.defer.clone()) else {
+                // Whatever is missing, there is nothing to drain: no
+                // database is no outbox, and the two ports `build()`
+                // refuses to compose without are ones a hand-rolled
+                // context skipped. Draining nothing beats panicking a cron
+                // tick.
                 return Ok(());
             };
-            // Same for the two ports build() also refuses to compose
-            // without. `None` here means a hand-rolled context skipped
-            // them; draining nothing beats panicking a cron tick.
-            let (Some(model), Some(tracker)) =
-                (ctx.ports.text_model.clone(), ctx.ports.tracker.clone())
-            else {
-                return Ok(());
-            };
-            let clock = ctx
-                .ports
-                .clock
-                .clone()
-                .unwrap_or_else(|| Arc::new(SystemClock));
-            let idgen = ctx
-                .ports
-                .id_gen
-                .clone()
-                .unwrap_or_else(|| Arc::new(UlidIdGen));
-            let cfg = ModuleConfig::new(Self::NAME, &*ctx.ports.config);
-            let policy = RetryPolicy::new()
-                .base(Duration::from_secs(u64::from(
-                    cfg.get_u32("RETRY_BASE_SECS", RetryPolicy::DEFAULT_BASE_SECS),
-                )))
-                .cap(Duration::from_secs(u64::from(
-                    cfg.get_u32("RETRY_CAP_SECS", RetryPolicy::DEFAULT_CAP_SECS),
-                )))
-                .max_attempts(cfg.get_u32("RETRY_MAX_ATTEMPTS", RetryPolicy::DEFAULT_MAX_ATTEMPTS));
-
-            let pipeline = Pipeline::new(
-                db,
-                model,
-                tracker,
-                ctx.ports.mailer.clone(),
-                ctx.ports.config.clone(),
-                clock,
-                idgen,
-                ctx.ports.defer.clone(),
-            )
-            .with_retry_policy(policy);
-
             for _ in 0..Pipeline::MAX_SWEEPS {
                 let processed = pipeline
                     .drain(Pipeline::SWEEP_LIMIT)
@@ -367,6 +501,96 @@ impl Module for Escalation {
             }
             Ok(())
         })
+    }
+}
+
+impl Escalation {
+    /// Runs the escalation pipeline now, on the given [`Defer`], instead of
+    /// waiting for the next scheduled drain.
+    ///
+    /// This is the second half of a handoff: `module-support` commits the
+    /// statements [`Escalation::intake`] built in the same batch as the
+    /// turn (see [`Intake::enqueue`]), then calls this so the staged
+    /// outbox row is driven draft → judge → file → notify immediately.
+    /// A failure here is only a delay — the row is already durable and
+    /// [`Module::scheduled`] is the backstop — so nothing is returned.
+    ///
+    /// `defer` is the caller's own port (the request's, when support calls
+    /// it), so the work rides the runtime's background execution rather
+    /// than the caller's response.
+    pub fn kick(ctx: &ModuleContext, defer: Arc<dyn Defer>) {
+        // The pipeline's finished stages re-drain through `defer` (see
+        // [`Pipeline::defer_next`]); `wake` is the same port for this first
+        // kick, so the staged run and everything it enqueues behind it all
+        // land on the caller's background execution.
+        let wake = Arc::clone(&defer);
+        let Some(pipeline) = Self::pipeline(ctx, Some(defer)) else {
+            // Missing ports mean the row cannot be driven now; the
+            // scheduled drain will find it if the composition ever gains
+            // them. Nothing to report and nothing to do.
+            return;
+        };
+        wake.wait_until(Box::pin(async move {
+            let _ = pipeline.drain(1).await;
+        }));
+    }
+
+    /// Builds the durable stage runner from whatever ports a context
+    /// resolved, with `defer` overriding the context's own for the
+    /// self-re-drain a finished stage hands back (see
+    /// [`Pipeline::defer_next`]). `None` means the context is missing a
+    /// port the pipeline cannot run without — the caller decides whether
+    /// that is an empty scheduled tick or a kick with nothing to drive.
+    ///
+    /// Shared by [`Module::scheduled`] and [`Escalation::kick`] so the two
+    /// entry points cannot drift: a change to how the pipeline is
+    /// configured lands in both.
+    fn pipeline(ctx: &ModuleContext, defer: Option<Arc<dyn Defer>>) -> Option<Pipeline> {
+        let db = ctx.ports.db.clone()?;
+        let model = ctx.ports.text_model.clone()?;
+        let tracker = ctx.ports.tracker.clone()?;
+        let clock = ctx
+            .ports
+            .clock
+            .clone()
+            .unwrap_or_else(|| Arc::new(SystemClock));
+        let idgen = ctx
+            .ports
+            .id_gen
+            .clone()
+            .unwrap_or_else(|| Arc::new(UlidIdGen));
+        let cfg = ModuleConfig::new(Self::NAME, &*ctx.ports.config);
+        let policy = RetryPolicy::new()
+            .base(Duration::from_secs(u64::from(
+                cfg.get_u32("RETRY_BASE_SECS", RetryPolicy::DEFAULT_BASE_SECS),
+            )))
+            .cap(Duration::from_secs(u64::from(
+                cfg.get_u32("RETRY_CAP_SECS", RetryPolicy::DEFAULT_CAP_SECS),
+            )))
+            .max_attempts(cfg.get_u32("RETRY_MAX_ATTEMPTS", RetryPolicy::DEFAULT_MAX_ATTEMPTS));
+
+        Some(
+            Pipeline::new(
+                db,
+                model,
+                tracker,
+                ctx.ports.mailer.clone(),
+                ctx.ports.config.clone(),
+                clock,
+                idgen,
+                defer,
+            )
+            .with_retry_policy(policy)
+            // Every stage that changes a ticket's life — filed,
+            // dead-lettered, parked for a human — also publishes the
+            // matching `escalation.*` event, in the stage's own atomic
+            // batch (see [`Pipeline`]). The publish is fail-safe: a
+            // venture that mounts this module without `Webhooks` has no
+            // webhook tables, and the fan-out is skipped rather than
+            // allowed to break every filing (see [`Pipeline::webhook_stmts`]).
+            // Shared by `scheduled` and `kick`, so both publish alike.
+            .with_webhooks(Webhooks::new()),
+        )
     }
 }
 
@@ -389,11 +613,23 @@ mod tests {
             &[Port::Db, Port::TextModel, Port::Tracker]
         );
         assert!(module.optional().contains(&Port::Mailer));
+        // `Signer` is optional: the destination routes need it, a pure
+        // cron drainer does not.
+        assert!(module.optional().contains(&Port::Signer));
         let tables = module.tables();
-        assert_eq!(tables.len(), 5);
-        for table in tables {
-            assert!(table.starts_with("sg_"), "{table} is not a sg_ table");
-        }
+        assert_eq!(tables.len(), 9);
+        let sg: Vec<&str> = tables
+            .iter()
+            .copied()
+            .filter(|table| table.starts_with("sg_"))
+            .collect();
+        assert_eq!(sg.len(), 6, "the module owns six sg_ tables");
+        let harness: Vec<&str> = tables
+            .iter()
+            .copied()
+            .filter(|table| table.starts_with("harness_secret"))
+            .collect();
+        assert_eq!(harness.len(), 3, "the embedded secrets schema is declared");
     }
 
     /// Every declared table is owned, and every owned table is declared —
@@ -414,12 +650,35 @@ mod tests {
     }
 
     #[test]
-    fn the_migration_set_is_exactly_the_one_migration() {
+    fn the_migration_set_is_the_module_files_then_the_embedded_secrets_schema() {
         let migrations = module().migrations();
-        assert_eq!(migrations.sqlite.len(), 1);
-        assert_eq!(migrations.sqlite[0].id, "0001");
-        assert!(migrations.postgres.is_empty());
+        assert_eq!(migrations.sqlite.len(), 6);
+        assert_eq!(
+            migrations
+                .sqlite
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            ["0001", "0002", "0003", "0004", "0005", "0006"]
+        );
         assert!(migrations.sqlite[0].sql.contains("CREATE TABLE"));
+        assert!(migrations.sqlite[1].sql.contains("sg_ticket_links"));
+        // The embedded bytes are the secrets crate's, re-id-ed: the first
+        // secret table appears in the module's third migration.
+        assert_eq!(
+            migrations.sqlite[2].sql,
+            cratefield_secrets::SQLITE_MIGRATIONS[0].sql
+        );
+        // The postgres set is complete (select_set applies it wholesale),
+        // carrying the same portable module files for 0001-0002 and the
+        // secrets crate's own postgres bytes thereafter.
+        assert_eq!(migrations.postgres.len(), 6);
+        assert_eq!(migrations.postgres[0].sql, migrations.sqlite[0].sql);
+        assert_eq!(migrations.postgres[1].sql, migrations.sqlite[1].sql);
+        assert_eq!(
+            migrations.postgres[2].sql,
+            cratefield_secrets::POSTGRES_MIGRATIONS[0].sql
+        );
     }
 
     #[test]

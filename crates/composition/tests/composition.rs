@@ -21,14 +21,18 @@ impl Runtime for FixedPorts {
 
 /// The ports a Redis-less native boot offers: `Db` from SQLite, `Mailer`
 /// from the Resend adapter, `Signer` from `HARNESS_SECRET`, plus `Clock`
-/// and `IdGen`, which the native runtime provides unconditionally.
+/// and `IdGen`, which the native runtime provides unconditionally, and
+/// `TextModel`/`Tracker`, which `main.rs` wires as the composition's
+/// `UnconfiguredTextModel`/`UnconfiguredTracker` (the escalation module
+/// requires both, so the boot must provide them).
 ///
 /// Those two used to be left out as shorthand — "never the missing ones,
 /// so omit them and keep this the worst case". That held only while no
-/// mounted module asked for them. `Support` does, so omitting them made
-/// this fail on the two ports a Redis-less boot always has, which is not
-/// the question being asked. The question is whether a module
-/// hard-requires `RateLimiter` or `KeyValue`; those stay out.
+/// mounted module asked for them. `Escalation` does (Support declares both
+/// optional), so omitting them made this fail on the two ports a
+/// Redis-less boot always has, which is not the question being asked. The
+/// question is whether a module hard-requires `RateLimiter` or `KeyValue`;
+/// those stay out.
 fn redis_less_native_ports() -> FixedPorts {
     FixedPorts(vec![
         Port::Db,
@@ -36,6 +40,8 @@ fn redis_less_native_ports() -> FixedPorts {
         Port::Signer,
         Port::Clock,
         Port::IdGen,
+        Port::TextModel,
+        Port::Tracker,
     ])
 }
 
