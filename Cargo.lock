@@ -3457,6 +3457,7 @@ name = "supportgenius"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "cratefield-adapter-anthropic",
  "cratefield-adapter-resend",
  "cratefield-adapter-turnstile",
  "cratefield-cli",
@@ -3468,6 +3469,7 @@ dependencies = [
  "http",
  "module-support",
  "pollster",
+ "serde_json",
  "supportgenius-composition",
  "worker",
 ]
@@ -3478,6 +3480,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "cratefield-adapter-anthropic",
  "cratefield-adapter-postgres",
  "cratefield-adapter-resend",
  "cratefield-adapter-sqlite",
@@ -3486,6 +3489,7 @@ dependencies = [
  "cratefield-runtime-native",
  "http",
  "pollster",
+ "serde_json",
  "supportgenius-composition",
  "tokio",
  "tracing",

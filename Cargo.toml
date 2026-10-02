@@ -46,8 +46,10 @@ cratefield-adapter-turnstile = { git = "https://github.com/Cratefield/harness", 
 cratefield-adapter-github-issues = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 cratefield-adapter-webhook-tracker = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 cratefield-module-webhooks = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
-# The `TextModel` port over the Anthropic Messages API: the `evals`
-# runner's real-model option (`--model anthropic[:ID]`), native-only.
+# The Anthropic `TextModel` adapter (issue #22): wasm-safe, because it
+# runs over the `HttpClient` port rather than reqwest — the same adapter
+# serves the Worker and the static binary, one instance per tier. It is
+# also the `evals` runner's real-model option (`--model anthropic[:ID]`).
 cratefield-adapter-anthropic = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 cratefield-testing = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }
 cratefield-cli = { git = "https://github.com/Cratefield/harness", rev = "b50c1d99b6f29e11a9fd5f116a8cd31275f735c6" }

@@ -40,6 +40,17 @@
 //! in wrangler.toml; the waitlist path keys on IP and normalized email and
 //! the support path on tenant id, all through the one shared port.
 //!
+//! **Text model.** When the `ANTHROPIC_API_KEY` secret is set, one
+//! `Anthropic` adapter per tier — fast and strong, ids from the
+//! `SUPPORTGENIUS_MODEL_FAST` / `SUPPORTGENIUS_MODEL_STRONG` vars — stands
+//! behind one `RoutingTextModel` on the `TextModel` port (issue #22);
+//! `POST /v1/support/messages` asks it for grounded answers. Without the
+//! key no port is mounted at all and the messages route answers
+//! `503 text-model-not-configured` while everything else works — the same
+//! keyless-adapter policy as the mailer, minus the adapter: an unmounted
+//! port is the honest report, and `/__ready` (decorated by this file's
+//! `fetch`) says `text_model: "missing"` until the secret lands.
+//!
 //! **Uploads.** The same shape, an R2 bucket: `BLOB` (issue #30) backs
 //! the `Blob` port the chunked-upload routes store parts in. The daily
 //! cron that already runs here is also what drains any leftover
@@ -51,14 +62,27 @@
 
 use std::sync::{Arc, OnceLock};
 
+use cratefield_adapter_anthropic::Anthropic;
 use cratefield_adapter_resend::Resend;
 use cratefield_adapter_turnstile::Turnstile;
-use cratefield_core::{ConfigError, Harness, Mailer, RateLimiter};
+use cratefield_core::{ConfigError, Harness, Mailer, RateLimiter, RoutingTextModel, TextModel};
 use cratefield_runtime_cloudflare::{
     Cloudflare, FetchClient, WorkersClock, serve, serve_scheduled,
 };
+use serde_json::Value;
 use supportgenius_composition::MAIL_FROM;
 use worker::{Context, Env, Request, Response, event};
+
+/// The model id the fast tier calls when `SUPPORTGENIUS_MODEL_FAST` is
+/// not set. Mirrored in `bin/supportgenius` (`main.rs`) — the binary does
+/// not depend on this crate, so the two constants are pinned to each
+/// other by their comments; the README's tier table documents both.
+pub(crate) const DEFAULT_MODEL_FAST: &str = "claude-haiku-4-5";
+
+/// The model id the strong tier calls when `SUPPORTGENIUS_MODEL_STRONG`
+/// is not set. Mirrored in `bin/supportgenius` (`main.rs`); see
+/// [`DEFAULT_MODEL_FAST`].
+pub(crate) const DEFAULT_MODEL_STRONG: &str = "claude-sonnet-5";
 
 /// Builds the `Cloudflare` runtime the harness is validated against AND
 /// serves with: one instance, cloned into the builder, the original
@@ -80,6 +104,7 @@ use worker::{Context, Env, Request, Response, event};
 pub fn compose(
     mailer: Arc<dyn Mailer>,
     captcha: Option<Turnstile>,
+    text_model: Option<Arc<dyn TextModel>>,
     visitor_rate_limiter: Option<Arc<dyn RateLimiter>>,
 ) -> Result<(Harness, Cloudflare), ConfigError> {
     // The `RateLimiter` is mounted unconditionally (issue #16 / #17): the
@@ -101,6 +126,12 @@ pub fn compose(
         .blob("BLOB");
     if let Some(captcha) = captcha {
         runtime = runtime.captcha(captcha);
+    }
+    // The `TextModel` port only when a key chose an adapter (issue #22):
+    // mounting nothing is the deployment's honest state, the same way the
+    // captcha above is skipped when `TURNSTILE_SECRET` is absent.
+    if let Some(text_model) = text_model {
+        runtime = runtime.text_model_arc(text_model);
     }
 
     // The environment is the deployment's to declare, through `ENV` in
@@ -173,6 +204,54 @@ fn build_captcha(env: &Env) -> Option<Turnstile> {
     )
 }
 
+/// One `Anthropic` adapter per tier behind a [`RoutingTextModel`], when
+/// `ANTHROPIC_API_KEY` is present on the Worker `Env`; `None` — no port
+/// at all — when it is absent. Read from the binding rather than
+/// `Anthropic::from_env`, which reads `std::env` and is therefore always
+/// empty on Workers (the same reason `build_captcha` avoids
+/// `Turnstile::from_env`).
+///
+/// A keyless `Anthropic` would answer `TextModelError::NotConfigured` —
+/// the exact degradation the module already serves without a port — so
+/// mounting the adapter without a key would only move the decision one
+/// hop; the port stays unmounted and `/__ready` reports `missing`.
+///
+/// The tier ids come from the `SUPPORTGENIUS_MODEL_FAST` /
+/// `SUPPORTGENIUS_MODEL_STRONG` vars, defaulting to
+/// [`DEFAULT_MODEL_FAST`] / [`DEFAULT_MODEL_STRONG`]. Both adapters share
+/// the one key: Anthropic is the only vendor with an adapter in the pin
+/// block, so the two tiers are one vendor (see the README's caveat about
+/// what that does to the escalation judge).
+fn build_text_model(env: &Env) -> Option<Arc<dyn TextModel>> {
+    let key = env
+        .secret("ANTHROPIC_API_KEY")
+        .ok()
+        .map(|secret| secret.to_string().trim().to_owned())
+        .filter(|key| !key.is_empty())?;
+    let var = |name: &str, default: &str| {
+        env.var(name)
+            .ok()
+            .map(|var| var.to_string().trim().to_owned())
+            .filter(|model| !model.is_empty())
+            .unwrap_or_else(|| default.to_owned())
+    };
+    Some(Arc::new(
+        RoutingTextModel::new()
+            .fast(Arc::new(Anthropic::new(
+                Arc::new(FetchClient),
+                Arc::new(WorkersClock),
+                Some(key.clone()),
+                var("SUPPORTGENIUS_MODEL_FAST", DEFAULT_MODEL_FAST),
+            )))
+            .strong(Arc::new(Anthropic::new(
+                Arc::new(FetchClient),
+                Arc::new(WorkersClock),
+                Some(key),
+                var("SUPPORTGENIUS_MODEL_STRONG", DEFAULT_MODEL_STRONG),
+            ))),
+    ))
+}
+
 /// The widget's own `RateLimiter`, from the `VISITOR_RATE_LIMITER`
 /// Workers Rate Limiting binding (issue #33): the per-visitor and per-IP
 /// buckets of `POST /v1/support/widget/messages` run on a namespace of
@@ -187,15 +266,21 @@ fn build_visitor_rate_limiter(env: &Env) -> Option<Arc<dyn RateLimiter>> {
 }
 
 /// Composes once per isolate, from the secrets actually set on this
-/// deployment. The returned pair is the same harness/runtime pair
-/// [`compose`] builds, so what was validated is what serves.
-fn instance(env: &Env) -> &'static (Harness, Cloudflare) {
-    static INSTANCE: OnceLock<(Harness, Cloudflare)> = OnceLock::new();
+/// deployment. The returned triple is the harness/runtime pair
+/// [`compose`] builds — so what was validated is what serves — plus
+/// whether a text model was mounted, which `fetch` needs to decorate
+/// `/__ready` (the harness's own probe cannot see the port).
+fn instance(env: &Env) -> &'static (Harness, Cloudflare, bool) {
+    static INSTANCE: OnceLock<(Harness, Cloudflare, bool)> = OnceLock::new();
     INSTANCE.get_or_init(|| {
         let mailer = build_mailer(env);
         let captcha = build_captcha(env);
+        let text_model = build_text_model(env);
+        let text_model_mounted = text_model.is_some();
         let visitor_rate_limiter = build_visitor_rate_limiter(env);
-        compose(mailer, captcha, visitor_rate_limiter).expect("supportgenius harness is valid")
+        let (harness, runtime) = compose(mailer, captcha, text_model, visitor_rate_limiter)
+            .expect("supportgenius harness is valid");
+        (harness, runtime, text_model_mounted)
     })
 }
 
@@ -208,7 +293,7 @@ fn instance(env: &Env) -> &'static (Harness, Cloudflare) {
 /// Panics if the composition is invalid, which would be a programming
 /// error caught by the tests, not an operational condition.
 pub fn harness() -> Harness {
-    compose(build_mailer_no_secrets(), None, None)
+    compose(build_mailer_no_secrets(), None, None, None)
         .expect("supportgenius harness is valid")
         .0
 }
@@ -228,13 +313,80 @@ fn build_mailer_no_secrets() -> Arc<dyn Mailer> {
 
 /// Worker fetch entry point.
 ///
+/// The one interposition this venture makes on the harness router: the
+/// harness's `/__ready` is a DB-only probe that cannot see the ports the
+/// venture mounts on top (`cratefield-core` `harness.rs`
+/// `ready_handler`), so for that one path the response body is rebuilt
+/// with the `text_model` field added. The status code stays the
+/// harness's — a missing model is a degradation, not unreadiness, which
+/// is exactly how the module serves it (`503 text-model-not-configured`
+/// from `POST /v1/support/messages`).
+///
 /// # Errors
 ///
 /// Propagates `worker::Error` from the harness router.
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, ctx: Context) -> worker::Result<Response> {
-    let (harness, runtime) = instance(&env);
-    serve(harness, runtime, req, env, ctx).await
+    let (harness, runtime, text_model_mounted) = instance(&env);
+    let is_ready_probe = req.path() == "/__ready";
+    let response = serve(harness, runtime, req, env, ctx).await;
+    if is_ready_probe {
+        report_text_model(response, *text_model_mounted).await
+    } else {
+        response
+    }
+}
+
+/// Adds `"text_model": "configured" | "missing"` to a 200 `/__ready`
+/// body. Any other status — the probe's `503` when the database did not
+/// answer — is passed through untouched: readiness is the harness's
+/// verdict to give, and the field is this deployment's annotation on the
+/// healthy answer, not a second opinion about it.
+///
+/// An annotation must never be the reason a healthy deployment reads as
+/// unready, so the two ways the body can surprise us do not fail the
+/// probe. A body that no longer parses as a JSON object (a harness
+/// change) is passed through as-is, and a body that cannot be read at all
+/// yields the original status and headers with an empty body — there is
+/// no body to annotate. Every rebuilt response re-applies the status and
+/// headers the harness set, so the `application/json` content type its
+/// `Json` responder chose stays correct for the body rebuilt here.
+async fn report_text_model(
+    response: worker::Result<Response>,
+    mounted: bool,
+) -> worker::Result<Response> {
+    let mut response = response?;
+    let status = response.status_code();
+    if status != 200 {
+        return Ok(response);
+    }
+    // Read the body once. Everything past this point either rebuilds the
+    // response or must, because reading a streamed body consumes it — the
+    // original `response` no longer carries it.
+    let headers = response.headers().clone();
+    let Ok(body) = response.text().await else {
+        // The body could not be read, so there is nothing to annotate or
+        // pass through: answer with the status and headers the harness
+        // set and an empty body rather than turn a healthy probe into a
+        // failure.
+        return Response::from_bytes(Vec::new())
+            .map(|rebuilt| rebuilt.with_status(status).with_headers(headers));
+    };
+    let Ok(Value::Object(mut ready)) = serde_json::from_str::<Value>(&body) else {
+        // Not JSON, or not a JSON object (a harness change): pass the
+        // probe's own body through rather than fail it — an annotation
+        // must never be the reason a healthy deployment reads as unready.
+        // Rebuilt from the text just read, with the status and headers
+        // the harness set.
+        return Response::from_bytes(body.into_bytes())
+            .map(|rebuilt| rebuilt.with_status(status).with_headers(headers));
+    };
+    ready.insert(
+        "text_model".to_owned(),
+        Value::from(if mounted { "configured" } else { "missing" }),
+    );
+    Response::from_json(&Value::Object(ready))
+        .map(|rebuilt| rebuilt.with_status(status).with_headers(headers))
 }
 
 /// The other half of wrangler.toml's `[triggers]` cron (`23 4 * * *`
@@ -243,6 +395,6 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> worker::Result<Respo
 /// and prunes expired mail-cooldown claims.
 #[event(scheduled)]
 pub async fn scheduled(event: worker::ScheduledEvent, env: Env, ctx: worker::ScheduleContext) {
-    let (harness, runtime) = instance(&env);
+    let (harness, runtime, _) = instance(&env);
     serve_scheduled(harness, runtime, event, env, ctx).await;
 }
