@@ -67,6 +67,23 @@ type = "ratelimit"
 namespace_id = "1001"
 simple = { limit = 60, period = 60 }
 
+# The second Rate Limiting binding the web widget routes (issue #33) run
+# on, mounted unconditionally in src/lib.rs like `RATE_LIMITER`: the
+# per-visitor and per-client-IP buckets of
+# `POST /v1/support/widget/messages` (and the transcript poll) key on
+# the visitor token's random id and the edge client IP, namespaced per
+# tenant, so one anonymous browser's ceiling never spends a tenant's
+# `RATE_LIMITER` budget. A distinct `namespace_id` is what makes the
+# buckets independent; if the binding is missing from a deployment the
+# widget falls back to the shared `RATE_LIMITER` port. 10/min per
+# visitor is deliberately tighter than the tenant budget above — a chat
+# turn every few seconds is already faster than a human types.
+[[unsafe.bindings]]
+name = "VISITOR_RATE_LIMITER"
+type = "ratelimit"
+namespace_id = "1002"
+simple = { limit = 10, period = 60 }
+
 [[d1_databases]]
 binding = "DB"
 database_name = "supportgenius"

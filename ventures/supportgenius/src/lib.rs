@@ -65,7 +65,7 @@ use std::sync::{Arc, OnceLock};
 use cratefield_adapter_anthropic::Anthropic;
 use cratefield_adapter_resend::Resend;
 use cratefield_adapter_turnstile::Turnstile;
-use cratefield_core::{ConfigError, Harness, Mailer, RoutingTextModel, TextModel};
+use cratefield_core::{ConfigError, Harness, Mailer, RateLimiter, RoutingTextModel, TextModel};
 use cratefield_runtime_cloudflare::{
     Cloudflare, FetchClient, WorkersClock, serve, serve_scheduled,
 };
@@ -105,6 +105,7 @@ pub fn compose(
     mailer: Arc<dyn Mailer>,
     captcha: Option<Turnstile>,
     text_model: Option<Arc<dyn TextModel>>,
+    visitor_rate_limiter: Option<Arc<dyn RateLimiter>>,
 ) -> Result<(Harness, Cloudflare), ConfigError> {
     // The `RateLimiter` is mounted unconditionally (issue #16 / #17): the
     // public mail path and the support search/sources routes must have a
@@ -142,8 +143,9 @@ pub fn compose(
     // would make the composition refuse to build at all — a panic at
     // boot instead of a serving Worker that says loudly what it is
     // missing.
-    let harness = supportgenius_composition::modules(
+    let harness = supportgenius_composition::modules_with(
         Harness::builder().venture(supportgenius_composition::venture()),
+        module_support::Support::new().visitor_rate_limiter(visitor_rate_limiter),
     )
     // The clone is what `Harness::build` validates `requires()`
     // against; the original below is what `serve` resolves ports
@@ -250,6 +252,19 @@ fn build_text_model(env: &Env) -> Option<Arc<dyn TextModel>> {
     ))
 }
 
+/// The widget's own `RateLimiter`, from the `VISITOR_RATE_LIMITER`
+/// Workers Rate Limiting binding (issue #33): the per-visitor and per-IP
+/// buckets of `POST /v1/support/widget/messages` run on a namespace of
+/// their own so one anonymous browser's ceiling is not the tenant's
+/// shared budget. Missing from a deployment, the widget falls back to the
+/// shared `RATE_LIMITER` port — the same fail-open-on-missing-binding
+/// behavior the main limiter has, for the same reason.
+fn build_visitor_rate_limiter(env: &Env) -> Option<Arc<dyn RateLimiter>> {
+    env.rate_limiter("VISITOR_RATE_LIMITER")
+        .ok()
+        .map(|limiter| Arc::new(cratefield_runtime_cloudflare::RateLimitPort(limiter)) as _)
+}
+
 /// Composes once per isolate, from the secrets actually set on this
 /// deployment. The returned triple is the harness/runtime pair
 /// [`compose`] builds — so what was validated is what serves — plus
@@ -262,8 +277,9 @@ fn instance(env: &Env) -> &'static (Harness, Cloudflare, bool) {
         let captcha = build_captcha(env);
         let text_model = build_text_model(env);
         let text_model_mounted = text_model.is_some();
-        let (harness, runtime) =
-            compose(mailer, captcha, text_model).expect("supportgenius harness is valid");
+        let visitor_rate_limiter = build_visitor_rate_limiter(env);
+        let (harness, runtime) = compose(mailer, captcha, text_model, visitor_rate_limiter)
+            .expect("supportgenius harness is valid");
         (harness, runtime, text_model_mounted)
     })
 }
@@ -277,7 +293,7 @@ fn instance(env: &Env) -> &'static (Harness, Cloudflare, bool) {
 /// Panics if the composition is invalid, which would be a programming
 /// error caught by the tests, not an operational condition.
 pub fn harness() -> Harness {
-    compose(build_mailer_no_secrets(), None, None)
+    compose(build_mailer_no_secrets(), None, None, None)
         .expect("supportgenius harness is valid")
         .0
 }

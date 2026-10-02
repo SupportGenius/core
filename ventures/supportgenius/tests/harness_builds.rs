@@ -28,7 +28,7 @@ fn keyless_mailer() -> Arc<dyn Mailer> {
 
 #[test]
 fn harness_builds() {
-    let built = compose(keyless_mailer(), None, None);
+    let built = compose(keyless_mailer(), None, None, None);
     // The `ConfigError` lists every problem, so `Debug` on `Err` is the
     // useful output when this goes red. (`Cloudflare` is not `Debug`, so
     // the whole `Ok` half cannot be formatted.)
@@ -39,7 +39,7 @@ fn harness_builds() {
 
 #[test]
 fn harness_reports_waitlist_module() {
-    let (harness, _runtime) = compose(keyless_mailer(), None, None).expect("harness builds");
+    let (harness, _runtime) = compose(keyless_mailer(), None, None, None).expect("harness builds");
     let names: Vec<&str> = harness
         .modules()
         .iter()
