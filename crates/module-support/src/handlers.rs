@@ -22,6 +22,7 @@ use cratefield_core::{
 
 use crate::bm25;
 use crate::chunk::{Chunker, tokenize};
+use crate::handoff::HandoffSink;
 use crate::messages;
 use crate::store::{self, ApiKeyRow, ChunkRow, STATUS_ACTIVE, SourceRow, TenantRow};
 
@@ -81,13 +82,22 @@ pub(crate) struct ModuleState {
     /// not given one: the route answers `503 text-model-not-configured`
     /// rather than pretending to answer.
     pub text_model: Option<Arc<dyn TextModel>>,
+    /// The handoff sink a handoff turn writes through and kicks. `None` is
+    /// `Support::new()` with nothing composed: the turn still marks
+    /// `needs_escalation`, and no ticket is filed.
+    pub handoff: Option<Arc<dyn HandoffSink>>,
 }
 
 pub(crate) fn router(
     ctx: Arc<ModuleContext>,
     text_model: Option<Arc<dyn TextModel>>,
+    handoff: Option<Arc<dyn HandoffSink>>,
 ) -> axum::Router {
-    let state = Arc::new(ModuleState { ctx, text_model });
+    let state = Arc::new(ModuleState {
+        ctx,
+        text_model,
+        handoff,
+    });
     axum::Router::new()
         .route("/admin/tenants", post(create_tenant))
         .route(

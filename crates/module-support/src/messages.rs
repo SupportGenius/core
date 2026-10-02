@@ -19,8 +19,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use cratefield_core::{
-    Clock, Completion, Database, IdGen, Json, ModelTier, Problem, ProblemDef, Prompt, Scope,
-    TextModel, TextModelError, require_admin,
+    Clock, Completion, Database, Defer, IdGen, Json, ModelTier, ModuleContext, Problem, ProblemDef,
+    Prompt, Scope, Statement, TextModel, TextModelError, require_admin,
 };
 use cratefield_i18n::{Args, Catalog, FluentCatalog, localize};
 
@@ -88,6 +88,39 @@ pub(crate) fn clarify_message(lang: Option<&str>) -> String {
 /// The handoff notice: shown when the turn was escalated to a person.
 pub(crate) fn handoff_message(lang: Option<&str>) -> String {
     canned("handoff", lang)
+}
+
+/// The plain-text transcript escalation files with the ticket: the turn's
+/// user message and the handoff notice it answered with, labelled so an
+/// agent reads who said what.
+///
+/// Deliberately the turn's own two messages, not the whole conversation.
+/// The route has loaded no prior messages (it reads counts, not bodies), and
+/// re-reading the transcript just to enrich a ticket would put a second,
+/// failure-prone read on the hot path of every escalating turn. The turn
+/// that escalates — the question that could not be answered and the notice
+/// that says so — is the part an agent needs to start from.
+fn handoff_transcript(message: &str, reply: &str) -> String {
+    format!("Customer: {message}\n\nSupport: {reply}")
+}
+
+/// The turn's one atomic batch: its own statements, then — when this turn
+/// escalates and a [`HandoffSink`](crate::HandoffSink) is composed — the
+/// sink's statements for `transcript`. Appending here is what makes the
+/// answer and the ticket all-or-nothing. `Support::new()` composes no
+/// sink, so this is just the turn and a handoff only marks
+/// `needs_escalation`.
+fn turn_batch(state: &ModuleState, turn: &store::Turn, transcript: Option<&str>) -> Vec<Statement> {
+    let mut statements = store::turn_statements(turn);
+    if let (Some(transcript), Some(sink)) = (transcript, state.handoff.as_deref()) {
+        statements.extend(sink.enqueue(
+            &state.ctx,
+            &turn.tenant_id,
+            &turn.conversation_id,
+            transcript,
+        ));
+    }
+    statements
 }
 
 /// The languages whose BCP-47 primary tag is not whatlang's ISO 639-3
@@ -242,26 +275,15 @@ pub(crate) async fn post_message(
     let id_gen: &dyn IdGen = required_port(ctx.ports.id_gen.as_deref(), "IdGen")?;
     let db: &dyn Database = required_port(ctx.ports.db.as_deref(), "Db")?;
 
-    // 1. The conversation, scoped to the tenant: unknown and foreign are
-    //    the same 404, answered before the model is ever asked.
-    let conversation = match body.conversation_id.as_deref() {
-        Some(id) => Some(
-            store::find_conversation(db, &tenant_id, id)
-                .await?
-                .ok_or_else(|| Problem::not_found().instance(&scope.request_id))?,
-        ),
-        None => None,
-    };
-    // 2. The clarify budget already spent, and the message count that
-    //    orders this turn's two messages. Reads: nothing is written until
-    //    the turn is decided, so a failed call below cannot spend either.
-    let counts = match &conversation {
-        Some(conversation) => store::conversation_counts(db, &tenant_id, &conversation.id).await?,
-        None => store::ConversationCounts {
-            messages: 0,
-            clarifies: 0,
-        },
-    };
+    // 1–2. The conversation this turn belongs to (or none) and its counts
+    //      — both reads, taken before any write.
+    let (conversation, counts) = resolve_conversation(
+        db,
+        &tenant_id,
+        body.conversation_id.as_deref(),
+        &scope.request_id,
+    )
+    .await?;
 
     // 3. Retrieve — the same BM25 path `GET /search` uses.
     let chunks = retrieve(db, &tenant_id, message, TOP_K).await?;
@@ -336,9 +358,18 @@ pub(crate) async fn post_message(
         citations_json: citations_json(&reply),
         lang: lang.clone(),
     };
-    // A handoff's `Escalation::intake().handoff(...)` statements belong in
-    // this same batch once module-escalation is composed alongside.
-    db.batch_atomic(&store::turn_statements(&turn)).await?;
+    // 9–10. One atomic write for the whole turn, then the kick. See
+    //       [`commit_turn`] for why the two are ordered this way.
+    let transcript = escalates.then(|| handoff_transcript(message, &shown));
+    commit_turn(
+        &state,
+        ctx,
+        db,
+        &turn,
+        transcript.as_deref(),
+        scope.defer.clone(),
+    )
+    .await?;
 
     let citations: Vec<Value> = shown_citations
         .iter()
@@ -355,6 +386,69 @@ pub(crate) async fn post_message(
         "needs_escalation": needs_escalation,
     }))
     .into_response())
+}
+
+/// Steps 1–2: the conversation a turn belongs to, scoped to the tenant, and
+/// its counts.
+///
+/// Both are reads — nothing is written until the turn is decided, so a
+/// failure here consumes nothing. `None` is a new conversation; an id that
+/// is unknown or belongs to another tenant is the same 404, answered before
+/// the model is ever asked.
+async fn resolve_conversation(
+    db: &dyn Database,
+    tenant_id: &str,
+    conversation_id: Option<&str>,
+    request_id: &str,
+) -> Result<(Option<ConversationRow>, store::ConversationCounts), Problem> {
+    let conversation = match conversation_id {
+        Some(id) => Some(
+            store::find_conversation(db, tenant_id, id)
+                .await?
+                .ok_or_else(|| Problem::not_found().instance(request_id))?,
+        ),
+        None => None,
+    };
+    // The clarify budget already spent, and the message count that orders
+    // this turn's two messages.
+    let counts = match &conversation {
+        Some(conversation) => store::conversation_counts(db, tenant_id, &conversation.id).await?,
+        None => store::ConversationCounts {
+            messages: 0,
+            clarifies: 0,
+        },
+    };
+    Ok((conversation, counts))
+}
+
+/// Commits the turn's one atomic write, then kicks escalation.
+///
+/// The batch is the turn's own statements plus, when `transcript` is
+/// `Some` (an escalating turn with a [`HandoffSink`](crate::HandoffSink)
+/// composed), the sink's for that transcript — so the "escalated" answer
+/// and the ticket behind it commit or roll back together. The kick runs
+/// only *after* the commit: a failure there costs a delay (the scheduled
+/// drain is the backstop), never the ticket the batch just wrote.
+///
+/// Extracted from [`post_message`] to keep the turn's ordering readable
+/// as one numbered sequence without the handler tripping the function
+/// length lint.
+async fn commit_turn(
+    state: &ModuleState,
+    ctx: &ModuleContext,
+    db: &dyn Database,
+    turn: &store::Turn,
+    transcript: Option<&str>,
+    defer: Arc<dyn Defer>,
+) -> Result<(), Problem> {
+    db.batch_atomic(&turn_batch(state, turn, transcript))
+        .await?;
+    if transcript.is_some()
+        && let Some(sink) = state.handoff.as_deref()
+    {
+        sink.kick(ctx, defer);
+    }
+    Ok(())
 }
 
 /// The request body, with `message` trimmed and length-checked.

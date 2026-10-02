@@ -3275,9 +3275,19 @@ dependencies = [
 name = "supportgenius-composition"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "cratefield-adapter-sqlite",
  "cratefield-core",
  "cratefield-module-waitlist",
+ "cratefield-testing",
+ "http",
+ "module-escalation",
  "module-support",
+ "pollster",
+ "serde_json",
+ "tower",
 ]
 
 [[package]]

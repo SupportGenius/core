@@ -35,11 +35,13 @@ mod answer;
 pub mod bm25;
 pub mod chunk;
 mod handlers;
+mod handoff;
 mod messages;
 mod store;
 
 pub use answer::DEFAULT_ANSWER_THRESHOLD;
 pub use chunk::tokenize;
+pub use handoff::HandoffSink;
 pub use store::reindex_stale_chunks;
 
 use std::sync::Arc;
@@ -109,16 +111,38 @@ const MIGRATION_INTERNATIONALIZATION: SqlMigration = SqlMigration::new(
 /// is likewise not passed here: it arrives through the runtime's
 /// [`Ports`](cratefield_core::Ports) at route-build time, so one instance
 /// serves a venture with a model and one without.
+///
+/// The one piece of state is the optional [`HandoffSink`]: a handoff turn
+/// appends the sink's statements to its own atomic batch and kicks it to
+/// run. `Support::new()` carries no sink, so the module composes exactly
+/// as it did before one existed (see [`handoff`](self) for why the seam is
+/// a trait and not a dependency on `module-escalation`).
 #[derive(Default)]
-pub struct Support;
+pub struct Support {
+    /// `None` is the unwired module: a handoff still marks
+    /// `needs_escalation` and nothing files a ticket.
+    handoff: Option<Arc<dyn HandoffSink>>,
+}
 
 impl Support {
-    /// A `Support` module with defaults. Whether `POST /messages` can
-    /// answer depends on what the runtime provides: with no `TextModel`
-    /// port it answers `503 text-model-not-configured` and every other
-    /// route still works.
+    /// A `Support` module with defaults and no handoff sink. Whether
+    /// `POST /messages` can answer depends on what the runtime provides:
+    /// with no `TextModel` port it answers `503 text-model-not-configured`
+    /// and every other route still works.
+    #[must_use]
     pub fn new() -> Self {
-        Self
+        Self { handoff: None }
+    }
+
+    /// A `Support` that hands an escalating turn to `handoff`: the sink's
+    /// statements join the turn's atomic write, and it is kicked once that
+    /// write commits. This is the one thing a builder needs to set by
+    /// hand, because the sink is the module's own seam and not a core
+    /// port.
+    #[must_use]
+    pub fn with_handoff(mut self, handoff: Arc<dyn HandoffSink>) -> Self {
+        self.handoff = Some(handoff);
+        self
     }
 }
 
@@ -141,13 +165,29 @@ impl Module for Support {
     /// when absent: URL ingest answers `503 not-ready`, the limiter is
     /// skipped, and messages answer `503 text-model-not-configured`.
     ///
+    /// `Tracker` and `Mailer` are here for the handoff sink, not for a
+    /// route: they are the ports the escalation pipeline reads when a
+    /// handoff kicks it, and support's [`ModuleContext`] is a filtered
+    /// view, so a port it does not declare is `None` in the sink's
+    /// pipeline. `Tracker` is what files the ticket; `Mailer` is what
+    /// sends the notify stage's message — dropping either would make a
+    /// kicked run behave differently from the scheduled one. The
+    /// escalation module's own `requires()` is where they are load-bearing;
+    /// a deployment with no handoff sink never touches them.
+    ///
     /// Optional, not required, on purpose: retrieval and ingest — the
     /// parts that make a workspace useful — work without a model, and a
     /// venture that never wires one should still boot (the escalation
     /// module is the one that cannot run without it, and it declares the
     /// port required).
     fn optional(&self) -> &'static [Port] {
-        &[Port::HttpClient, Port::RateLimiter, Port::TextModel]
+        &[
+            Port::HttpClient,
+            Port::RateLimiter,
+            Port::TextModel,
+            Port::Tracker,
+            Port::Mailer,
+        ]
     }
 
     fn tables(&self) -> &'static [&'static str] {
@@ -340,7 +380,7 @@ impl Module for Support {
         // The model `POST /messages` asks: whatever the runtime resolved,
         // `None` — and the degraded 503 — where it resolved nothing.
         let text_model = ctx.ports.text_model.clone();
-        handlers::router(Arc::new(ctx), text_model)
+        handlers::router(Arc::new(ctx), text_model, self.handoff.clone())
     }
 
     /// The re-index drain: every chunk whose `tokenizer_version` stamp

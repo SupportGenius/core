@@ -179,16 +179,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         runtime = runtime.captcha_arc(captcha);
     }
 
-    // Deliberately no TextModel stub here. The port exists now (core 0.5)
-    // and its fake ships in `cratefield-testing` — which is exactly why
-    // it is not wired: a shipping binary must not depend on the testing
-    // crate, and a hand-written `StubTextModel` would exist only to make
-    // `POST /v1/support/messages` answer something in a dev boot. Without
-    // it the route degrades the way production would with the port
-    // unconfigured: `503 text-model-not-configured`, everything else
-    // working. If a developer ever needs a *working* messages route
-    // locally, the honest move is a real provider key in the environment,
-    // not a fake answer in the binary.
+    // TextModel and Tracker: the composition's unconfigured ports. The
+    // escalation module *requires* both, so the harness will not build
+    // without them, and no real adapter is in this binary's graph yet.
+    // They answer `NotConfigured`, so `POST /v1/support/messages` degrades
+    // exactly as production would with the port unset (`503
+    // text-model-not-configured`) instead of the boot failing outright.
+    //
+    // Deliberately not `cratefield-testing`'s fake: a shipping binary must
+    // not depend on the testing crate, and a fake that answered *something*
+    // would hide that no provider is wired. A developer who wants a working
+    // messages route locally should put a real provider key in the
+    // environment, not a fake answer in the binary.
+    runtime = runtime
+        .text_model(composition::UnconfiguredTextModel)
+        .tracker_arc(Arc::new(composition::UnconfiguredTracker));
 
     // Single tenant, seeded at boot from env: the compiled identity is
     // the default, and these variables exist for operators who front the
@@ -208,8 +213,74 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     apply_migrations(&harness, &db).await?;
+
+    check_crons_override(config)?;
+
+    // The native counterpart of wrangler.toml's `[triggers] crons`.
+    // `serve` reads `CRONS` from the environment and starts one task per
+    // expression, but this venture's two ticks are compiled in
+    // (`composition::CRONS`, pinned to the wrangler copy), and the binary
+    // must not require an operator to retype them. The environment is the
+    // only channel `serve` offers, and this process cannot write it (the
+    // workspace forbids `unsafe`, so `set_var` is out), so instead the
+    // default schedule is spawned here, from the same consts, through the
+    // runtime's own public scheduler — exactly the fan-out `serve` would
+    // have run. `CRONS` set is an operator override, not an addition:
+    // `serve` then owns the schedule and this branch is skipped, so the
+    // two paths never both fire.
+    if config.get("CRONS").is_none() {
+        cratefield_runtime_native::spawn_cron_scheduler(
+            &harness,
+            &runtime.ports(),
+            &composition::cron_expressions(),
+        )?;
+        tracing::info!(
+            crons = ?composition::CRONS,
+            "CRONS unset: running the composition's default schedule"
+        );
+    }
+
     serve(harness, runtime).await?;
     Ok(())
+}
+
+/// Refuses an operator `CRONS` override that drops an expression the
+/// composition gates a module on ([`composition::GATED_CRONS`]).
+///
+/// `serve` reads `CRONS` and, when set, spawns one task per expression
+/// *instead of* the compiled default the boot spawns otherwise, so an
+/// override that omits a gated expression would silently switch that
+/// module's scheduled work off — today the daily waitlist retention purge,
+/// which would simply never run. Catch it here, where the error can name
+/// the missing expression, rather than as a task that answers 200 and does
+/// nothing.
+fn check_crons_override(config: EnvConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(raw) = config.get("CRONS") else {
+        return Ok(());
+    };
+    // Split the way `runtime-native`'s own `cron_expressions` does, so the
+    // schedule this checks is the schedule `serve` will run.
+    let schedule: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let missing: Vec<String> = composition::missing_gated_crons(&schedule)
+        .into_iter()
+        .map(|expr| format!("{expr:?}"))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "CRONS omits {}, which the composition gates scheduled work on (the waitlist \
+         retention purge would never run). Add every gated expression, or unset CRONS \
+         to run the compiled default schedule {:?}.",
+        missing.join(", "),
+        composition::CRONS,
+    )
+    .into())
 }
 
 /// `DATABASE_URL`: `postgres://`/`postgresql://` opens a Postgres pool
