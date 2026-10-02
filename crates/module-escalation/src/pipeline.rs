@@ -44,10 +44,11 @@ use crate::model::{
 use crate::store;
 
 use cratefield_core::{
-    Clock, Completion, Config, Credential, Database, Defer, Filed, IdGen, Inbox, Mailer, Message,
-    ModelTier, Outbox, OutboxRecord, Prompt, SendOutcome, Statement, TextModel, TicketDraft,
-    Tracker,
+    Clock, Completion, Config, Credential, Database, Defer, Destination, Filed, IdGen, Inbox,
+    Mailer, Message, ModelTier, Outbox, OutboxRecord, Prompt, SendOutcome, Statement, TextModel,
+    TicketDraft, Tracker,
 };
+use cratefield_secrets::{Actor, Secrets};
 
 /// The inbox table the migration creates; the stages' claim keys live in
 /// it, one `ticket:stage` per stage attempt. Reachable as
@@ -586,7 +587,7 @@ impl Pipeline {
             Ok(filed) => {
                 let detail = json!({
                     "external_id": filed.external_id.clone(),
-                    "url": filed.url.clone(),
+                    "url": (!filed.url.is_empty()).then(|| filed.url.clone()),
                 });
                 let batch = [
                     store::insert_event_stmt(
@@ -626,8 +627,9 @@ impl Pipeline {
 
     /// The file stage's port call, with the tenant's destination and
     /// per-call credential resolved first. Any gap — no drafted ticket to
-    /// file, no destination row, no secret under the stored ref — is a
-    /// terminal decode error, which dead-letters.
+    /// file, no destination row, no credential behind the stored ref — is
+    /// a terminal decode error, which dead-letters. A webhook's filed URL
+    /// is blanked: it is the destination's own secret.
     async fn file_ticket(&self, ticket: &Ticket) -> Result<Filed, Error> {
         let title = ticket
             .title
@@ -648,23 +650,131 @@ impl Pipeline {
                 ticket.tenant_id
             )));
         };
-        // The stored ref names a Config key, never the secret: credentials
-        // are resolved per call from the deployment's config, used, and
-        // dropped — the database holds references only.
-        let Some(secret) = self.config.get(&credential_ref) else {
-            return Err(Error::Decode(format!(
-                "config key `{credential_ref}` (tenant `{}`) is not set",
-                ticket.tenant_id
-            )));
-        };
-        let credential = Credential::new(secret);
+        let (destination, credential) = self
+            .resolve_credential(&ticket.tenant_id, destination, &credential_ref)
+            .await?;
         let idempotency_key = format!("escalation:{}", ticket.id);
         let mut draft = TicketDraft::new(idempotency_key, title, body, severity)
             .labels(vec!["escalated".to_owned(), severity.name().to_owned()]);
         if let Some(environment) = &ticket.environment {
             draft = draft.environment(environment.clone());
         }
-        Ok(self.tracker.file(&destination, &credential, &draft).await?)
+        let filed = self.tracker.file(&destination, &credential, &draft).await?;
+        // A webhook reports the URL it was POSTed to as `Filed::url`, and
+        // that URL is the secret this module stores encrypted. Drop it,
+        // before it can reach the ticket row, the audit detail or the
+        // customer's notification.
+        Ok(if matches!(destination, Destination::Webhook { .. }) {
+            Filed {
+                url: String::new(),
+                ..filed
+            }
+        } else {
+            filed
+        })
+    }
+
+    /// Resolves the tenant's credential and destination from the stored
+    /// `credential_ref`.
+    ///
+    /// Two forms. A `secret:` reference (issue #23) names a value in the
+    /// tenant's encrypted `cratefield-secrets` store: the KMS comes from
+    /// config, the store opens on the same database, and the credential —
+    /// and, for a webhook, the URL, which is itself the secret — is read
+    /// for this one call and dropped. A bare reference is the older
+    /// Config-key form, resolved from the Config port.
+    ///
+    /// Every failure here is a terminal [`Error::Decode`] (dead-letter),
+    /// and none of them names a secret value: a missing KMS, an
+    /// unreadable store or an unset secret are all dead-ends a retry
+    /// cannot heal.
+    async fn resolve_credential(
+        &self,
+        tenant_id: &str,
+        destination: Destination,
+        credential_ref: &str,
+    ) -> Result<(Destination, Credential), Error> {
+        let Some(name) = credential_ref.strip_prefix(crate::secrets::SECRET_REF_PREFIX) else {
+            // Legacy: the ref names a Config key, never the secret.
+            let Some(secret) = self.config.get(credential_ref) else {
+                return Err(Error::Decode(format!(
+                    "config key `{credential_ref}` (tenant `{tenant_id}`) is not set"
+                )));
+            };
+            return Ok((destination, Credential::new(secret)));
+        };
+
+        let kms = crate::secrets::kms_from_config(&*self.config).ok_or_else(|| {
+            Error::Decode(format!(
+                "tenant `{tenant_id}` stores its tracker credential encrypted, but no KMS is \
+                 configured"
+            ))
+        })?;
+        let store = Secrets::new(kms)
+            .tenant(tenant_id, self.db.clone())
+            .map_err(|_| {
+                Error::Decode(format!("tenant `{tenant_id}` has no usable secret store"))
+            })?;
+        let actor = Actor::new("escalation.pipeline")
+            .map_err(|_| Error::Decode("the pipeline actor name is empty".to_owned()))?;
+        let secret = Self::read_secret(&store, &actor, name, tenant_id).await?;
+        let credential = Credential::new(
+            secret
+                .expose_str()
+                .map_err(|_| {
+                    Error::Decode(format!(
+                        "secret `{name}` (tenant `{tenant_id}`) is not valid UTF-8"
+                    ))
+                })?
+                .to_owned(),
+        );
+
+        // A webhook URL is credential material; the stored destination
+        // keeps a marker, and the real URL is read back here.
+        let destination = match destination {
+            Destination::Webhook { url } => {
+                match url.strip_prefix(crate::secrets::SECRET_REF_PREFIX) {
+                    Some(url_name) => {
+                        let real = Self::read_secret(&store, &actor, url_name, tenant_id).await?;
+                        let url = real
+                            .expose_str()
+                            .map_err(|_| {
+                                Error::Decode(format!(
+                                    "webhook URL secret `{url_name}` (tenant `{tenant_id}`) is not \
+                                 valid UTF-8"
+                                ))
+                            })?
+                            .to_owned();
+                        Destination::Webhook { url }
+                    }
+                    None => Destination::Webhook { url },
+                }
+            }
+            other => other,
+        };
+        Ok((destination, credential))
+    }
+
+    /// Reads one named secret from the tenant store, mapping "not found"
+    /// and "unreadable" onto the same terminal decode error — neither
+    /// heals on retry, and neither names a value.
+    async fn read_secret(
+        store: &cratefield_secrets::SecretStore,
+        actor: &Actor,
+        name: &str,
+        tenant_id: &str,
+    ) -> Result<cratefield_secrets::SecretBytes, Error> {
+        store
+            .get(name, actor)
+            .await
+            .map_err(|_| {
+                Error::Decode(format!(
+                    "secret `{name}` (tenant `{tenant_id}`) could not be read"
+                ))
+            })?
+            .ok_or_else(|| {
+                Error::Decode(format!("secret `{name}` (tenant `{tenant_id}`) is not set"))
+            })
     }
 
     // ------------------------------------------------------------------

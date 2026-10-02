@@ -16,7 +16,17 @@ The plan, in order, is the issue list. Two modules, not five:
   answers with citations
 - `crates/module-escalation` — a conversation becomes a ticket: drafted by one
   model, checked by an independent one, filed by a router, followed up until
-  it closes
+  it closes. A tenant (or an operator acting for one) sets where its
+  escalations go with `PUT /v1/escalation/destinations` — or, for a tenant
+  that cannot, `PUT /v1/escalation/admin/tenants/{tenant_id}/destinations`
+  with the admin token. The credential is validated against the tracker once
+  and then stored **encrypted** (through `cratefield-secrets`), never as a
+  Worker secret an operator edits by hand. That storage is enabled by
+  configuration: `HARNESS_KEK_CURRENT` (the Worker's numbered KEK ring) or
+  `ESCALATION_KMS_KEY_FILE` (a development master-key file, refused in
+  `ENV=production`). With neither set the routes answer
+  `503 escalation-kms-not-configured`; a destination whose `credential_ref`
+  names a plain Config key still files as before.
 - `ventures/supportgenius` — the Cloudflare Worker (built)
 - `bin/supportgenius` — the same modules as one static binary, which is what
   the site promises

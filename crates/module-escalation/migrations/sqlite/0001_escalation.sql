@@ -71,11 +71,14 @@ CREATE INDEX IF NOT EXISTS idx_sg_ticket_events_ticket_seq
 -- ---------------------------------------------------------------------------
 -- sg_destinations: per-tenant tracker destination. `destination` is the
 -- JSON of the `Destination` port enum. **`credential_ref` is a reference,
--- never a secret**: it names the Config key the secret lives under (e.g.
--- `ESCALATION_TRACKER_CREDENTIAL`), and the secret is resolved from the
--- Config port at file-time. Storing the credential itself here would put
--- it in a table that gets exported, backed up and replicated like any
--- other row.
+-- never a secret**: since issue #23 it is a `secret:` name in the
+-- tenant's encrypted `cratefield-secrets` store (`secret:escalation.tracker.credential`),
+-- and for a webhook the stored `destination` keeps the marker
+-- `secret:escalation.tracker.destination` in place of the URL, which is
+-- itself credential material. The older form is a Config key name
+-- resolved from the Config port at file-time. Either way the secret
+-- itself is never in this row: storing it here would put it in a table
+-- that gets exported, backed up and replicated like any other.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS sg_destinations (
     tenant_id TEXT PRIMARY KEY,
