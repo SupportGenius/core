@@ -20,11 +20,17 @@
 //!                                                # upload routes answer
 //!                                                # `503 not-ready`
 //! export CRONS="23 4 * * *"                      # module scheduled hooks: the
-//!                                                # upload GC, the waitlist purge,
+//!                                                # upload GC, the connector
+//!                                                # re-sync, the waitlist purge,
 //!                                                # the escalation retry sweeps
 //! LISTEN_ADDR=127.0.0.1:8080 ./supportgenius
 //! curl -fsS http://127.0.0.1:8080/__health && curl -fsS http://127.0.0.1:8080/__ready
 //! ```
+//!
+//! `CRONS` is comma-separated five-field cron expressions (UTC), the
+//! environment counterpart of a Worker's `[triggers] crons`. Without it,
+//! connector fetches still run when a connector is created (through
+//! `Defer`); they just never re-check their sources.
 //!
 //! `--check-ready` runs the container health check (GET `/__ready`
 //! against the configured listen address, exit 0/1) — distroless ships
