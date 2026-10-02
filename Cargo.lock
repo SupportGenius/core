@@ -2215,7 +2215,9 @@ dependencies = [
 name = "module-support"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
+ "base64 0.23.1",
  "bytes",
  "cratefield-core",
  "cratefield-i18n",

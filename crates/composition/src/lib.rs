@@ -63,7 +63,11 @@ pub fn venture() -> Venture {
         .cors_origins(["https://supportgeni.us", "https://www.supportgeni.us"])
 }
 
-/// Adds every venture module — and its templates — to any builder.
+/// Adds every venture module — and its templates — to any builder, with
+/// the `Support` module exactly as the caller built it. The Worker passes
+/// [`Support::visitor_rate_limiter`] here so the widget's per-visitor
+/// buckets run on their own Rate Limiting binding; the static binary
+/// calls [`modules`], which uses a default `Support`.
 ///
 /// ── THE ONE PLACE A NEW MODULE IS REGISTERED ──────────────────────────
 /// `crates/module-support` and `crates/module-escalation` land in this
@@ -72,7 +76,7 @@ pub fn venture() -> Venture {
 /// in `optional()`, never `requires()` — the tests in `tests/` enforce
 /// it, because a hard requirement is a self-hosted brick (see the crate
 /// docs).
-pub fn modules(builder: HarnessBuilder) -> HarnessBuilder {
+pub fn modules_with(builder: HarnessBuilder, support: Support) -> HarnessBuilder {
     builder
         // No `/ui` is mounted on either link target, so send the
         // post-confirm landing to the site rather than the module's
@@ -86,10 +90,17 @@ pub fn modules(builder: HarnessBuilder) -> HarnessBuilder {
         // point of this crate is that the binary and the Worker cannot
         // drift, and `Support` reaching only one of them would be exactly
         // that drift.
-        .module(Support::new())
+        .module(support)
         // Templates register on the harness builder — `Waitlist` itself
         // has no `.templates` method.
         .templates(cratefield_module_waitlist::default_templates())
+}
+
+/// [`modules_with`] with a default `Support` — what a runtime with no
+/// widget-specific bindings to hand over uses, including the static
+/// binary.
+pub fn modules(builder: HarnessBuilder) -> HarnessBuilder {
+    modules_with(builder, Support::new())
 }
 
 #[cfg(test)]
