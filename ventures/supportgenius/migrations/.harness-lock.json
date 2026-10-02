@@ -15,6 +15,10 @@
     "file": "0010_support_0004_internationalization.sql",
     "sha256": "515f0f1624ff39358acad28d900cfb572fa371cf42a3186432e10a34aa56515d"
   },
+  "support/0005": {
+    "file": "0011_support_0005_uploads.sql",
+    "sha256": "173038ac5186ef000bd263150d14946108c561a2eb58d394996f82fda9db3b60"
+  },
   "waitlist/0001": {
     "file": "0001_waitlist_0001_init.sql",
     "sha256": "504c3e013f921975e286b27f6253ac5f2b9f884bf2b89f6d077c4931760c54ea"
