@@ -16,14 +16,15 @@ use std::sync::Arc;
 
 use cratefield_core::{
     Clock, Database, HttpClient, IdGen, Json, ModuleConfig, ModuleContext, Problem, ProblemDef,
-    RateLimit, RateLimitFailure, Scope, Signer, TextModel, check_rate_limit, rate_limited,
-    require_admin,
+    RateLimit, RateLimitFailure, RateLimiter, Scope, Signer, TextModel, check_rate_limit,
+    rate_limited, require_admin,
 };
 
 use crate::bm25;
 use crate::chunk::{Chunker, tokenize};
 use crate::messages;
 use crate::store::{self, ApiKeyRow, ChunkRow, STATUS_ACTIVE, SourceRow, TenantRow};
+use crate::widget;
 
 /// The inline `text` ceiling for `POST /sources`. Not arbitrary: `/v1/*`
 /// request bodies are already capped at 64 KiB
@@ -56,7 +57,7 @@ const MAX_EXTERNAL_ID_BYTES: usize = 512;
 /// indistinguishable 401. Which of these it is would be a handout to
 /// anyone probing the API; the holder of a genuine key never needs the
 /// distinction, because re-minting fixes all of them the same way.
-const UNAUTHORIZED: ProblemDef = ProblemDef {
+pub(crate) const UNAUTHORIZED: ProblemDef = ProblemDef {
     slug: "unauthorized",
     status: StatusCode::UNAUTHORIZED,
     title: "Support API key unauthorized",
@@ -81,18 +82,34 @@ pub(crate) struct ModuleState {
     /// not given one: the route answers `503 text-model-not-configured`
     /// rather than pretending to answer.
     pub text_model: Option<Arc<dyn TextModel>>,
+    /// The module-owned limiter the widget's per-visitor buckets run on
+    /// (`crate::widget`), wired by the composition so a deployment can
+    /// bound one anonymous browser separately from the tenant's own
+    /// budget. `None` falls back to `ctx.ports.rate_limiter` — both
+    /// buckets then share the tenant limiter — and to no limiting at all
+    /// when that is absent too.
+    pub visitor_rate_limiter: Option<Arc<dyn RateLimiter>>,
 }
 
 pub(crate) fn router(
     ctx: Arc<ModuleContext>,
     text_model: Option<Arc<dyn TextModel>>,
+    visitor_rate_limiter: Option<Arc<dyn RateLimiter>>,
 ) -> axum::Router {
-    let state = Arc::new(ModuleState { ctx, text_model });
+    let state = Arc::new(ModuleState {
+        ctx,
+        text_model,
+        visitor_rate_limiter,
+    });
     axum::Router::new()
         .route("/admin/tenants", post(create_tenant))
         .route(
             "/admin/tenants/{tenant_id}/settings",
             put(messages::put_settings),
+        )
+        .route(
+            "/admin/tenants/{tenant_id}/publishable-keys",
+            post(widget::create_publishable_key),
         )
         .route("/sources", post(ingest_source).get(list_sources))
         .route(
@@ -101,6 +118,12 @@ pub(crate) fn router(
         )
         .route("/search", get(search))
         .route("/messages", post(messages::post_message))
+        .route("/widget/messages", post(widget::post_widget_message))
+        .route(
+            "/widget/conversations/{conversation_id}",
+            get(widget::get_widget_conversation),
+        )
+        .route("/w.js", get(widget::serve_w_js))
         .with_state(state)
 }
 

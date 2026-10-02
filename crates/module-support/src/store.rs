@@ -858,28 +858,86 @@ pub(crate) async fn tenant_threshold_pct(
         .and_then(|row| row.get::<i64>("answer_threshold_pct")))
 }
 
-/// Upserts the tenant's answer threshold. `ON CONFLICT … DO UPDATE SET …
-/// = excluded.…` is the one upsert form SQLite and Postgres agree on.
-pub(crate) async fn upsert_tenant_threshold(
+/// One tenant's settings row as the admin settings route reads it.
+/// `answer_threshold_pct` cannot be null in this schema (0002 made it
+/// `NOT NULL`; a row created for the widget origins alone records the
+/// documented default), while `widget_origins` is null — the widget
+/// refused — until the tenant sets an allowlist.
+pub(crate) struct TenantSettingsRow {
+    pub answer_threshold_pct: i64,
+    /// The normalized origin allowlist as the JSON text it is stored as,
+    /// `None` (and an explicit `"[]"`) both meaning the widget is closed.
+    pub widget_origins: Option<String>,
+}
+
+/// The tenant's settings row, or `None` when it has never set anything.
+pub(crate) async fn find_tenant_settings(
     db: &dyn Database,
     tenant_id: &str,
-    answer_threshold_pct: i64,
+) -> Result<Option<TenantSettingsRow>, DbError> {
+    let mut select = Query::select();
+    select
+        .columns(["answer_threshold_pct", "widget_origins"])
+        .from(iden("sg_tenant_settings"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id));
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows.rows.first().map(|row| TenantSettingsRow {
+        answer_threshold_pct: row.get("answer_threshold_pct").unwrap_or_default(),
+        widget_origins: row.get("widget_origins").unwrap_or_default(),
+    }))
+}
+
+/// The tenant's normalized widget origin allowlist, parsed from its JSON
+/// text. `None` (never set) and an empty array both mean the widget is
+/// refused; a malformed stored array is treated the same way rather than
+/// trusted — only the admin route writes this column and it normalizes
+/// before storing.
+pub(crate) fn parse_widget_origins(stored: Option<&str>) -> Vec<String> {
+    stored
+        .and_then(|json| serde_json::from_str::<Vec<String>>(json).ok())
+        .unwrap_or_default()
+}
+
+/// One atomic statement for "set the fields this request named, leave
+/// the others exactly as they stand": the `DO UPDATE` SET list is built
+/// from the provided fields only, so an omitted field keeps its stored
+/// value with no read-merge-write two concurrent admins could interleave
+/// (and one of their writes lose). `default_threshold_pct` fills the NOT
+/// NULL column only when the insert creates the row's first version — a
+/// conflict never reaches it. `ON CONFLICT … DO UPDATE SET x =
+/// excluded.x` is the one upsert form SQLite and Postgres agree on.
+pub(crate) async fn upsert_tenant_settings(
+    db: &dyn Database,
+    tenant_id: &str,
+    answer_threshold_pct: Option<i64>,
+    widget_origins: Option<&str>,
+    default_threshold_pct: i64,
     updated_at: &str,
 ) -> Result<(), DbError> {
     let mut insert = Query::insert();
     insert
         .into_table(iden("sg_tenant_settings"))
-        .columns(["tenant_id", "answer_threshold_pct", "updated_at"])
+        .columns([
+            "tenant_id",
+            "answer_threshold_pct",
+            "widget_origins",
+            "updated_at",
+        ])
         .values_panic([
             tenant_id.into(),
-            answer_threshold_pct.into(),
+            answer_threshold_pct.unwrap_or(default_threshold_pct).into(),
+            widget_origins.into(),
             updated_at.into(),
-        ])
-        .on_conflict(
-            OnConflict::column(iden("tenant_id"))
-                .update_columns([iden("answer_threshold_pct"), iden("updated_at")])
-                .to_owned(),
-        );
+        ]);
+    let mut conflict = OnConflict::column(iden("tenant_id")).clone();
+    if let Some(pct) = answer_threshold_pct {
+        conflict.value(iden("answer_threshold_pct"), pct);
+    }
+    if widget_origins.is_some() {
+        conflict.value(iden("widget_origins"), widget_origins);
+    }
+    conflict.value(iden("updated_at"), updated_at);
+    insert.on_conflict(conflict);
     execute(db, &Statement::render(&insert)).await
 }
 
@@ -1026,4 +1084,102 @@ pub(crate) fn iso_now(clock: &dyn cratefield_core::Clock) -> String {
         .unwrap_or_else(|_| clock.now())
         .format(&Rfc3339)
         .unwrap_or_default()
+}
+
+/// A conversation as the widget transcript route shows it. `status` is
+/// the stored column (`'open' | 'escalated'`), redundant with
+/// `needs_escalation` by this schema's invariant and sent anyway so the
+/// widget reads one word instead of deriving it.
+pub(crate) struct WidgetConversation {
+    pub id: String,
+    pub status: String,
+    pub needs_escalation: bool,
+}
+
+/// The conversation `conversation_id`, scoped to the tenant, with its
+/// status column — the widget transcript route's existence-and-state
+/// read. Scoped exactly like [`find_conversation`]: a foreign id is no
+/// conversation at all.
+pub(crate) async fn find_conversation_with_status(
+    db: &dyn Database,
+    tenant_id: &str,
+    conversation_id: &str,
+) -> Result<Option<WidgetConversation>, DbError> {
+    let mut select = Query::select();
+    select
+        .columns(["id", "status", "needs_escalation"])
+        .from(iden("sg_conversations"))
+        .and_where(Expr::col(iden("id")).eq(conversation_id))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id));
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows.rows.first().map(|row| WidgetConversation {
+        id: row.get("id").unwrap_or_default(),
+        status: row.get("status").unwrap_or_default(),
+        needs_escalation: row.get::<i64>("needs_escalation").unwrap_or(0) != 0,
+    }))
+}
+
+/// One message as the widget transcript shows it: the body the visitor
+/// was shown — never `model_answer`, which stays out of every
+/// user-facing path — plus the assistant turn's outcome and its
+/// retrieved-only citations.
+pub(crate) struct WidgetMessage {
+    pub id: String,
+    pub role: String,
+    pub body: String,
+    pub outcome: Option<String>,
+    pub citations: Vec<(String, String)>,
+    pub created_at: String,
+}
+
+/// The conversation's messages in `seq` order (the order the turn writer
+/// guarantees), scoped to the tenant. A stored citations blob that does
+/// not parse contributes no citations rather than failing the transcript:
+/// the column is written only by this module and only as JSON, but a
+/// transcript is a read path and one bad row must not blank it.
+pub(crate) async fn conversation_messages(
+    db: &dyn Database,
+    tenant_id: &str,
+    conversation_id: &str,
+) -> Result<Vec<WidgetMessage>, DbError> {
+    let mut select = Query::select();
+    select
+        .columns(["id", "role", "body", "outcome", "citations", "created_at"])
+        .from(iden("sg_messages"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden("conversation_id")).eq(conversation_id))
+        .order_by(iden("seq"), sea_query::Order::Asc);
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows
+        .rows
+        .iter()
+        .filter_map(|row| {
+            let citations = row
+                .get::<Option<String>>("citations")
+                .unwrap_or_default()
+                .and_then(|json| serde_json::from_str::<Vec<ModelCitationJson>>(&json).ok())
+                .map(|parsed| {
+                    parsed
+                        .into_iter()
+                        .map(|citation| (citation.chunk_id, citation.quote))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(WidgetMessage {
+                id: row.get("id")?,
+                role: row.get("role")?,
+                body: row.get("body")?,
+                outcome: row.get("outcome").unwrap_or_default(),
+                citations,
+                created_at: row.get("created_at")?,
+            })
+        })
+        .collect())
+}
+
+/// The stored shape of one citation in the `citations` JSON column.
+#[derive(serde::Deserialize)]
+struct ModelCitationJson {
+    chunk_id: String,
+    quote: String,
 }

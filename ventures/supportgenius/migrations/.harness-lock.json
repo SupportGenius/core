@@ -11,6 +11,10 @@
     "file": "0009_support_0003_source_management.sql",
     "sha256": "b41235ce26089af596f376a22b8d55e2e6ba8fe3c2f01b6e59d2a027d2a12772"
   },
+  "support/0004": {
+    "file": "0010_support_0004_widget_settings.sql",
+    "sha256": "c6c487b395bdf963bb3e9bcb19016ba75e823af0cd99d3995b7bbfe22f6f7729"
+  },
   "waitlist/0001": {
     "file": "0001_waitlist_0001_init.sql",
     "sha256": "504c3e013f921975e286b27f6253ac5f2b9f884bf2b89f6d077c4931760c54ea"

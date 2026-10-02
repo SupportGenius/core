@@ -36,7 +36,7 @@ fn keyless_mailer() -> Arc<dyn Mailer> {
 /// covered here with no edit to this file.
 #[test]
 fn composed_modules_have_unique_names_and_disjoint_tables() {
-    let (harness, _runtime) = compose(keyless_mailer(), None).expect("harness builds");
+    let (harness, _runtime) = compose(keyless_mailer(), None, None).expect("harness builds");
     let modules = harness.modules();
     assert!(
         !modules.is_empty(),

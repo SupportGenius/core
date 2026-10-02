@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SupportGenius widget example</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; }
+  </style>
+</head>
+<body>
+  <h1>SupportGenius widget example</h1>
+  <p>Click the chat button in the bottom-right corner.</p>
+
+  <!--
+    Test setup:
+    1. Start the API: `wrangler dev` (serves http://localhost:8787).
+    2. Mint a publishable key for your tenant via
+       POST /v1/support/admin/tenants/{id}/publishable-keys,
+       then paste it below, replacing sg_pub_REPLACE_ME.
+    3. Serve THIS PAGE from an origin on the tenant's allowlist, e.g.:
+         cd widget/example && python3 -m http.server 8000
+       then open http://localhost:8000 — and first add that origin
+       (http://localhost:8000) to the tenant's widget_origins via
+       PUT /v1/support/admin/tenants/{id}/settings, or every request
+       will 403 with "Chat is unavailable".
+  -->
+  <script src="http://localhost:8787/v1/support/w.js" data-key="sg_pub_REPLACE_ME" async></script>
+</body>
+</html>
