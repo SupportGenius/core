@@ -25,7 +25,10 @@ use stats_check::{assert_stats_exact, df_of};
 const ADMIN_TOKEN: &str = "test-admin-token-0123456789abcdef";
 const ADMIN: &str = "/v1/support/admin/tenants";
 const SEARCH: &str = "/v1/support/search";
-const PROBLEMS: &str = "https://factory0.ventures/problems/";
+/// The problem `type` base: since cratefield-core 0.7 every problem is named
+/// under the serving venture's own `<public_url>/problems/`, and
+/// `TestHarness` serves as `https://test.example`.
+const PROBLEMS: &str = "https://test.example/problems/";
 
 /// A buffered JSON response, as in `routes.rs`.
 struct Reply {

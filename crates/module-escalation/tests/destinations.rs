@@ -27,7 +27,10 @@ use serde_json::{Value, json};
 const ADMIN_TOKEN: &str = "test-admin-token-0123456789abcdef";
 const DESTINATIONS: &str = "/v1/escalation/destinations";
 const ADMIN_TENANTS: &str = "/v1/escalation/admin/tenants";
-const PROBLEMS: &str = "https://factory0.ventures/problems/";
+/// The problem `type` base: since cratefield-core 0.7 every problem is named
+/// under the serving venture's own `<public_url>/problems/`, and
+/// `TestHarness` serves as `https://test.example`.
+const PROBLEMS: &str = "https://test.example/problems/";
 
 /// A distinctive credential: if it ever reaches a response, an audit row, a
 /// table dump or a log line, the canary test fails loudly.
