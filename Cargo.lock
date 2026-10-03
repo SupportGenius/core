@@ -541,9 +541,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-adapter-anthropic"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a52c11d792a58b7ce983c3c8e0be49d60e4bb2413f758c8474c77e1fa1ead306"
+checksum = "fc4e0c7df9de94351a998c95c064da1fe01d17af1fa3f3e1ebe66daefcc71dd1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -557,9 +557,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-adapter-apns"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f7b9b1c1e8f3e42a1e8a9707c4ce5e1ba715226240ede5f24475b0d8509ae60"
+checksum = "7b10da4ec98cfba90bcada663be9947c9938a8537606552eec5368fda7f0f54f"
 dependencies = [
  "async-trait",
  "bytes",
@@ -574,9 +574,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-adapter-fcm"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76e2bd61118fd0bff691078b4f10da600183011cf974dca964da30b5c40c0957"
+checksum = "987abf8d3a5f0ad1f897ff4e604adef519a33d6b8db1794c1d403d9b9fd29950"
 dependencies = [
  "async-trait",
  "bytes",
@@ -593,9 +593,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-adapter-github-issues"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b4eb18382cd026ca39fdb866682658b3062b88f1801aef6e52f9b7605b4cded"
+checksum = "63aefff96af55ca01e0df3139f5b92f36dfc1f5011e98a3e000caf5f6d47a40d"
 dependencies = [
  "async-trait",
  "bytes",
@@ -609,9 +609,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-adapter-postgres"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73b385cce2b2cdaf6e8a0bf96495eb9f0cdf51c5c759bc7faf421392ade7a201"
+checksum = "80db5d57be0aaf7e98e3ff800a649dfc8c1c1324d6ca796e3716fdd9d36f788c"
 dependencies = [
  "async-trait",
  "cratefield-core",
@@ -625,9 +625,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-adapter-resend"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f621d849a8a160f19dd5a4e5ef3009035925726169189bb5fb3c8dfc2308e32"
+checksum = "cc8791ed4920f1d006679353253ac3ae3f815ee1da64e52fb9ff350ce619ed29"
 dependencies = [
  "async-trait",
  "bytes",
@@ -640,9 +640,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-adapter-sqlite"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f883302ae76b7a1119e458885424fcfe4a3d2bb5cb678bbc1b7b048246599284"
+checksum = "89d9f9f07d7ca89e873353914cb4715164ae0c4fbcde3f61cc6ef7d5262b0a33"
 dependencies = [
  "async-trait",
  "cratefield-core",
@@ -654,9 +654,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-adapter-turnstile"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "296bb18b7861b7ba78e102609c24658cf6d07a7c119e3e3a2b74dd24e74708b5"
+checksum = "7e64de8954dbb3783901a50da1ad197bb7f4fc72f3ea1470ec2c4118b353855b"
 dependencies = [
  "async-trait",
  "bytes",
@@ -669,9 +669,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-adapter-webhook-tracker"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07d49e02b07770360140210d2923cabb730d33c7faffd2df9854d5ca6a6ddfb3"
+checksum = "7a8b9022b35004b0c14004772e5f649af84d889dc79e919ea4d4bc81a7c05445"
 dependencies = [
  "async-trait",
  "bytes",
@@ -687,9 +687,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-adapter-webpush"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c2d45ada09339d15429d5b36433e49277bfa57b489dd4813df6ce331e84897c"
+checksum = "5ed5af2732b3c78b51681ec41f153c07d7299cfd6ac3550774c6bf9e09f6bd2f"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -710,9 +710,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-auth-client"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6892c601a2d6a08456ce4223aa3b4441f8ec40f72bb5bee830457429d6cb8579"
+checksum = "739351599c26447aaede8bc4d5bf2400f991ded0d88f42dfffbfba626d53b62a"
 dependencies = [
  "async-trait",
  "axum",
@@ -730,9 +730,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-cli"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f483b1b18ebfe3b8b1deb469cc6f9d7fedfe81acbec220334cae6c781cf0c2d6"
+checksum = "57dc4396fcdb36127e542eb65d6db88772187b1e9c7b72b96872196f0ee3f9e1"
 dependencies = [
  "base64 0.23.1",
  "clap",
@@ -757,9 +757,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-client-ts"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6894c254b7561fa8f98f7cf2fd83cb39a47a8a0948fdf70564a06cadc0586d9"
+checksum = "937ca5c1b2ed40862f6b482bd181271f9765d67db6f2ab42c6606d1d77eba68d"
 dependencies = [
  "cratefield-core",
  "serde_json",
@@ -768,9 +768,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-core"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "063509c507d59a67888527e7b2642877a83b5f344f9d51fc408c24e419a5b70d"
+checksum = "81ad996962e9d76cfacc39b7ee209ca87cd815f38bd50d9db19850ef0c1421ca"
 dependencies = [
  "async-trait",
  "axum",
@@ -783,6 +783,7 @@ dependencies = [
  "sea-query",
  "serde",
  "serde_json",
+ "sha1",
  "sha2 0.11.0",
  "subtle",
  "thiserror",
@@ -826,9 +827,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-manifest"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5565f9ba7cfad55de1f4e604fead62cd9d851d5e0a5ae3e068a8c49b85dbd31"
+checksum = "3546c43cdf11f3e6b28c5bac2c276042607dbd0263d7f3a9a4f546d6ef960431"
 dependencies = [
  "cratefield-tables",
  "serde",
@@ -838,9 +839,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-module-waitlist"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07cada96b9fe5cc642e7d5664262eca07042eb234cb7f8c251253eba36ad95eb"
+checksum = "41099f86cdeb86de5726a58be53c153517c655aca78b650ebf5eb967853d0da0"
 dependencies = [
  "askama",
  "axum",
@@ -857,9 +858,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-module-webhooks"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddd68fbc8cb6986929bd07273789fbdb46301bafa5058337612043fb0c8a5395"
+checksum = "aec4a71bd39d40d024d8d38e001e6a28bc1a4bfef04d9bf85f08a31289991f9a"
 dependencies = [
  "axum",
  "bytes",
@@ -877,9 +878,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-push-auth"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e25cebcf635906132333e34c4050a3017f80af18720df15cf7b573ad82d39050"
+checksum = "a3b8192e55b109705166ab2ae76ff936ab5416fb87acf89aa1727fb2c4220e90"
 dependencies = [
  "base64 0.23.1",
  "cratefield-core",
@@ -892,9 +893,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-push-wiring"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "026da40898351d8306bf8761e8b7e53fbc5afb395958e87a899ea8bed6bfde6f"
+checksum = "2ffc43c116c4ff6ff0a57834735f55f0093334d73e91b5458357ab08c9eaaab4"
 dependencies = [
  "async-trait",
  "bytes",
@@ -907,9 +908,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-runtime-cloudflare"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd3abce7b4eaf1ac17d45d0f3b5a39d3ab0b664b235393cd1737339900feccfa"
+checksum = "78d6c1762f4b34c5e61d413d0f8bf4159b81f1183aef49a27dfb7c8245d44e5a"
 dependencies = [
  "async-trait",
  "axum",
@@ -927,14 +928,15 @@ dependencies = [
  "time",
  "tower",
  "tracing",
+ "wasm-bindgen",
  "worker",
 ]
 
 [[package]]
 name = "cratefield-runtime-native"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf5fa134864d75b86fb3fe19d0fd5f9ada3bea09e11e7afcb09c2a68d5e6d563"
+checksum = "9720b14abb7bc335996f1e23973b5c9f15de907a8d6b547057c52f3acdd0ec2f"
 dependencies = [
  "async-trait",
  "axum",
@@ -958,9 +960,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-secrets"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6efc75f75a593ee6ac69017711c69a5f12b45cd26bb44c3fccb8bb5d9a21980d"
+checksum = "04626de54ab22eb11548f1ac81b928ee49ab58c469adb518b85252c6bba2be66"
 dependencies = [
  "async-trait",
  "chacha20poly1305",
@@ -977,9 +979,9 @@ dependencies = [
 
 [[package]]
 name = "cratefield-tables"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9299e3cfbf9ce6465b03f9899ef76314dd0a17d5096b971d4ed915afeeeb2296"
+checksum = "607dd2557beb7e8d3f02a8cf7f64eb072770478cd77aa030241f9ba58c2a3aed"
 dependencies = [
  "cratefield-core",
  "sea-query",
@@ -989,22 +991,25 @@ dependencies = [
 
 [[package]]
 name = "cratefield-testing"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "839922ce111fd92651282bd0b95c4bfa895b9a215dda1e263ff629a6d7390d85"
+checksum = "ef5ca2c562a418d42c9b029569866ba3d987dd7eb350c331392cecd2b1a5b32b"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.23.1",
  "bytes",
  "cratefield-adapter-postgres",
  "cratefield-adapter-sqlite",
  "cratefield-core",
  "futures-core",
+ "hmac 0.13.0",
  "http",
  "pollster",
  "sea-query",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "time",
  "tokio",
  "tower",
@@ -1374,7 +1379,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2706,7 +2711,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3203,6 +3208,17 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "sha1"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.1",
+ "digest 0.11.3",
 ]
 
 [[package]]

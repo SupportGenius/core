@@ -68,11 +68,6 @@ use crate::handlers::{ModuleState, UNAUTHORIZED, guard_rate_limit, required_port
 use crate::messages;
 use crate::store;
 
-/// The base URI of every problem `type` this module emits —
-/// `cratefield_core`'s `PROBLEM_TYPE_BASE` restated, because that one is
-/// `pub(crate)` upstream.
-const PROBLEMS: &str = "https://factory0.ventures/problems/";
-
 /// 403: the request named no `Origin`, or one that is not on the tenant's
 /// allowlist. One slug for both, so a probing page cannot learn whether
 /// the tenant uses the widget at all.
@@ -84,9 +79,8 @@ const ORIGIN_NOT_ALLOWED: ProblemDef = ProblemDef {
 };
 
 /// 403: the visitor owes a captcha and did not present one that verified.
-/// Hand-built rather than a rendered [`Problem`] so the body can carry
-/// the `site_key` extension member — the one thing the widget needs to
-/// render the challenge it has been asked to solve.
+/// The body carries the `site_key` extension member — the one thing the
+/// widget needs to render the challenge it has been asked to solve.
 const WIDGET_CAPTCHA_REQUIRED: ProblemDef = ProblemDef {
     slug: "widget-captcha-required",
     status: StatusCode::FORBIDDEN,
@@ -759,21 +753,17 @@ fn turnstile_site_key(ctx: &ModuleContext) -> Option<String> {
         .filter(|key| !key.is_empty())
 }
 
-/// The hand-built captcha refusal: problem+json with the `site_key`
-/// extension member, stamped with the origin so the widget may read it.
+/// The captcha refusal: problem+json with the `site_key` extension
+/// member, stamped with the origin so the widget may read it. Built as a
+/// [`Problem`] so the harness names its `type` under the serving venture's
+/// own base (cratefield-core 0.7); the extension member survives that
+/// re-render.
 fn captcha_refusal(state: &ModuleState, scope: &Scope, origin: &str) -> Response {
-    let body = json!({
-        "type": format!("{PROBLEMS}{}", WIDGET_CAPTCHA_REQUIRED.slug),
-        "title": WIDGET_CAPTCHA_REQUIRED.title,
-        "status": WIDGET_CAPTCHA_REQUIRED.status.as_u16(),
-        "detail": WIDGET_CAPTCHA_REQUIRED.description,
-        "instance": scope.request_id,
-        "site_key": turnstile_site_key(&state.ctx),
-    });
-    stamp_origin(
-        (WIDGET_CAPTCHA_REQUIRED.status, Json(body)).into_response(),
-        origin,
-    )
+    let problem = Problem::new(&WIDGET_CAPTCHA_REQUIRED)
+        .with_detail(WIDGET_CAPTCHA_REQUIRED.description)
+        .instance(&scope.request_id)
+        .with_extension("site_key", turnstile_site_key(&state.ctx));
+    stamp_origin(problem.into_response(), origin)
 }
 
 /// Stamps a response with the request's own origin and `Vary: Origin` —

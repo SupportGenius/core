@@ -39,7 +39,10 @@ const SOURCES: &str = "/v1/support/sources";
 const SEARCH: &str = "/v1/support/search";
 const MESSAGES: &str = "/v1/support/messages";
 const KEYS: &str = "/v1/support/keys";
-const PROBLEMS: &str = "https://factory0.ventures/problems/";
+/// The problem `type` base: since cratefield-core 0.7 every problem is named
+/// under the serving venture's own `<public_url>/problems/`, and
+/// `TestHarness` serves as `https://test.example`.
+const PROBLEMS: &str = "https://test.example/problems/";
 
 /// A buffered response: every route here answers JSON (success or
 /// problem+json), so the body is parsed once, eagerly.
