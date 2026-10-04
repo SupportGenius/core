@@ -27,6 +27,10 @@
     "file": "0021_escalation_0007_routing.sql",
     "sha256": "9575f8886435cd4f1613db213d33213f3995c3a7d46b683b970b2caabb01d997"
   },
+  "escalation/0008": {
+    "file": "0022_escalation_0008_follow.sql",
+    "sha256": "ec8b34f2281410869bc89468291a77d3e82f6a209a57ac487d1d7636617bd82b"
+  },
   "support/0001": {
     "file": "0007_support_0001_init.sql",
     "sha256": "c55b0fb12a7dcdc620659f2dc77989771cfd4df761c41b9afc3a1baf60c3f3cc"

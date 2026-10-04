@@ -11,7 +11,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 
-use cratefield_core::Severity;
+use cratefield_core::{Severity, TicketState};
 
 /// The width of one stage's band in the audit `seq` numbering: a stage's
 /// events occupy `[ordinal * SEQ_BAND, ordinal * SEQ_BAND + SEQ_BAND)`.
@@ -35,6 +35,11 @@ pub enum Stage {
     File,
     /// Follow up / notify the customer.
     Notify,
+    /// Poll the tracker for the ticket's state and tell the customer when
+    /// it changes. Not once-only like the other stages: the outbox row
+    /// reschedules itself until the ticket closes (see the pipeline's
+    /// `run_follow`).
+    Follow,
 }
 
 impl Stage {
@@ -46,6 +51,7 @@ impl Stage {
             Stage::Judge => "judge",
             Stage::File => "file",
             Stage::Notify => "notify",
+            Stage::Follow => "follow",
         }
     }
 
@@ -58,14 +64,17 @@ impl Stage {
             "judge" => Some(Stage::Judge),
             "file" => Some(Stage::File),
             "notify" => Some(Stage::Notify),
+            "follow" => Some(Stage::Follow),
             _ => None,
         }
     }
 
     /// The stage's position in the pipeline: `Draft` = 1, `Judge` = 2,
-    /// `File` = 3, `Notify` = 4. Band 0 belongs to the intake event, so
-    /// the audit trail reads intake first ([`INTAKE_SEQ`]) without intake
-    /// needing to be a stage.
+    /// `File` = 3, `Notify` = 4, `Follow` = 5. Band 0 belongs to the intake
+    /// event, so the audit trail reads intake first ([`INTAKE_SEQ`]) without
+    /// intake needing to be a stage. `Follow` sits above `Notify` so its
+    /// (repeating) status events are banded after the notifications they
+    /// come from.
     #[must_use]
     pub fn ordinal(self) -> i64 {
         match self {
@@ -73,6 +82,7 @@ impl Stage {
             Stage::Judge => 2,
             Stage::File => 3,
             Stage::Notify => 4,
+            Stage::Follow => 5,
         }
     }
 }
@@ -497,6 +507,13 @@ pub struct StagePayload {
     pub ticket_id: String,
     /// The tenant the ticket belongs to.
     pub tenant_id: String,
+    /// The `sg_ticket_events` row a status-update `notify` is about,
+    /// present only on a notify the follow stage enqueued after a tracker
+    /// state change. Absent (and omitted from the wire form) for every
+    /// other stage, so the payload a filing enqueues is byte-for-byte what
+    /// it always was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
 }
 
 /// The closed set of audit events the pipeline writes to
@@ -564,6 +581,14 @@ pub enum EventKind {
     /// A closed built-in ticket was reopened (`filed` again) through the
     /// same route; `detail` carries the previous status.
     Reopened,
+    /// A follow-up poll found the tracker's state changed from the one
+    /// last recorded; `detail` carries `{"from": <state>, "to": <state>}`.
+    StatusChanged,
+    /// The follow stage's failure kind. The follow stage never dead-letters
+    /// — a failed poll reschedules itself — so this is the vocabulary entry
+    /// the shared failure classifier names for it, not a row a healthy
+    /// pipeline writes in the ordinary course.
+    FollowFailed,
 }
 
 impl EventKind {
@@ -593,6 +618,8 @@ impl EventKind {
             EventKind::DuplicateIgnored => "duplicate_ignored",
             EventKind::Closed => "closed",
             EventKind::Reopened => "reopened",
+            EventKind::StatusChanged => "status_changed",
+            EventKind::FollowFailed => "follow_failed",
         }
     }
 }
@@ -625,6 +652,8 @@ impl std::str::FromStr for EventKind {
             "duplicate_ignored" => Ok(EventKind::DuplicateIgnored),
             "closed" => Ok(EventKind::Closed),
             "reopened" => Ok(EventKind::Reopened),
+            "status_changed" => Ok(EventKind::StatusChanged),
+            "follow_failed" => Ok(EventKind::FollowFailed),
             _ => Err(crate::error::Error::Decode(format!(
                 "unknown event kind `{raw}`"
             ))),
@@ -697,6 +726,10 @@ pub struct Ticket {
     /// How many later tickets have linked to this one as a duplicate.
     /// Incremented by the judge stage's duplicate branch; zero otherwise.
     pub match_count: i64,
+    /// The tracker's last-reported state, written `open` when the file
+    /// stage succeeds and refreshed by every follow-up poll. `None` until
+    /// the ticket is filed.
+    pub tracker_state: Option<TicketState>,
     /// RFC 3339.
     pub created_at: String,
     /// RFC 3339; every write refreshes it.
@@ -736,6 +769,7 @@ mod tests {
             (Stage::Judge, "judge", 2),
             (Stage::File, "file", 3),
             (Stage::Notify, "notify", 4),
+            (Stage::Follow, "follow", 5),
         ] {
             assert_eq!(stage.as_topic(), topic);
             assert_eq!(Stage::from_topic(topic), Some(stage));
@@ -754,8 +788,10 @@ mod tests {
         assert!(stage_seq(Stage::Draft, 9) < stage_seq(Stage::Judge, 0));
         assert!(stage_seq(Stage::Judge, 0) < stage_seq(Stage::File, 0));
         assert!(stage_seq(Stage::File, 0) < stage_seq(Stage::Notify, 0));
+        assert!(stage_seq(Stage::Notify, 0) < stage_seq(Stage::Follow, 0));
         assert_eq!(stage_seq(Stage::Draft, 0), 10);
         assert_eq!(stage_seq(Stage::Notify, 4), 44);
+        assert_eq!(stage_seq(Stage::Follow, 0), 50);
     }
 
     #[test]
@@ -829,6 +865,8 @@ mod tests {
             EventKind::DuplicateIgnored,
             EventKind::Closed,
             EventKind::Reopened,
+            EventKind::StatusChanged,
+            EventKind::FollowFailed,
         ] {
             assert_eq!(kind.as_str().parse::<EventKind>(), Ok(kind));
             let wire = serde_json::to_string(&kind).expect("serialize");
@@ -1022,10 +1060,13 @@ mod tests {
         assert!(decoded.kind_ok);
 
         // The stage payload round-trips through the exact string form that
-        // rides in the outbox `payload` column.
+        // rides in the outbox `payload` column. A stage payload with no
+        // `event_id` omits the field entirely (every stage but a
+        // status-update notify).
         let payload = StagePayload {
             ticket_id: "01JDEMO".to_owned(),
             tenant_id: "acme".to_owned(),
+            event_id: None,
         };
         let wire = serde_json::to_string(&payload).expect("serialize");
         assert_eq!(
@@ -1035,6 +1076,21 @@ mod tests {
         assert_eq!(
             wire, r#"{"ticket_id":"01JDEMO","tenant_id":"acme"}"#,
             "the payload column stores exactly these two fields"
+        );
+
+        // A status-update notify carries the event id it is about.
+        let with_event = StagePayload {
+            event_id: Some("01JEVENT".to_owned()),
+            ..payload.clone()
+        };
+        let wire = serde_json::to_string(&with_event).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<StagePayload>(&wire).expect("valid"),
+            with_event
+        );
+        assert_eq!(
+            wire,
+            r#"{"ticket_id":"01JDEMO","tenant_id":"acme","event_id":"01JEVENT"}"#
         );
     }
 

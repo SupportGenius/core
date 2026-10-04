@@ -470,9 +470,9 @@ async fn notify_skips_with_an_explicit_reason_when_no_mailer_is_wired() {
     );
 }
 
-/// ...and with a `Mailer` wired, the reason is the honest one: intake
-/// carries no customer address, so there is no recipient and nothing is
-/// sent.
+/// ...and with a `Mailer` wired but no contact stored for the
+/// conversation, the reason is the honest one: there is no recipient and
+/// nothing is sent.
 #[pollster::test]
 async fn notify_skips_with_an_explicit_reason_when_there_is_no_recipient() {
     let mut fixture = happy();
@@ -490,5 +490,54 @@ async fn notify_skips_with_an_explicit_reason_when_there_is_no_recipient() {
     assert!(
         mailer.sent().is_empty(),
         "no recipient means nothing was sent"
+    );
+}
+
+/// Issue #26: a contact stored for the conversation is the notify
+/// recipient, and the address reaches the send call and nowhere else — the
+/// audit row records the message but never the address.
+#[pollster::test]
+async fn a_stored_contact_is_the_notify_recipient() {
+    use cratefield_core::{Clock as _, Database as _};
+
+    let mut fixture = happy();
+    let mailer = Arc::new(FakeMailer::new(MailerMode::SendOk));
+    fixture.mailer = Some(mailer.clone());
+    let contact = module_escalation::store::upsert_contact_stmt(
+        support::TENANT,
+        support::CONVERSATION,
+        "jane@acme.test",
+        &support::format_at(fixture.clock.now()),
+    );
+    pollster::block_on(fixture.db.batch_atomic(&[contact])).expect("contact seeds");
+
+    let pipeline = fixture.pipeline();
+    support::drain_all(&pipeline);
+
+    let sent = mailer.sent();
+    assert_eq!(sent.len(), 1, "the notify stage sent to the stored contact");
+    assert_eq!(sent[0].to, "jane@acme.test");
+    assert!(
+        sent[0]
+            .idempotency_key
+            .as_deref()
+            .is_some_and(|key| key.contains(&fixture.ticket_id)),
+        "the filing notice carries a per-ticket key: {:?}",
+        sent[0].idempotency_key
+    );
+
+    let notified = {
+        let events = support::events(&fixture);
+        support::event_of_kind(&events, EventKind::Notified).clone()
+    };
+    let detail = notified.detail.as_ref().expect("a send carries its detail");
+    assert_eq!(
+        detail["message"].as_str().expect("message"),
+        sent[0].text,
+        "the audit's message is the one sent"
+    );
+    assert!(
+        !detail.to_string().contains("jane@acme.test"),
+        "the address never reaches the audit row: {detail}"
     );
 }

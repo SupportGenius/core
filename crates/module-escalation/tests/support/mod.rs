@@ -236,6 +236,7 @@ pub(crate) fn migrated_db() -> Arc<SqliteDatabase> {
             module_escalation::MIGRATION_ESCALATION,
             module_escalation::MIGRATION_DUPLICATES,
             module_escalation::MIGRATION_ROUTING,
+            module_escalation::MIGRATION_FOLLOW,
         ],
     )
     .expect("migration applies");
@@ -489,6 +490,7 @@ pub(crate) fn requeue_file_stage(fixture: &Fixture) {
         &fixture.ticket_id,
         TENANT,
         Stage::File,
+        None,
         &format_at(fixture.clock.now()),
     );
     pollster::block_on(fixture.db.batch_atomic(&[stmt])).expect("the redelivered row commits");
@@ -610,4 +612,20 @@ pub(crate) fn outbox_count(fixture: &Fixture) -> usize {
     )
     .expect("outbox count read");
     rows.rows.len()
+}
+
+/// How many rows the escalation outbox holds under one topic. A filing
+/// leaves a `follow` row behind (it reschedules itself until the ticket
+/// closes), so an assertion about "everything else is finished" wants this
+/// rather than the raw [`outbox_count`].
+#[must_use]
+pub(crate) fn outbox_count_of(fixture: &Fixture, topic: &str) -> usize {
+    let stmt = Statement::with_values(
+        format!("SELECT topic FROM {OUTBOX_TABLE} WHERE topic = ?"),
+        vec![topic.to_owned().into()],
+    );
+    pollster::block_on(fixture.db.query(&stmt))
+        .expect("outbox count read")
+        .rows
+        .len()
 }

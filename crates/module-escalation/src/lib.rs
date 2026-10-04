@@ -45,10 +45,10 @@ pub use tenants::TenantDirectory;
 #[cfg(feature = "testing")]
 pub mod testing;
 
-/// The module's migrations: the five `sg_*` tables in the portable SQL
-/// subset (issue #4). The outbox/inbox blocks inside are generated from
-/// core's `create_table_sql` helpers — see the migration file's header
-/// before touching them.
+/// The escalation module's core migrations: the `sg_*` schema in the
+/// portable SQL subset (issue #4). The outbox/inbox blocks inside are
+/// generated from core's `create_table_sql` helpers — see the migration
+/// file's header before touching them.
 pub const MIGRATION_ESCALATION: SqlMigration = SqlMigration::new(
     "0001",
     "escalation",
@@ -70,6 +70,18 @@ pub const MIGRATION_ROUTING: SqlMigration = SqlMigration::new(
     "0007",
     "routing",
     include_str!("../migrations/sqlite/0007_routing.sql"),
+);
+
+/// Follow-up polling and customer contact (issue #26): the
+/// `sg_tickets.tracker_state` column and the `sg_contacts` table. Appended
+/// after the embedded secrets schema (0003-0006) and routing (0007) rather
+/// than renumbering them: those files are already collected into
+/// `ventures/supportgenius/migrations` and locked by sha256, so a new highest
+/// id adds a file where a renumber would rewrite history.
+pub const MIGRATION_FOLLOW: SqlMigration = SqlMigration::new(
+    "0008",
+    "follow",
+    include_str!("../migrations/sqlite/0008_follow.sql"),
 );
 
 /// One `cratefield-secrets` migration under this module's own id,
@@ -228,6 +240,7 @@ impl Module for Escalation {
             "sg_ticket_links",
             "sg_destinations",
             "sg_routes",
+            "sg_contacts",
             "sg_escalation_outbox",
             "sg_escalation_inbox",
             "harness_secret_keys",
@@ -299,6 +312,21 @@ impl Module for Escalation {
                 redacted: &[],
                 subject_via: None,
             },
+            // The contact address a turn supplied, so the filed ticket's
+            // notifications have a recipient. Erased by the address itself
+            // — the subject column holds the email verbatim (module-support
+            // wrote it through `HandoffSink::remember_contact`), so a
+            // subject erasure reaches it directly.
+            PersonalDataSet {
+                table: "sg_contacts",
+                subject: "email",
+                kind: DataKind::Contact,
+                disposition: Disposition::Erase,
+                description: "The contact address you asked us to reach you at for this \
+                              conversation's escalation.",
+                redacted: &[],
+                subject_via: None,
+            },
             PersonalDataSet::none(
                 "sg_destinations",
                 "Per-tenant tracker configuration: which tracker a tenant files into and a \
@@ -360,12 +388,14 @@ impl Module for Escalation {
     /// crate's own `SQLITE_MIGRATIONS`/`POSTGRES_MIGRATIONS` and re-id-ed
     /// (the `control-plane-dashboard` idiom) so the embedded copy cannot
     /// drift. The module files are portable SQL, so the postgres set carries
-    /// the same bytes for ids `0001`, `0002` and `0007`, but the secrets
-    /// schema is not (BLOB vs
-    /// BYTEA, per-engine triggers), so each set embeds its own dialect's.
+    /// the same bytes for ids `0001`, `0002`, `0007` and `0008`, but the
+    /// secrets schema is not (BLOB vs BYTEA, per-engine triggers), so each set
+    /// embeds its own dialect's. `0007` and `0008` are appended after the
+    /// secrets schema rather than inserted before it: the intermediate files
+    /// are already collected and locked by sha256 (see [`MIGRATION_FOLLOW`]).
     /// The postgres set must be complete: `select_set` applies it wholesale.
     fn migrations(&self) -> Migrations {
-        const SQLITE: [SqlMigration; 7] = [
+        const SQLITE: [SqlMigration; 8] = [
             MIGRATION_ESCALATION,
             MIGRATION_DUPLICATES,
             sub_migration(
@@ -393,11 +423,12 @@ impl Module for Escalation {
                 "secrets-store-attribution",
             ),
             MIGRATION_ROUTING,
+            MIGRATION_FOLLOW,
         ];
         // The array is the apply order; this refuses a gap, a duplicate
         // or an entry out of order at build time.
         const _: () = cratefield_core::assert_migration_set(&SQLITE);
-        const POSTGRES: [SqlMigration; 7] = [
+        const POSTGRES: [SqlMigration; 8] = [
             MIGRATION_ESCALATION,
             MIGRATION_DUPLICATES,
             sub_migration(
@@ -425,6 +456,7 @@ impl Module for Escalation {
                 "secrets-store-attribution",
             ),
             MIGRATION_ROUTING,
+            MIGRATION_FOLLOW,
         ];
         const _: () = cratefield_core::assert_migration_set(&POSTGRES);
         Migrations {
@@ -658,13 +690,13 @@ mod tests {
         // cron drainer does not.
         assert!(module.optional().contains(&Port::Signer));
         let tables = module.tables();
-        assert_eq!(tables.len(), 10);
+        assert_eq!(tables.len(), 11);
         let sg: Vec<&str> = tables
             .iter()
             .copied()
             .filter(|table| table.starts_with("sg_"))
             .collect();
-        assert_eq!(sg.len(), 7, "the module owns seven sg_ tables");
+        assert_eq!(sg.len(), 8, "the module owns eight sg_ tables");
         let harness: Vec<&str> = tables
             .iter()
             .copied()
@@ -693,14 +725,16 @@ mod tests {
     #[test]
     fn the_migration_set_is_the_module_files_then_the_embedded_secrets_schema() {
         let migrations = module().migrations();
-        assert_eq!(migrations.sqlite.len(), 7);
+        assert_eq!(migrations.sqlite.len(), 8);
         assert_eq!(
             migrations
                 .sqlite
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            ["0001", "0002", "0003", "0004", "0005", "0006", "0007"]
+            [
+                "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008"
+            ]
         );
         assert!(migrations.sqlite[0].sql.contains("CREATE TABLE"));
         assert!(migrations.sqlite[1].sql.contains("sg_ticket_links"));
@@ -711,13 +745,17 @@ mod tests {
             migrations.sqlite[2].sql,
             cratefield_secrets::SQLITE_MIGRATIONS[0].sql
         );
+        // The follow migration is appended after the secrets schema and
+        // carries the module's own portable bytes.
+        assert!(migrations.sqlite[7].sql.contains("sg_contacts"));
         // The postgres set is complete (select_set applies it wholesale),
-        // carrying the same portable module files for 0001-0002 and 0007
-        // and the secrets crate's own postgres bytes thereafter.
-        assert_eq!(migrations.postgres.len(), 7);
+        // carrying the same portable module files for 0001-0002, 0007 and
+        // 0008 and the secrets crate's own postgres bytes thereafter.
+        assert_eq!(migrations.postgres.len(), 8);
         assert_eq!(migrations.postgres[0].sql, migrations.sqlite[0].sql);
         assert_eq!(migrations.postgres[1].sql, migrations.sqlite[1].sql);
         assert_eq!(migrations.postgres[6].sql, migrations.sqlite[6].sql);
+        assert_eq!(migrations.postgres[7].sql, migrations.sqlite[7].sql);
         assert_eq!(
             migrations.postgres[2].sql,
             cratefield_secrets::POSTGRES_MIGRATIONS[0].sql
