@@ -13,7 +13,9 @@ mix: the harness admin token (`Authorization: Bearer $ADMIN_TOKEN`) for
 the `/admin/*` routes, and a tenant API key (the `sg_…` bearer minted by
 `POST /admin/tenants`) for everything a tenant does. Every guard runs
 before the body is parsed. The key routes share one per-tenant budget on
-the optional `RateLimiter` port.
+the optional `RateLimiter` port. The staff routes (`/inbox` and
+`/conversations/*`) need a **staff key** — a tenant key minted with a
+`staff_id` — and answer `403` for a plain tenant key.
 
 | Route | Credential | What it does |
 | --- | --- | --- |
@@ -31,8 +33,12 @@ the optional `RateLimiter` port.
 | `POST /connectors` | API key | `{"kind": "sitemap" \| "url_prefix", "url"}` or `{"kind": "github", "owner", "repo", "path_glob"?, "ref"?, "credential_ref"?}`, with optional `max_pages`/`max_bytes`/`max_depth` → `201`; the crawl runs asynchronously and re-syncs on cron |
 | `GET /search?q=…&limit=…` | API key | BM25 over the tenant's own index |
 | `POST /messages` | API key | `{"message", "conversation_id"?, "contact"?: {"email"}}` → one support turn |
+| `GET /inbox?state=…` | staff key | the tenant's conversations in one state (`bot`, `waiting_for_human`, `human`, `closed`; default `waiting_for_human`), newest first, at most 100 |
+| `POST /conversations/{id}/takeover` | staff key | a person takes the conversation: `state=human`, `assignee` = caller; answers the transcript |
+| `POST /conversations/{id}/reply` | staff key | `{"body", "save_as_answer"?}` → append a `staff` message as the assignee; `save_as_answer` also ingests a reviewed source and returns its `source_id` |
+| `POST /conversations/{id}/handback` | staff key | `{"close"?}` → `state=bot` (or `closed`), `assignee` cleared; the bot resumes with the staff turns in its history |
 | `GET /keys` | API key | the tenant's own API keys — `{kid, label, created_at}` each, oldest first |
-| `POST /keys` | API key | `{"label"?}` → mint another API key for the tenant (shown once, like provisioning) |
+| `POST /keys` | API key | `{"label"?, "staff_id"?}` → mint another API key for the tenant (shown once, like provisioning); a `staff_id` makes it a staff key |
 | `DELETE /keys/{kid}` | API key | delete one of the tenant's own keys; `204`, or `404` for a foreign/unknown kid and `409` for the last remaining key |
 
 ### Sources
@@ -232,6 +238,34 @@ before and nothing files a ticket. The port declares `Tracker` and
 `Mailer` optional too, because a kicked escalation run reads them and
 support's `ModuleContext` is a filtered view; a deployment with no sink
 never touches them.
+
+### Human handoff
+
+A conversation has a `state`: `bot`, `waiting_for_human`, `human` or
+`closed` (migration `0009`, independent of the older `status` /
+`needs_escalation` pair, which are left as they were). An escalating turn
+moves `bot` to `waiting_for_human` and the conversation appears in a staff
+`GET /inbox`. A **staff key** is a tenant key minted with a `staff_id`
+(`POST /keys`); the caller it names is the `assignee`. `takeover` is
+allowed from `bot` or `waiting_for_human` and is idempotent for the
+assignee already holding it; another holder, or a `closed` conversation,
+is `409`. While `state=human`, a customer turn stores its message and
+answers `outcome: "human"` with no model call and no answer; a `closed`
+conversation answers `409`. `reply` writes a `staff` message only for the
+assignee. `handback` returns the conversation to `bot` (or `closed`) and
+the bot resumes, now with the staff turns — rendered as `Support agent: …`
+— in the history the model sees.
+
+**A saved correction becomes a reviewed source.** `reply` with
+`save_as_answer: true` ingests, in the same atomic batch as the message, a
+source built from the customer's last message (its title) and the agent's
+answer, marked `reviewed`, with `reviewed_by` and
+`reviewed_conversation_id`. Retrieval over-fetches and multiplies the
+score of any chunk whose source is reviewed by `REVIEWED_BOOST` (1.5)
+before cutting back to `k`, so a correction written to be the answer wins
+a close call without beating a clearly better document. Sources expose
+`reviewed` / `reviewed_by` / `reviewed_conversation_id`, and a saved
+correction is deleted through the ordinary `DELETE /sources/{id}`.
 
 ## Retrieval, and its constraints on purpose
 

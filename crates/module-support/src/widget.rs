@@ -432,7 +432,25 @@ pub(crate) async fn get_widget_conversation(
         .await?
         .ok_or_else(gone)?;
     let messages = store::conversation_messages(db, &tenant_id, &conversation_id).await?;
-    let transcript: Vec<Value> = messages
+    let mut response = Json(json!({
+        "conversation_id": conversation.id,
+        "status": conversation.status,
+        "needs_escalation": conversation.needs_escalation,
+        "messages": transcript_json(&messages),
+    }))
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(stamp_origin(response, &origin))
+}
+
+/// The widget's message shape — the body the visitor was shown (never
+/// `model_answer`), the assistant turn's outcome and its retrieved-only
+/// citations. Shared with the staff takeover transcript (`crate::human`),
+/// so an agent sees exactly what the visitor did.
+pub(crate) fn transcript_json(messages: &[store::WidgetMessage]) -> Vec<Value> {
+    messages
         .iter()
         .map(|message| {
             json!({
@@ -448,18 +466,7 @@ pub(crate) async fn get_widget_conversation(
                 "created_at": message.created_at,
             })
         })
-        .collect();
-    let mut response = Json(json!({
-        "conversation_id": conversation.id,
-        "status": conversation.status,
-        "needs_escalation": conversation.needs_escalation,
-        "messages": transcript,
-    }))
-    .into_response();
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    Ok(stamp_origin(response, &origin))
+        .collect()
 }
 
 /// `GET /v1/support/w.js` — the widget script, served from the API origin

@@ -99,6 +99,10 @@ pub(crate) struct ApiKeyRow {
     /// signing-key generation, which lives in config alone.
     pub kid: String,
     pub label: String,
+    /// The staff member this key belongs to (issue #35), a caller-chosen
+    /// handle. `None` — a customer or integration key — may not use the
+    /// staff routes (`crate::human`).
+    pub staff_id: Option<String>,
     pub created_at: String,
 }
 
@@ -126,6 +130,9 @@ pub(crate) struct ChunkRow {
     pub source_id: String,
     pub title: String,
     pub body: String,
+    /// The `reviewed` flag of the chunk's source (issue #35): retrieval
+    /// boosts a reviewed chunk before it truncates to `k`.
+    pub reviewed: bool,
 }
 
 /// Renders and runs one statement.
@@ -179,12 +186,13 @@ pub(crate) async fn insert_api_key(db: &dyn Database, key: &ApiKeyRow) -> Result
     let mut insert = Query::insert();
     insert
         .into_table(iden("sg_api_keys"))
-        .columns(["id", "tenant_id", "kid", "label", "created_at"])
+        .columns(["id", "tenant_id", "kid", "label", "staff_id", "created_at"])
         .values_panic([
             key.id.clone().into(),
             key.tenant_id.clone().into(),
             key.kid.clone().into(),
             key.label.clone().into(),
+            key.staff_id.clone().into(),
             key.created_at.clone().into(),
         ]);
     execute(db, &Statement::render(&insert)).await
@@ -202,7 +210,7 @@ pub(crate) async fn find_api_key(
 ) -> Result<Option<ApiKeyRow>, DbError> {
     let mut select = Query::select();
     select
-        .columns(["id", "tenant_id", "kid", "label", "created_at"])
+        .columns(["id", "tenant_id", "kid", "label", "staff_id", "created_at"])
         .from(iden("sg_api_keys"))
         .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
         .and_where(Expr::col(iden("kid")).eq(kid));
@@ -219,7 +227,7 @@ pub(crate) async fn list_api_keys(
 ) -> Result<Vec<ApiKeyRow>, DbError> {
     let mut select = Query::select();
     select
-        .columns(["id", "tenant_id", "kid", "label", "created_at"])
+        .columns(["id", "tenant_id", "kid", "label", "staff_id", "created_at"])
         .from(iden("sg_api_keys"))
         .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
         .order_by(iden("created_at"), sea_query::Order::Asc)
@@ -272,6 +280,7 @@ fn api_key_from(row: &cratefield_core::Row) -> ApiKeyRow {
         tenant_id: row.get("tenant_id").unwrap_or_default(),
         kid: row.get("kid").unwrap_or_default(),
         label: row.get("label").unwrap_or_default(),
+        staff_id: row.get::<Option<String>>("staff_id").unwrap_or_default(),
         created_at: row.get("created_at").unwrap_or_default(),
     }
 }
@@ -395,6 +404,33 @@ pub(crate) fn source_with_chunks_statements(
     source: &SourceRow,
     chunks: &[Chunk],
 ) -> Vec<Statement> {
+    source_statements(source, chunks, None)
+}
+
+/// The statements for a source a support agent saved from a reply (issue
+/// #35): the same rows as [`source_with_chunks_statements`], with the
+/// source marked `reviewed` and its provenance — the staff id that wrote
+/// it and the conversation it came from.
+pub(crate) fn reviewed_source_with_chunks_statements(
+    source: &SourceRow,
+    chunks: &[Chunk],
+    reviewed_by: &str,
+    reviewed_conversation_id: &str,
+) -> Vec<Statement> {
+    source_statements(
+        source,
+        chunks,
+        Some((reviewed_by, reviewed_conversation_id)),
+    )
+}
+
+/// The shared body of both: the source row (reviewed or not), its chunks,
+/// their postings and the statistics, all in one batch.
+fn source_statements(
+    source: &SourceRow,
+    chunks: &[Chunk],
+    reviewed: Option<(&str, &str)>,
+) -> Vec<Statement> {
     let mut statements: Vec<Statement> = Vec::new();
 
     let mut insert_source = Query::insert();
@@ -407,6 +443,9 @@ pub(crate) fn source_with_chunks_statements(
             "url",
             "external_id",
             "byte_len",
+            "reviewed",
+            "reviewed_by",
+            "reviewed_conversation_id",
             "created_at",
             "updated_at",
         ])
@@ -417,6 +456,11 @@ pub(crate) fn source_with_chunks_statements(
             source.url.clone().into(),
             source.external_id.clone().into(),
             source.byte_len.into(),
+            i64::from(reviewed.is_some()).into(),
+            reviewed.map(|(by, _)| by.to_owned()).into(),
+            reviewed
+                .map(|(_, conversation)| conversation.to_owned())
+                .into(),
             source.created_at.clone().into(),
             source.updated_at.clone().into(),
         ]);
@@ -673,6 +717,11 @@ pub(crate) struct SourceSummary {
     pub byte_len: i64,
     pub updated_at: String,
     pub chunk_count: i64,
+    /// A source a support agent wrote as a correction (issue #35), with
+    /// the staff id that saved it and the conversation it came from.
+    pub reviewed: bool,
+    pub reviewed_by: Option<String>,
+    pub reviewed_conversation_id: Option<String>,
 }
 
 /// The source-list columns plus their grouped chunk count: a `LEFT JOIN`
@@ -696,6 +745,18 @@ fn summary_select() -> sea_query::SelectStatement {
         .expr_as(
             Expr::col((iden("s"), iden("updated_at"))),
             Alias::new("updated_at"),
+        )
+        .expr_as(
+            Expr::col((iden("s"), iden("reviewed"))),
+            Alias::new("reviewed"),
+        )
+        .expr_as(
+            Expr::col((iden("s"), iden("reviewed_by"))),
+            Alias::new("reviewed_by"),
+        )
+        .expr_as(
+            Expr::col((iden("s"), iden("reviewed_conversation_id"))),
+            Alias::new("reviewed_conversation_id"),
         )
         .expr_as(
             Func::count(Expr::col((iden("c"), iden("id")))),
@@ -725,6 +786,9 @@ fn summary_from(row: &cratefield_core::Row) -> Option<SourceSummary> {
         byte_len: row.get("byte_len")?,
         updated_at: row.get("updated_at")?,
         chunk_count: row.get("chunk_count")?,
+        reviewed: row.get::<i64>("reviewed").unwrap_or(0) != 0,
+        reviewed_by: row.get("reviewed_by").unwrap_or_default(),
+        reviewed_conversation_id: row.get("reviewed_conversation_id").unwrap_or_default(),
     })
 }
 
@@ -751,6 +815,9 @@ pub(crate) async fn list_sources(
             (iden("s"), iden("external_id")),
             (iden("s"), iden("byte_len")),
             (iden("s"), iden("updated_at")),
+            (iden("s"), iden("reviewed")),
+            (iden("s"), iden("reviewed_by")),
+            (iden("s"), iden("reviewed_conversation_id")),
         ])
         .order_by((iden("s"), iden("id")), sea_query::Order::Asc)
         .limit(u64::from(limit));
@@ -776,6 +843,9 @@ pub(crate) async fn find_source_summary(
             (iden("s"), iden("external_id")),
             (iden("s"), iden("byte_len")),
             (iden("s"), iden("updated_at")),
+            (iden("s"), iden("reviewed")),
+            (iden("s"), iden("reviewed_by")),
+            (iden("s"), iden("reviewed_conversation_id")),
         ]);
     let rows = db.query(&Statement::render(&select)).await?;
     Ok(rows.rows.first().and_then(summary_from))
@@ -1341,9 +1411,10 @@ pub(crate) async fn postings_for(
 }
 
 /// Bodies, source ids and source titles for the top-ranked chunk ids.
-/// The id list is the ranker's shortlist (at most the `limit` clamp), so
-/// the `IN` here stays small — like [`postings_for`], one bounded read
-/// among a query's fixed budget, never a scan of the index.
+/// The id list is the ranker's shortlist — `k` over-fetched a small
+/// constant ([`crate::handlers::REVIEWED_BOOST`]'s headroom), so the `IN`
+/// stays small — like [`postings_for`], one bounded read among a query's
+/// fixed budget, never a scan of the index.
 pub(crate) async fn chunks_by_id(
     db: &dyn Database,
     tenant_id: &str,
@@ -1361,6 +1432,10 @@ pub(crate) async fn chunks_by_id(
         )
         .expr_as(Expr::col((iden("s"), iden("title"))), Alias::new("title"))
         .expr_as(Expr::col((iden("c"), iden("body"))), Alias::new("body"))
+        .expr_as(
+            Expr::col((iden("s"), iden("reviewed"))),
+            Alias::new("reviewed"),
+        )
         .from_as(iden("sg_chunks"), iden("c"))
         .join_as(
             sea_query::JoinType::InnerJoin,
@@ -1382,6 +1457,7 @@ pub(crate) async fn chunks_by_id(
                 source_id: row.get("source_id")?,
                 title: row.get("title")?,
                 body: row.get("body")?,
+                reviewed: row.get::<i64>("reviewed").unwrap_or(0) != 0,
             })
         })
         .collect())
@@ -1389,10 +1465,13 @@ pub(crate) async fn chunks_by_id(
 
 /// A conversation as loaded for a turn. `status` is not loaded: in this
 /// schema `status = 'escalated'` iff `needs_escalation = 1`, so the flag
-/// alone carries everything the turn needs.
+/// alone carries everything the turn needs. `state`/`assignee` (issue
+/// #35) do too: they say who answers the next customer turn.
 pub(crate) struct ConversationRow {
     pub id: String,
     pub needs_escalation: bool,
+    pub state: String,
+    pub assignee: Option<String>,
 }
 
 /// The conversation `conversation_id`, **scoped to the tenant**: a row
@@ -1405,7 +1484,7 @@ pub(crate) async fn find_conversation(
 ) -> Result<Option<ConversationRow>, DbError> {
     let mut select = Query::select();
     select
-        .columns(["id", "needs_escalation"])
+        .columns(["id", "needs_escalation", "state", "assignee"])
         .from(iden("sg_conversations"))
         .and_where(Expr::col(iden("id")).eq(conversation_id))
         .and_where(Expr::col(iden("tenant_id")).eq(tenant_id));
@@ -1413,6 +1492,9 @@ pub(crate) async fn find_conversation(
     Ok(rows.rows.first().map(|row| ConversationRow {
         id: row.get("id").unwrap_or_default(),
         needs_escalation: row.get::<i64>("needs_escalation").unwrap_or(0) != 0,
+        // A row written before 0009 reads the column default back.
+        state: row.get("state").unwrap_or_default(),
+        assignee: row.get::<Option<String>>("assignee").unwrap_or_default(),
     }))
 }
 
@@ -1564,6 +1646,18 @@ pub(crate) async fn upsert_tenant_settings(
 
 pub(crate) const ROLE_USER: &str = "user";
 pub(crate) const ROLE_ASSISTANT: &str = "assistant";
+/// A message a support agent wrote (issue #35). Rendered in the transcript
+/// like the assistant side and tolerated by everything that reads roles.
+pub(crate) const ROLE_STAFF: &str = "staff";
+
+/// Who answers the next customer turn (issue #35). `status` and
+/// `needs_escalation` stay monotonic ("this was escalated"); `state` says
+/// where the conversation is *now*, so a handback to the bot does not
+/// clear the escalation that put a person in it.
+pub(crate) const STATE_BOT: &str = "bot";
+pub(crate) const STATE_WAITING: &str = "waiting_for_human";
+pub(crate) const STATE_HUMAN: &str = "human";
+pub(crate) const STATE_CLOSED: &str = "closed";
 
 const CONVERSATION_OPEN: &str = "open";
 const CONVERSATION_ESCALATED: &str = "escalated";
@@ -1623,6 +1717,9 @@ pub(crate) fn open_conversation_stmt(
     } else {
         CONVERSATION_OPEN
     };
+    // A conversation that escalates on its first turn is waiting for a
+    // person from the start; any other new one is the bot's.
+    let state = if escalated { STATE_WAITING } else { STATE_BOT };
     let mut insert = Query::insert();
     insert
         .into_table(iden("sg_conversations"))
@@ -1631,6 +1728,7 @@ pub(crate) fn open_conversation_stmt(
             "tenant_id",
             "status",
             "needs_escalation",
+            "state",
             "created_at",
             "updated_at",
         ])
@@ -1639,10 +1737,27 @@ pub(crate) fn open_conversation_stmt(
             tenant_id.to_owned().into(),
             status.into(),
             i64::from(escalated).into(),
+            state.into(),
             now.to_owned().into(),
             now.to_owned().into(),
         ]);
     Statement::render(&insert)
+}
+
+/// Moves a conversation into `waiting_for_human` — but only out of `bot`:
+/// once a person holds the conversation, a later handoff must not drag it
+/// back to the queue (the same monotonic reading `status` gets). A separate
+/// statement from [`escalate_conversation_stmt`], so the condition applies
+/// to `state` alone; it rides the same atomic batch.
+pub(crate) fn wait_for_human_stmt(tenant_id: &str, conversation_id: &str) -> Statement {
+    let mut set_waiting = Query::update();
+    set_waiting
+        .table(iden("sg_conversations"))
+        .value(iden("state"), STATE_WAITING)
+        .and_where(Expr::col(iden("id")).eq(conversation_id))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden("state")).eq(STATE_BOT));
+    Statement::render(&set_waiting)
 }
 
 /// Marks an existing conversation `escalated` — `status = 'escalated'`,
@@ -1673,8 +1788,12 @@ pub(crate) fn escalate_conversation_stmt(
 /// messages, an answer with no question behind it — cannot survive a
 /// crash between statements.
 pub(crate) fn turn_statements(turn: &Turn) -> Vec<Statement> {
+    // A handoff moves the state machine into `waiting_for_human` (see
+    // `wait_for_human_stmt`), in the same atomic batch as the turn.
+    let mut waiting = None;
     let conversation = if turn.conversation_existed {
         if turn.escalates {
+            waiting = Some(wait_for_human_stmt(&turn.tenant_id, &turn.conversation_id));
             escalate_conversation_stmt(&turn.tenant_id, &turn.conversation_id, &turn.now)
         } else {
             let mut update = Query::update();
@@ -1694,6 +1813,19 @@ pub(crate) fn turn_statements(turn: &Turn) -> Vec<Statement> {
         )
     };
 
+    // The state transition rides with the turn, so the escalation and the
+    // queue move together or not at all.
+    let mut statements = vec![conversation];
+    if let Some(waiting) = waiting {
+        statements.push(waiting);
+    }
+    statements.push(turn_message_statement(turn));
+    statements
+}
+
+/// The two messages of one turn — the visitor's question and the bot's
+/// reply — as one two-row insert, so a turn writes both or neither.
+fn turn_message_statement(turn: &Turn) -> Statement {
     let mut messages = Query::insert();
     messages
         .into_table(iden("sg_messages"))
@@ -1739,8 +1871,252 @@ pub(crate) fn turn_statements(turn: &Turn) -> Vec<Statement> {
             turn.lang.clone().into(),
             turn.now.clone().into(),
         ]);
+    Statement::render(&messages)
+}
 
-    vec![conversation, Statement::render(&messages)]
+// ---------------------------------------------------------------------------
+// Human in the loop (issue #35), support side. A conversation carries a
+// `state` saying who answers the next customer turn; a customer message
+// taken while a person holds it is stored with no bot reply; an agent's
+// `staff` turn and the correction it may save are the writes below. See
+// `crate::human` for the routes and `messages::run_turn` for the read a
+// customer turn makes of the state before it reaches the model.
+// ---------------------------------------------------------------------------
+
+/// One customer message stored while a person holds the conversation (or
+/// after it was closed): the visitor's own words and nothing else. No bot
+/// reply follows it, because the bot is not answering — and no `outcome`,
+/// which belongs to an assistant turn.
+pub(crate) struct CustomerMessage {
+    pub id: String,
+    pub conversation_id: String,
+    pub tenant_id: String,
+    /// The conversation's prior message count — the row's `seq`.
+    pub seq: i64,
+    pub body: String,
+    pub lang: Option<String>,
+    pub created_at: String,
+}
+
+/// The batch for a customer message during `human`/`closed`: the message
+/// row plus the conversation's `updated_at`, so the queue still sorts by
+/// activity even though the bot never writes the usual pair.
+pub(crate) fn customer_message_statements(message: &CustomerMessage) -> Vec<Statement> {
+    let mut insert = Query::insert();
+    insert
+        .into_table(iden("sg_messages"))
+        .columns([
+            "id",
+            "conversation_id",
+            "tenant_id",
+            "role",
+            "seq",
+            "body",
+            "model_answer",
+            "outcome",
+            "confidence_pct",
+            "citations",
+            "lang",
+            "created_at",
+        ])
+        .values_panic([
+            message.id.clone().into(),
+            message.conversation_id.clone().into(),
+            message.tenant_id.clone().into(),
+            ROLE_USER.into(),
+            message.seq.into(),
+            message.body.clone().into(),
+            Option::<String>::None.into(),
+            Option::<String>::None.into(),
+            Option::<i64>::None.into(),
+            Option::<String>::None.into(),
+            message.lang.clone().into(),
+            message.created_at.clone().into(),
+        ]);
+    let mut touch = Query::update();
+    touch
+        .table(iden("sg_conversations"))
+        .value(iden("updated_at"), message.created_at.clone())
+        .and_where(Expr::col(iden("id")).eq(message.conversation_id.as_str()))
+        .and_where(Expr::col(iden("tenant_id")).eq(message.tenant_id.as_str()));
+    vec![Statement::render(&insert), Statement::render(&touch)]
+}
+
+/// One queue entry (`GET /inbox`): a conversation and who, if anyone,
+/// holds it.
+pub(crate) struct InboxRow {
+    pub id: String,
+    pub state: String,
+    pub assignee: Option<String>,
+    pub updated_at: String,
+    pub needs_escalation: bool,
+}
+
+/// The tenant's conversations in one `state`, most recently active first.
+/// `limit` is the caller's ceiling (the route passes
+/// [`crate::human::MAX_INBOX`]); `id` breaks ties so the order — and so a
+/// repeated read — is deterministic even with equal timestamps.
+pub(crate) async fn list_inbox(
+    db: &dyn Database,
+    tenant_id: &str,
+    state: &str,
+    limit: usize,
+) -> Result<Vec<InboxRow>, DbError> {
+    let mut select = Query::select();
+    select
+        .columns(["id", "state", "assignee", "updated_at", "needs_escalation"])
+        .from(iden("sg_conversations"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden("state")).eq(state))
+        .order_by(iden("updated_at"), sea_query::Order::Desc)
+        .order_by(iden("id"), sea_query::Order::Desc)
+        .limit(u64::try_from(limit).unwrap_or(u64::MAX));
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows
+        .rows
+        .iter()
+        .filter_map(|row| {
+            Some(InboxRow {
+                id: row.get("id")?,
+                state: row.get("state")?,
+                assignee: row.get("assignee").unwrap_or_default(),
+                updated_at: row.get("updated_at")?,
+                needs_escalation: row.get::<i64>("needs_escalation").unwrap_or(0) != 0,
+            })
+        })
+        .collect())
+}
+
+/// Moves a conversation into `human`, owned by `staff_id`, but only out of
+/// `bot` or `waiting_for_human`: one a person already holds, or a closed
+/// one, is left alone. The conditional `UPDATE` is the guard — two
+/// concurrent takeovers cannot both win — and the returned row count tells
+/// the caller whether it did (the route reads the row again to say why
+/// not).
+pub(crate) async fn take_over(
+    db: &dyn Database,
+    tenant_id: &str,
+    conversation_id: &str,
+    staff_id: &str,
+    now: &str,
+) -> Result<u64, DbError> {
+    let mut update = Query::update();
+    update
+        .table(iden("sg_conversations"))
+        .values([
+            (iden("state"), STATE_HUMAN.into()),
+            (iden("assignee"), staff_id.into()),
+            (iden("updated_at"), now.into()),
+        ])
+        .and_where(Expr::col(iden("id")).eq(conversation_id))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden("state")).is_in([STATE_BOT, STATE_WAITING]));
+    db.execute(&Statement::render(&update)).await
+}
+
+/// Hands a conversation the assignee holds back to the bot (`close` false)
+/// or closes it (`close` true): the state the caller names, `assignee`
+/// cleared, `updated_at` stamped. Only the current assignee of a `human`
+/// conversation matches, so a handback by anyone else changes nothing and
+/// the returned row count says so.
+pub(crate) async fn hand_back(
+    db: &dyn Database,
+    tenant_id: &str,
+    conversation_id: &str,
+    staff_id: &str,
+    close: bool,
+    now: &str,
+) -> Result<u64, DbError> {
+    let state = if close { STATE_CLOSED } else { STATE_BOT };
+    let mut update = Query::update();
+    update
+        .table(iden("sg_conversations"))
+        .values([
+            (iden("state"), state.into()),
+            (iden("assignee"), Option::<String>::None.into()),
+            (iden("updated_at"), now.into()),
+        ])
+        .and_where(Expr::col(iden("id")).eq(conversation_id))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden("state")).eq(STATE_HUMAN))
+        .and_where(Expr::col(iden("assignee")).eq(staff_id));
+    db.execute(&Statement::render(&update)).await
+}
+
+/// A message a support agent wrote into the conversation (issue #35): the
+/// `staff` role, the agent's id in `author`. Not a decided turn — no
+/// outcome, confidence or citations.
+pub(crate) struct StaffMessage {
+    pub id: String,
+    pub conversation_id: String,
+    pub tenant_id: String,
+    pub seq: i64,
+    pub body: String,
+    pub author: String,
+    pub created_at: String,
+}
+
+/// The statement for one staff message. Paired, when the reply saves a
+/// correction, with [`reviewed_source_with_chunks_statements`] in the same
+/// atomic batch: the message and the source it produced land together.
+pub(crate) fn staff_message_statement(message: &StaffMessage) -> Statement {
+    let mut insert = Query::insert();
+    insert
+        .into_table(iden("sg_messages"))
+        .columns([
+            "id",
+            "conversation_id",
+            "tenant_id",
+            "role",
+            "seq",
+            "body",
+            "model_answer",
+            "outcome",
+            "confidence_pct",
+            "citations",
+            "lang",
+            "author",
+            "created_at",
+        ])
+        .values_panic([
+            message.id.clone().into(),
+            message.conversation_id.clone().into(),
+            message.tenant_id.clone().into(),
+            ROLE_STAFF.into(),
+            message.seq.into(),
+            message.body.clone().into(),
+            Option::<String>::None.into(),
+            Option::<String>::None.into(),
+            Option::<i64>::None.into(),
+            Option::<String>::None.into(),
+            Option::<String>::None.into(),
+            message.author.clone().into(),
+            message.created_at.clone().into(),
+        ]);
+    Statement::render(&insert)
+}
+
+/// The body of the most recent customer message in a conversation, before
+/// `before_seq` — the question a saved correction answers. `None` when the
+/// conversation has no customer turn yet.
+pub(crate) async fn last_user_message(
+    db: &dyn Database,
+    tenant_id: &str,
+    conversation_id: &str,
+    before_seq: i64,
+) -> Result<Option<String>, DbError> {
+    let mut select = Query::select();
+    select
+        .column(iden("body"))
+        .from(iden("sg_messages"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden("conversation_id")).eq(conversation_id))
+        .and_where(Expr::col(iden("role")).eq(ROLE_USER))
+        .and_where(Expr::col(iden("seq")).lt(before_seq))
+        .order_by(iden("seq"), sea_query::Order::Desc)
+        .limit(1);
+    let rows = db.query(&Statement::render(&select)).await?;
+    Ok(rows.rows.first().and_then(|row| row.get::<String>("body")))
 }
 
 // ---------------------------------------------------------------------------
@@ -2504,9 +2880,38 @@ pub(crate) async fn conversation_messages(
         .and_where(Expr::col(iden("conversation_id")).eq(conversation_id))
         .order_by(iden("seq"), sea_query::Order::Asc);
     let rows = db.query(&Statement::render(&select)).await?;
-    Ok(rows
-        .rows
-        .iter()
+    Ok(widget_messages(&rows.rows))
+}
+
+/// The conversation's most recent `limit` messages, oldest first — the
+/// bounded read a turn's prompt history makes (issue #35): a prompt needs
+/// only a window, so this reads the tail with a `LIMIT` and reverses it.
+/// The whole transcript is unbounded by design — the widget's read is
+/// [`conversation_messages`] — so the two are separate queries.
+pub(crate) async fn recent_conversation_messages(
+    db: &dyn Database,
+    tenant_id: &str,
+    conversation_id: &str,
+    limit: usize,
+) -> Result<Vec<WidgetMessage>, DbError> {
+    let mut select = Query::select();
+    select
+        .columns(["id", "role", "body", "outcome", "citations", "created_at"])
+        .from(iden("sg_messages"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden("conversation_id")).eq(conversation_id))
+        .order_by(iden("seq"), sea_query::Order::Desc)
+        .limit(u64::try_from(limit).unwrap_or(u64::MAX));
+    let rows = db.query(&Statement::render(&select)).await?;
+    let mut messages = widget_messages(&rows.rows);
+    messages.reverse();
+    Ok(messages)
+}
+
+/// The `sg_messages` rows of a transcript, mapped to [`WidgetMessage`]s in
+/// the order read. Shared by the whole-transcript and bounded reads.
+fn widget_messages(rows: &[Row]) -> Vec<WidgetMessage> {
+    rows.iter()
         .filter_map(|row| {
             let citations = row
                 .get::<Option<String>>("citations")
@@ -2528,7 +2933,7 @@ pub(crate) async fn conversation_messages(
                 created_at: row.get("created_at")?,
             })
         })
-        .collect())
+        .collect()
 }
 
 /// The stored shape of one citation in the `citations` JSON column.

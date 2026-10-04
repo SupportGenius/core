@@ -22,6 +22,11 @@ pub(crate) const MAX_CLARIFY_TURNS: u32 = 2;
 pub(crate) const OUTCOME_ANSWERED: &str = "answered";
 pub(crate) const OUTCOME_CLARIFY: &str = "clarify";
 pub(crate) const OUTCOME_HANDOFF: &str = "handoff";
+/// The outcome a customer turn answers with while a person holds the
+/// conversation (issue #35): the message is stored, but the bot does not
+/// answer. Not a decision [`decide`] returns — the state short-circuit in
+/// [`crate::messages::run_turn`] answers it before the model is asked.
+pub(crate) const OUTCOME_HUMAN: &str = "human";
 
 /// The reply the model is asked for, parsed from its answer.
 ///
