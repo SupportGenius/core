@@ -3,6 +3,18 @@
 version = 4
 
 [[package]]
+name = "adapter-livingbrain"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "cratefield-core",
+ "http",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3644,6 +3656,7 @@ dependencies = [
 name = "supportgenius-composition"
 version = "0.1.0"
 dependencies = [
+ "adapter-livingbrain",
  "async-trait",
  "axum",
  "bytes",

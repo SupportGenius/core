@@ -16,6 +16,9 @@ sha2 = { workspace = true }
 http = { workspace = true }
 # Shared workspace crate: tenant API keys over the Signer port.
 tenancy = { path = "../tenancy" }
+# The `PublicKnowledge` port's `#[async_trait]` (the attribute must match
+# the one on the traits in `cratefield-core`).
+async-trait = { workspace = true }
 # Shared workspace crate: the one tokenizer and Okapi BM25, moved out of
 # this module so escalation's duplicate scoring can tokenize with the
 # same rules. Re-exported from lib.rs/chunk.rs, so callers here are

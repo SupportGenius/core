@@ -2860,15 +2860,25 @@ pub(crate) async fn find_conversation_with_status(
 
 /// One message as the widget transcript shows it: the body the visitor
 /// was shown — never `model_answer`, which stays out of every
-/// user-facing path — plus the assistant turn's outcome and its
-/// retrieved-only citations.
+/// user-facing path — plus the assistant turn's outcome and its citations.
 pub(crate) struct WidgetMessage {
     pub id: String,
     pub role: String,
     pub body: String,
     pub outcome: Option<String>,
-    pub citations: Vec<(String, String)>,
+    pub citations: Vec<WidgetCitation>,
     pub created_at: String,
+}
+
+/// One citation read back for the transcript, both stored shapes at once:
+/// a model citation fills `chunk_id`/`quote`, a Living Brain one
+/// `title`/`url` (issue #64). The reader carries whichever the row has, so
+/// a brain citation survives a reload as a link rather than a blank bullet.
+pub(crate) struct WidgetCitation {
+    pub chunk_id: String,
+    pub quote: String,
+    pub title: String,
+    pub url: String,
 }
 
 /// The conversation's messages in `seq` order (the order the turn writer
@@ -2922,17 +2932,28 @@ pub(crate) async fn recent_conversation_messages(
 fn widget_messages(rows: &[Row]) -> Vec<WidgetMessage> {
     rows.iter()
         .filter_map(|row| {
-            let citations = row
-                .get::<Option<String>>("citations")
-                .unwrap_or_default()
-                .and_then(|json| serde_json::from_str::<Vec<ModelCitationJson>>(&json).ok())
-                .map(|parsed| {
-                    parsed
-                        .into_iter()
-                        .map(|citation| (citation.chunk_id, citation.quote))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let citations =
+                row.get::<Option<String>>("citations")
+                    .unwrap_or_default()
+                    .and_then(|json| serde_json::from_str::<Vec<ModelCitationJson>>(&json).ok())
+                    .map(|parsed| {
+                        parsed
+                            .into_iter()
+                            // Keep a citation that carries either shape — a
+                            // model `{chunk_id, quote}` or a Living Brain
+                            // `{title, url}` — and drop a wholly empty one.
+                            .filter_map(|citation| {
+                                (!citation.chunk_id.is_empty() || !citation.url.is_empty())
+                                    .then_some(WidgetCitation {
+                                        chunk_id: citation.chunk_id,
+                                        quote: citation.quote,
+                                        title: citation.title,
+                                        url: citation.url,
+                                    })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
             Some(WidgetMessage {
                 id: row.get("id")?,
                 role: row.get("role")?,
@@ -2945,9 +2966,20 @@ fn widget_messages(rows: &[Row]) -> Vec<WidgetMessage> {
         .collect()
 }
 
-/// The stored shape of one citation in the `citations` JSON column.
+/// The stored shape of one citation in the `citations` JSON column. Two
+/// shapes land there: a model citation (`{chunk_id, quote}`) and a Living
+/// Brain one (`{title, url}`, issue #64). Every field defaults, so serde
+/// reads whichever shape the row holds and a row reads back whether the
+/// turn was answered by the model or by a knowledge source — with no
+/// migration either way.
 #[derive(serde::Deserialize)]
 struct ModelCitationJson {
+    #[serde(default)]
     chunk_id: String,
+    #[serde(default)]
     quote: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    url: String,
 }

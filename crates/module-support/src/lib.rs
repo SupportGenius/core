@@ -85,6 +85,7 @@ mod extract;
 mod handlers;
 mod handoff;
 mod human;
+mod knowledge;
 /// MCP over Streamable HTTP (issue #34). Public so an MCP client test can
 /// name the tool argument types and compare their derived schemas with
 /// what `tools/list` serves.
@@ -100,6 +101,7 @@ pub use answer::DEFAULT_ANSWER_THRESHOLD;
 pub use chunk::tokenize;
 pub use handlers::{MAX_BOOST_CANDIDATES, REVIEWED_BOOST};
 pub use handoff::{HandoffSink, TicketView};
+pub use knowledge::{PublicAnswer, PublicCitation, PublicKnowledge};
 pub use messages::MessageBody;
 // The tokenizer and BM25 ranker now live in the shared `lexical` crate
 // (escalation's duplicate scoring tokenizes with the same rules); this
@@ -273,13 +275,17 @@ const MIGRATION_ANALYTICS: SqlMigration = SqlMigration::new(
 /// [`Ports`](cratefield_core::Ports) at route-build time, so one instance
 /// serves a venture with a model and one without.
 ///
-/// Two pieces of builder state, both optional:
+/// Three pieces of builder state, all optional:
 ///
 /// - The [`HandoffSink`]: a handoff turn appends the sink's statements to
 ///   its own atomic batch and kicks it to run. `Support::new()` carries no
 ///   sink, so the module composes exactly as it did before one existed
 ///   (see [`handoff`](self) for why the seam is a trait and not a
 ///   dependency on `module-escalation`).
+/// - The [`PublicKnowledge`] source: a turn whose question a configured
+///   source can answer is answered from it, before retrieval. `None` — the
+///   default — leaves every turn on the module's own path (see
+///   [`knowledge`](self)).
 /// - [`Support::visitor_rate_limiter`]: the widget's per-visitor and
 ///   per-IP buckets want a limiter *separate* from the port a runtime
 ///   fills for the whole process (on Workers, a second Rate Limiting
@@ -296,6 +302,9 @@ pub struct Support {
     /// five ticket columns report zero — support rolls up its own numbers
     /// without reaching into another module's tables.
     ticket_stats: Option<Arc<dyn TicketStats>>,
+    /// `None` is the unwired module: every turn retrieves, asks the model
+    /// and decides, exactly as before a source existed.
+    knowledge: Option<Arc<dyn PublicKnowledge>>,
     visitor_rate_limiter: Option<Arc<dyn cratefield_core::RateLimiter>>,
     /// Other modules' surfaces the `OpenAPI` document (`GET /openapi.json`,
     /// issue #34) covers, paired with the module name their paths mount
@@ -315,6 +324,7 @@ impl Support {
         Self {
             handoff: None,
             ticket_stats: None,
+            knowledge: None,
             visitor_rate_limiter: None,
             api_surfaces: Vec::new(),
         }
@@ -357,6 +367,17 @@ impl Support {
         self.ticket_stats = Some(stats);
         self
     }
+
+    /// A `Support` that answers from `knowledge` when it can: a turn whose
+    /// question the source answers commits an `answered` turn without
+    /// retrieval or the model. `None` — the default — leaves every turn on
+    /// the module's own path.
+    #[must_use]
+    pub fn with_knowledge(mut self, knowledge: Arc<dyn PublicKnowledge>) -> Self {
+        self.knowledge = Some(knowledge);
+        self
+    }
+
     /// Gives the widget routes their own limiter, for the per-visitor and
     /// per-IP buckets (`support-widget:{tenant}:v:{vid}` and
     /// `…:ip:{ip}`). On Workers this is a second Rate Limiting binding
@@ -603,6 +624,7 @@ impl Module for Support {
             Arc::new(ctx),
             text_model,
             self.handoff.clone(),
+            self.knowledge.clone(),
             visitor_rate_limiter,
             self.api_surfaces.clone(),
         )

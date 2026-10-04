@@ -46,12 +46,13 @@ use crate::model::{
     Drafted, EventKind, Judgment, Kind, Stage, StagePayload, Status, Ticket, Verdict, stage_seq,
     webhook_events,
 };
+use crate::router::OwnerRouter;
 use crate::store;
 
 use cratefield_core::{
-    Clock, Completion, Config, Credential, Database, Defer, Destination, Filed, IdGen, Inbox,
-    Mailer, Message, ModelTier, Outbox, OutboxRecord, Prompt, SendOutcome, Severity, Statement,
-    TextModel, TicketDraft, TicketState, TicketStatus, Tracker, scrub_text,
+    Clock, Completion, Config, Credential, Database, Defer, Destination, Filed, HttpClient, IdGen,
+    Inbox, Mailer, Message, ModelTier, Outbox, OutboxRecord, Prompt, SendOutcome, Severity,
+    Statement, TextModel, TicketDraft, TicketState, TicketStatus, Tracker, scrub_text,
 };
 use cratefield_module_webhooks::{PublishError, Webhooks};
 use cratefield_secrets::Actor;
@@ -234,6 +235,13 @@ pub struct Pipeline {
     /// composed venture wires it with [`Pipeline::with_webhooks`], whose
     /// tables must exist in this database.
     webhooks: Option<Webhooks>,
+    /// The owner lookup the file stage asks. `None` (the default) files
+    /// with the tenant's configured destination alone.
+    router: Option<Arc<dyn OwnerRouter>>,
+    /// The HTTP port [`Pipeline::router`] calls through, resolved from the
+    /// runtime. `None` means a wired router is asked with no client and
+    /// answers `None`.
+    http: Option<Arc<dyn HttpClient>>,
     outbox: Outbox,
     inbox: Inbox,
     policy: RetryPolicy,
@@ -288,6 +296,10 @@ impl Pipeline {
             // Publishing is opt-in: a bare pipeline (every test fixture that
             // does not build the webhooks tables) publishes nothing.
             webhooks: None,
+            // Routing is opt-in too: a bare pipeline files where the
+            // tenant's destination says, exactly as before the port.
+            router: None,
+            http: None,
             outbox: Outbox::new(OUTBOX_TABLE),
             inbox: Inbox::new(INBOX_TABLE),
             policy: RetryPolicy::new(),
@@ -310,6 +322,24 @@ impl Pipeline {
     #[must_use]
     pub fn with_webhooks(mut self, webhooks: Webhooks) -> Self {
         self.webhooks = Some(webhooks);
+        self
+    }
+
+    /// Wires the owner lookup the file stage asks (see [`OwnerRouter`]).
+    /// `None` — the [`Pipeline::new`] default — files with the tenant's
+    /// configured destination alone.
+    #[must_use]
+    pub fn with_router(mut self, router: Option<Arc<dyn OwnerRouter>>) -> Self {
+        self.router = router;
+        self
+    }
+
+    /// Wires the HTTP port [`Pipeline::with_router`]'s lookup calls through.
+    /// `None` is a runtime with no HTTP port: a wired router is asked with
+    /// no client and answers `None`, so filing falls back unchanged.
+    #[must_use]
+    pub fn with_http(mut self, http: Option<Arc<dyn HttpClient>>) -> Self {
+        self.http = http;
         self
     }
 
@@ -1273,10 +1303,28 @@ impl Pipeline {
             .resolve_credential(&ticket.tenant_id, destination, &route.credential_ref)
             .await?;
         let idempotency_key = format!("escalation:{}", ticket.id);
-        let body = with_conversation_link(body, &*self.config, &ticket.conversation_id);
         let kind = destination.kind();
-        let mut draft = TicketDraft::new(idempotency_key, title, body, severity)
-            .labels(escalation_labels(ticket.kind, severity, &route.priority));
+        let mut body = with_conversation_link(body, &*self.config, &ticket.conversation_id);
+        let mut labels = escalation_labels(ticket.kind, severity, &route.priority);
+        // Who owns this topic, asked of the module's router when one is
+        // wired (issue #64). A target becomes an `owner:<target>` label and
+        // a body line; with no router, no HTTP port, or no owner, the
+        // route's destination is the routing, exactly as before. `topic` is
+        // the drafted title, scrubbed of emails, tokens and links.
+        if let Some(router) = self.router.as_deref()
+            && let Some(owner) = router
+                .route(
+                    &*self.config,
+                    self.http.as_deref(),
+                    &ticket.tenant_id,
+                    &scrub_text(&title),
+                )
+                .await
+        {
+            labels.push(format!("owner:{owner}"));
+            body = with_owner(&body, &owner);
+        }
+        let mut draft = TicketDraft::new(idempotency_key, title, body, severity).labels(labels);
         if let Some(environment) = &ticket.environment {
             draft = draft.environment(environment.clone());
         }
@@ -2143,6 +2191,14 @@ fn escalation_labels(
         labels.push(format!("priority:{value}"));
     }
     labels
+}
+
+/// Appends the owning target an [`OwnerRouter`] named to the filed ticket's
+/// body, so the engineer who reads it sees who the ticket belongs to even
+/// where the tracker drops the `owner:` label. The label is the machine-
+/// readable half; this line is the human one.
+fn with_owner(body: &str, owner: &str) -> String {
+    format!("{body}\n\n---\n\nOwner (from Living Brain): {owner}\n")
 }
 
 /// Appends a link back to the support conversation the ticket came from,
