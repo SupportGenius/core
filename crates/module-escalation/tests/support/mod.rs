@@ -11,6 +11,7 @@
 
 #![allow(dead_code)] // each test binary uses the helpers it needs
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use cratefield_adapter_sqlite::SqliteDatabase;
@@ -20,8 +21,8 @@ use cratefield_core::{
 };
 use cratefield_testing::{FakeDefer, FakeTextModel, FakeTracker, TextModelMode};
 use module_escalation::intake::OUTBOX_TABLE;
-use module_escalation::model::{EventKind, Stage, Ticket, TicketEvent};
-use module_escalation::store;
+use module_escalation::model::{EventKind, Kind, Stage, Ticket, TicketEvent};
+use module_escalation::store::{self, RouteTarget};
 use module_escalation::testing::{FakeConfig, SettableClock};
 use module_escalation::{Intake, Pipeline, RetryPolicy};
 use time::format_description::well_known::Rfc3339;
@@ -114,6 +115,7 @@ pub(crate) fn happy_model() -> FakeTextModel {
 pub(crate) fn drafted_json() -> serde_json::Value {
     serde_json::json!({
         "title": DRAFT_TITLE,
+        "kind": "defect",
         "repro_steps": [
             "Add an item to the cart",
             "Pay with a gift card that still has a balance",
@@ -123,6 +125,27 @@ pub(crate) fn drafted_json() -> serde_json::Value {
         "environment": "production",
         "severity": "error",
     })
+}
+
+/// A `Drafted` of the given `kind`, carrying only that kind's fields — the
+/// shape the drafter is told to answer with (issue #24). `json` is the
+/// kind's own field set; `title` and `severity` are added here.
+#[must_use]
+pub(crate) fn drafted_json_kind(
+    kind: Kind,
+    title: &str,
+    fields: &serde_json::Value,
+) -> serde_json::Value {
+    let mut draft = serde_json::json!({
+        "title": title,
+        "kind": kind.as_str(),
+        "severity": "info",
+    });
+    let object = draft.as_object_mut().expect("a JSON object");
+    for (key, value) in fields.as_object().expect("a JSON object") {
+        object.insert(key.clone(), value.clone());
+    }
+    draft
 }
 
 /// The `Judgment` that sends the ticket on to the file stage.
@@ -212,10 +235,34 @@ pub(crate) fn migrated_db() -> Arc<SqliteDatabase> {
         &[
             module_escalation::MIGRATION_ESCALATION,
             module_escalation::MIGRATION_DUPLICATES,
+            module_escalation::MIGRATION_ROUTING,
         ],
     )
     .expect("migration applies");
     Arc::new(db)
+}
+
+/// Seeds one `(tenant, kind)` route — the file stage's per-kind destination
+/// and the credential *reference* it resolves through the Config port at
+/// file-time. `priority` is the severity→priority map the tracker's labels
+/// carry.
+pub(crate) fn seed_route(
+    db: &SqliteDatabase,
+    tenant: &str,
+    kind: Kind,
+    target: &RouteTarget,
+    credential_ref: &str,
+    priority: &BTreeMap<String, String>,
+) {
+    let stmt = store::put_route_stmt(
+        tenant,
+        kind,
+        target,
+        credential_ref,
+        priority,
+        &format_at(time::OffsetDateTime::from_unix_timestamp(EPOCH).expect("epoch")),
+    );
+    pollster::block_on(db.batch_atomic(&[stmt])).expect("route seeds");
 }
 
 /// Seeds the tenant's tracker destination — the file stage's destination
@@ -317,15 +364,17 @@ pub(crate) fn fixture_for(
     fixture_full(destination, model, tracker, TRANSCRIPT)
 }
 
-/// The one fixture builder: a destination, the fakes, and the transcript.
-fn fixture_full(
-    destination: &Destination,
+/// The one fixture builder: `seed` fills the database (a destination row,
+/// or the `sg_routes` rows of [`fixture_routed`]), then the handoff is
+/// committed and the fakes are boxed up.
+fn fixture_seeded(
+    seed: impl FnOnce(&SqliteDatabase),
     model: FakeTextModel,
     tracker: FakeTracker,
     transcript: &str,
 ) -> Fixture {
     let db = migrated_db();
-    seed_destination(&db, destination);
+    seed(&db);
     let clock = Arc::new(SettableClock::at_unix(EPOCH));
     let ticket_id = commit_handoff(&db, &clock, TENANT, CONVERSATION, transcript);
     Fixture {
@@ -337,6 +386,49 @@ fn fixture_full(
         mailer: None,
         ticket_id,
     }
+}
+
+/// [`fixture_seeded`] seeding the legacy `sg_destinations` row (rather than
+/// `sg_routes` rows).
+fn fixture_full(
+    destination: &Destination,
+    model: FakeTextModel,
+    tracker: FakeTracker,
+    transcript: &str,
+) -> Fixture {
+    fixture_seeded(
+        |db| seed_destination(db, destination),
+        model,
+        tracker,
+        transcript,
+    )
+}
+
+/// Like [`fixture`], but the file stage is driven by `sg_routes` rows the
+/// caller seeds (`seed`), not a single `sg_destinations` row — no legacy
+/// destination exists, so a kind with no route files into the built-in
+/// ticketing. The seam the per-kind routing tests need (issue #24).
+#[must_use]
+pub(crate) fn fixture_routed(
+    seed: impl FnOnce(&SqliteDatabase),
+    model: FakeTextModel,
+    tracker: FakeTracker,
+) -> Fixture {
+    fixture_seeded(seed, model, tracker, TRANSCRIPT)
+}
+
+/// Commits one more handoff (a fresh conversation) into an existing
+/// fixture's database, returning its ticket id — the multi-ticket seam the
+/// routing tests drive one kind at a time.
+#[must_use]
+pub(crate) fn add_ticket(fixture: &Fixture, conversation: &str, transcript: &str) -> String {
+    commit_handoff(
+        &fixture.db,
+        &fixture.clock,
+        TENANT,
+        conversation,
+        transcript,
+    )
 }
 
 impl Fixture {

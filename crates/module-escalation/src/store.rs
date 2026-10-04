@@ -23,12 +23,14 @@
 //! by the tests below), and should be deleted when core grows
 //! `complete_statement`/`retry_later_statement`.
 
+use std::collections::BTreeMap;
+
 use cratefield_core::{Database, Row, Statement};
-use sea_query::{Alias, Expr, Order, Query};
+use sea_query::{Alias, Expr, Order, Query, SimpleExpr};
 
 use crate::error::Error;
 use crate::model::{
-    Drafted, EventKind, Judgment, Stage, StagePayload, Status, Ticket, TicketEvent, Verdict,
+    Drafted, EventKind, Judgment, Kind, Stage, StagePayload, Status, Ticket, TicketEvent, Verdict,
 };
 
 use cratefield_core::{Destination, Filed, Severity};
@@ -38,7 +40,7 @@ fn iden(name: &str) -> Alias {
 }
 
 /// The columns `sg_tickets` reads come back in, in decode order.
-const TICKET_COLUMNS: [&str; 18] = [
+const TICKET_COLUMNS: [&str; 19] = [
     "id",
     "tenant_id",
     "conversation_id",
@@ -57,10 +59,44 @@ const TICKET_COLUMNS: [&str; 18] = [
     "match_count",
     "created_at",
     "updated_at",
+    // Appended by migration 0007, so it stays at the end of the insert and
+    // select lists (the intake tests pin the earlier positions).
+    "kind",
 ];
 
 /// The columns `sg_ticket_events` reads come back in, in decode order.
 const EVENT_COLUMNS: [&str; 7] = ["id", "ticket_id", "seq", "at", "stage", "kind", "detail"];
+
+/// The `sg_routes.destination` sentinel for a kind that files into the
+/// module's own built-in ticketing rather than an external tracker. A
+/// serialized [`Destination`] is always a JSON object (or `null`), so the
+/// bare string can never collide with one.
+pub const LOCAL_ROUTE: &str = "local";
+
+/// Where a `(tenant, kind)` route sends its tickets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteTarget {
+    /// File into the module's own built-in ticketing: no tracker call, the
+    /// ticket is filed with a synthetic `local:<ticket id>` reference.
+    Local,
+    /// File into an external tracker through the `Tracker` port.
+    Tracker(Destination),
+}
+
+/// A resolved `(tenant, kind)` route: its target, the credential
+/// *reference* the file stage resolves at file-time (never a secret), and
+/// the severity→priority map the tracker's labels carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Route {
+    /// Where the ticket goes.
+    pub target: RouteTarget,
+    /// A reference to the credential (`secret:` name or Config key), or the
+    /// empty string for a [`RouteTarget::Local`] route.
+    pub credential_ref: String,
+    /// `severity` wire form → the tracker's priority value. Empty when the
+    /// route names no priorities.
+    pub priority: BTreeMap<String, String>,
+}
 
 // ---------------------------------------------------------------------------
 // Statement builders (pure; compose into a caller's `batch_atomic`)
@@ -100,6 +136,7 @@ pub fn insert_ticket_stmt(ticket: &Ticket) -> Statement {
             ticket.match_count.into(),
             ticket.created_at.clone().into(),
             ticket.updated_at.clone().into(),
+            ticket.kind.as_str().into(),
         ]);
     Statement::render(&insert)
 }
@@ -155,6 +192,7 @@ pub fn update_ticket_draft_stmt(
         .table(iden("sg_tickets"))
         .values([
             (iden("title"), drafted.title.clone().into()),
+            (iden("kind"), drafted.kind.as_str().into()),
             (iden("body_markdown"), body_markdown.to_owned().into()),
             (iden("severity"), severity_text(drafted.severity).into()),
             (iden("environment"), drafted.environment.clone().into()),
@@ -375,6 +413,67 @@ pub fn delete_destination_stmt(tenant_id: &str) -> Statement {
     Statement::render(&delete)
 }
 
+/// Upserts a tenant's route for one ticket `kind` — `(tenant_id, kind)` is
+/// the primary key, so re-routing a kind replaces its row. `target` is
+/// stored the same way `sg_destinations.destination` is: a serialized
+/// [`Destination`], or the [`LOCAL_ROUTE`] sentinel for the built-in
+/// ticketing. `credential_ref` names where the secret lives — **never the
+/// secret itself** — and is `""` for a [`RouteTarget::Local`] route.
+/// `priority` is the severity→priority map, stored as a JSON object.
+#[must_use]
+pub fn put_route_stmt(
+    tenant_id: &str,
+    kind: Kind,
+    target: &RouteTarget,
+    credential_ref: &str,
+    priority: &BTreeMap<String, String>,
+    at: &str,
+) -> Statement {
+    let destination = match target {
+        RouteTarget::Local => LOCAL_ROUTE.to_owned(),
+        RouteTarget::Tracker(destination) => {
+            serde_json::to_string(destination).unwrap_or_else(|_| {
+                // Serializing a fieldless/struct variant enum cannot fail; the
+                // fallback only keeps this builder pure.
+                "null".to_owned()
+            })
+        }
+    };
+    let priority = serde_json::to_string(priority).unwrap_or_else(|_| "{}".to_owned());
+    let mut insert = Query::insert();
+    insert
+        .into_table(iden("sg_routes"))
+        .columns([
+            "tenant_id",
+            "kind",
+            "destination",
+            "credential_ref",
+            "priority_map",
+            "created_at",
+            "updated_at",
+        ])
+        .values_panic([
+            tenant_id.to_owned().into(),
+            kind.as_str().into(),
+            destination.into(),
+            credential_ref.to_owned().into(),
+            priority.into(),
+            at.to_owned().into(),
+            at.to_owned().into(),
+        ])
+        .on_conflict(
+            sea_query::OnConflict::columns([iden("tenant_id"), iden("kind")])
+                .update_columns([
+                    "destination",
+                    "credential_ref",
+                    "priority_map",
+                    "updated_at",
+                ])
+                .to_owned(),
+        );
+    Statement::render(&insert)
+}
+
 /// The rendered equivalent of `Outbox::complete(db, id)` — a
 /// `DELETE FROM "<table>" WHERE "id" = ?` — so a stage handler can
 /// complete its own outbox row **inside the same** `batch_atomic` that
@@ -544,6 +643,83 @@ pub async fn candidate_tickets(
     rows.rows.iter().map(ticket_from).collect()
 }
 
+/// How many of a tenant's built-in tickets `GET /tickets` returns at most.
+/// The same bounded-pool idiom as [`CANDIDATE_POOL`], newest first; the
+/// route has no cursor, so this is the sane ceiling rather than a page
+/// size.
+const LOCAL_LIST_LIMIT: u64 = 200;
+
+/// The predicate matching a built-in ticket: one whose `external_id` is the
+/// `local:` reference for **its own** id — the exact string the file stage
+/// wrote (`local:<ticket id>`; see `Pipeline::run_file` and [`LOCAL_ROUTE`]).
+///
+/// Comparing the reference to `'local:' || id`, rather than matching the
+/// `local:` *prefix*, is what keeps a duplicate of a built-in ticket out of
+/// the list and off the by-id routes: a duplicate row copies the existing
+/// ticket's reference ([`update_ticket_duplicate_stmt`]) but keeps its own
+/// id, so a prefix match would present it as a built-in ticket.
+fn built_in_ticket() -> SimpleExpr {
+    Expr::cust_with_values(
+        "sg_tickets.external_id = ? || sg_tickets.id",
+        [format!("{LOCAL_ROUTE}:")],
+    )
+}
+
+/// Lists a tenant's built-in tickets — the ones the file stage filed into
+/// the module's own ticketing, not an external tracker — newest first,
+/// capped at [`LOCAL_LIST_LIMIT`]. `status`, when given, narrows the list
+/// to one lifecycle status.
+///
+/// # Errors
+///
+/// As [`load_ticket`].
+pub async fn local_tickets(
+    db: &dyn Database,
+    tenant_id: &str,
+    status: Option<Status>,
+) -> Result<Vec<Ticket>, Error> {
+    let mut query = select_tickets();
+    query
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(built_in_ticket());
+    if let Some(status) = status {
+        query.and_where(Expr::col(iden("status")).eq(status.as_str()));
+    }
+    query
+        // Newest first; `id` (a ULID) breaks a `created_at` tie
+        // deterministically.
+        .order_by(iden("created_at"), Order::Desc)
+        .order_by(iden("id"), Order::Desc)
+        .limit(LOCAL_LIST_LIMIT);
+    let rows = db.query(&Statement::render(&query)).await?;
+    rows.rows.iter().map(ticket_from).collect()
+}
+
+/// Loads one tenant's built-in ticket by id — `None` when no such ticket
+/// exists, when it belongs to another tenant, when it was filed to an
+/// external tracker, or when it is only a *duplicate* of a built-in ticket
+/// (see [`built_in_ticket`]). So a cross-tenant, tracker-filed or duplicate
+/// id is indistinguishable from a missing one (the routes answer `404`
+/// without leaking which).
+///
+/// # Errors
+///
+/// As [`load_ticket`].
+pub async fn load_local_ticket(
+    db: &dyn Database,
+    tenant_id: &str,
+    id: &str,
+) -> Result<Option<Ticket>, Error> {
+    let mut query = select_tickets();
+    query
+        .and_where(Expr::col(iden("id")).eq(id))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(built_in_ticket())
+        .limit(1);
+    let rows = db.query(&Statement::render(&query)).await?;
+    rows.first().map(ticket_from).transpose()
+}
+
 /// Loads a tenant's tracker destination and the Config key its credential
 /// lives under. The secret itself never reaches the store; resolve
 /// `credential_ref` through the Config port at file-time.
@@ -570,6 +746,53 @@ pub async fn load_destination(
     let destination: Destination = serde_json::from_str(&destination)
         .map_err(|err| Error::Decode(format!("sg_destinations.destination: {err}")))?;
     Ok(Some((destination, required_text(row, "credential_ref")?)))
+}
+
+/// Loads the route a tenant has configured for one ticket `kind`, or
+/// `None` when the kind has no row. `destination` is decoded like
+/// `sg_destinations.destination`, except that the [`LOCAL_ROUTE`] sentinel
+/// decodes to [`RouteTarget::Local`]. `credential_ref` may be SQL NULL
+/// (local routes) and comes back as the empty string;
+/// `priority_map` is a JSON object of severity wire form → priority value.
+///
+/// # Errors
+///
+/// As [`load_ticket`], plus [`Error::Decode`] when the stored
+/// `Destination` or `priority_map` JSON no longer parses.
+pub async fn load_route(
+    db: &dyn Database,
+    tenant_id: &str,
+    kind: Kind,
+) -> Result<Option<Route>, Error> {
+    let mut query = Query::select();
+    query
+        .columns(["destination", "credential_ref", "priority_map"])
+        .from(iden("sg_routes"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden("kind")).eq(kind.as_str()))
+        .limit(1);
+    let rows = db.query(&Statement::render(&query)).await?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let destination = required_text(row, "destination")?;
+    let target = if destination == LOCAL_ROUTE {
+        RouteTarget::Local
+    } else {
+        let destination: Destination = serde_json::from_str(&destination)
+            .map_err(|err| Error::Decode(format!("sg_routes.destination: {err}")))?;
+        RouteTarget::Tracker(destination)
+    };
+    let priority = parse_json_column::<BTreeMap<String, String>>(
+        optional_text(row, "priority_map")?,
+        "priority_map",
+    )?
+    .unwrap_or_default();
+    Ok(Some(Route {
+        target,
+        credential_ref: optional_text(row, "credential_ref")?.unwrap_or_default(),
+        priority,
+    }))
 }
 
 /// A ticket's audit trail, in true pipeline order: `(seq, at, id)` —
@@ -636,11 +859,13 @@ fn ticket_from(row: &Row) -> Result<Ticket, Error> {
     let verdict = optional_text(row, "verdict")?
         .map(|raw| raw.parse::<Verdict>())
         .transpose()?;
+    let kind = required_text(row, "kind")?.parse::<Kind>()?;
 
     Ok(Ticket {
         id: required_text(row, "id")?,
         tenant_id: required_text(row, "tenant_id")?,
         conversation_id: required_text(row, "conversation_id")?,
+        kind,
         status,
         stage,
         transcript: required_text(row, "transcript")?,
@@ -830,7 +1055,11 @@ mod tests {
         let db = cratefield_adapter_sqlite::SqliteDatabase::in_memory().expect("in-memory db");
         db.apply_migrations(
             "module-escalation",
-            &[crate::MIGRATION_ESCALATION, crate::MIGRATION_DUPLICATES],
+            &[
+                crate::MIGRATION_ESCALATION,
+                crate::MIGRATION_DUPLICATES,
+                crate::MIGRATION_ROUTING,
+            ],
         )
         .expect("migration applies");
         db
@@ -842,6 +1071,7 @@ mod tests {
             id: "01JTICKET".to_owned(),
             tenant_id: "acme".to_owned(),
             conversation_id: "conv-1".to_owned(),
+            kind: Kind::Defect,
             status: Status::Intake,
             stage: Stage::Draft,
             transcript: "customer: checkout 500s".to_owned(),
@@ -929,14 +1159,21 @@ mod tests {
 
         let drafted = Drafted {
             title: "Checkout 500s".to_owned(),
+            kind: Kind::Defect,
             repro_steps: vec!["pay".to_owned()],
             expected: "order completes".to_owned(),
             actual: "HTTP 500".to_owned(),
             environment: Some("production".to_owned()),
             severity: Severity::Error,
+            summary: None,
+            customer_ask: None,
+            company: None,
+            seats: None,
+            intent: None,
         };
         let judgment = Judgment {
             is_defect: true,
+            kind_ok: true,
             reproducible: true,
             duplicate_of: None,
             severity_ok: false,
@@ -996,6 +1233,76 @@ mod tests {
             }
         );
         assert_eq!(credential_ref, "ESCALATION_TRACKER_CREDENTIAL");
+    }
+
+    /// `sg_routes` round-trips both targets — a serialized `Destination`
+    /// and the `local` sentinel — with the priority map, treats a missing
+    /// `(tenant, kind)` as `None`, and replaces a row on re-route (the
+    /// conflict path).
+    #[test]
+    fn routes_round_trip_with_their_priority_map() {
+        let db = migrated_db();
+        let at = "2026-09-19T00:00:00Z";
+        let github = Destination::GitHub {
+            owner: "acme".to_owned(),
+            repo: "checkout".to_owned(),
+        };
+        let priority = BTreeMap::from([("error".to_owned(), "high".to_owned())]);
+        pollster::block_on(db.batch_atomic(&[
+            put_route_stmt(
+                "acme",
+                Kind::Defect,
+                &RouteTarget::Tracker(github.clone()),
+                "secret:gh",
+                &priority,
+                at,
+            ),
+            put_route_stmt(
+                "acme",
+                Kind::Lead,
+                &RouteTarget::Local,
+                "",
+                &BTreeMap::new(),
+                at,
+            ),
+        ]))
+        .expect("upserts commit");
+
+        let defect = pollster::block_on(load_route(&db, "acme", Kind::Defect))
+            .expect("read")
+            .expect("route configured");
+        assert_eq!(defect.target, RouteTarget::Tracker(github));
+        assert_eq!(defect.credential_ref, "secret:gh");
+        assert_eq!(defect.priority, priority);
+
+        let lead = pollster::block_on(load_route(&db, "acme", Kind::Lead))
+            .expect("read")
+            .expect("route configured");
+        assert_eq!(lead.target, RouteTarget::Local);
+        assert_eq!(lead.credential_ref, "");
+        assert!(lead.priority.is_empty());
+
+        assert!(
+            pollster::block_on(load_route(&db, "acme", Kind::SupportCase))
+                .expect("read")
+                .is_none(),
+            "a kind with no row has no route"
+        );
+
+        // Re-routing a kind replaces its row rather than adding one.
+        pollster::block_on(db.batch_atomic(&[put_route_stmt(
+            "acme",
+            Kind::Defect,
+            &RouteTarget::Local,
+            "",
+            &BTreeMap::new(),
+            at,
+        )]))
+        .expect("re-route commits");
+        let defect = pollster::block_on(load_route(&db, "acme", Kind::Defect))
+            .expect("read")
+            .expect("route configured");
+        assert_eq!(defect.target, RouteTarget::Local);
     }
 
     /// The outbox statements drive core's own queue against the

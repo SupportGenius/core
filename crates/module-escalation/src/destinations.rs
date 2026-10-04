@@ -62,7 +62,7 @@ const UNAUTHORIZED: ProblemDef = ProblemDef {
     slug: "escalation-unauthorized",
     status: StatusCode::UNAUTHORIZED,
     title: "Escalation API key unauthorized",
-    description: "A destination route was reached without a valid, unrevoked tenant API key.",
+    description: "An escalation route was reached without a valid, unrevoked tenant API key.",
 };
 
 /// `422` when the tracker refuses the credential (`401`/`403`): wrong,
@@ -201,7 +201,7 @@ async fn put_tenant(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, Problem> {
-    let (tenant_id, actor) = tenant_of(&state, &headers).await?;
+    let (tenant_id, actor) = tenant_of(&state.ctx, state.tenants.as_deref(), &headers).await?;
     put_destination(&state, &tenant_id, &actor, &scope, &body).await
 }
 
@@ -210,7 +210,7 @@ async fn get_tenant(
     State(state): State<Arc<DestinationsState>>,
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
-    let (tenant_id, actor) = tenant_of(&state, &headers).await?;
+    let (tenant_id, actor) = tenant_of(&state.ctx, state.tenants.as_deref(), &headers).await?;
     get_destination(&state, &tenant_id, &actor, &scope).await
 }
 
@@ -219,7 +219,7 @@ async fn delete_tenant(
     State(state): State<Arc<DestinationsState>>,
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
-    let (tenant_id, actor) = tenant_of(&state, &headers).await?;
+    let (tenant_id, actor) = tenant_of(&state.ctx, state.tenants.as_deref(), &headers).await?;
     delete_destination(&state, &tenant_id, &actor, &scope).await
 }
 
@@ -357,7 +357,7 @@ async fn put_destination(
         }
     };
 
-    let now = iso_now(state);
+    let now = iso_now(&state.ctx);
     let statement =
         crate::store::put_destination_stmt(tenant_id, &stored_destination, CREDENTIAL_REF, &now);
     db.batch_atomic(&[statement]).await?;
@@ -436,21 +436,27 @@ async fn delete_destination(
 /// A valid key for a tenant that is not active (suspended, closed,
 /// unknown) is refused with the same indistinguishable `401` as a bad key
 /// — the answer `module-support`'s routes give the same key.
-async fn tenant_of(
-    state: &DestinationsState,
+///
+/// Shared by the destination and ticket routes (hence `ctx`/`tenants`
+/// rather than a route state): every surface authenticated by a tenant
+/// `sg_…` key takes this same path, so a key accepted on one is accepted
+/// identically on the other.
+pub(crate) async fn tenant_of(
+    ctx: &ModuleContext,
+    tenants: Option<&dyn TenantDirectory>,
     headers: &HeaderMap,
 ) -> Result<(String, Actor), Problem> {
-    let key = authenticate(&state.ctx, headers)?;
+    let key = authenticate(ctx, headers)?;
     let tenant_id = key.tenant_id;
-    if !tenant_is_active(state, &tenant_id).await? {
+    if !tenant_is_active(ctx, tenants, &tenant_id).await? {
         return Err(Problem::new(&UNAUTHORIZED));
     }
     // A valid signature is not enough: the key must still be on record, so
     // a key revoked by deleting its row is refused here too. No directory
     // means no way to tell, so no key is live (fail closed).
-    let live = match state.tenants.as_deref() {
+    let live = match tenants {
         Some(tenants) => tenants
-            .key_is_live(&state.ctx, &tenant_id, &key.key_id)
+            .key_is_live(ctx, &tenant_id, &key.key_id)
             .await
             .map_err(Problem::from)?,
         None => false,
@@ -473,7 +479,7 @@ async fn admin_of(
     scope: &Scope,
 ) -> Result<Actor, Problem> {
     require_admin(&*state.ctx.config, headers)?;
-    if !tenant_is_active(state, tenant_id).await? {
+    if !tenant_is_active(&state.ctx, state.tenants.as_deref(), tenant_id).await? {
         return Err(Problem::not_found().instance(&scope.request_id));
     }
     Actor::new("admin").map_err(|_| Problem::internal())
@@ -482,12 +488,16 @@ async fn admin_of(
 /// Whether `tenant_id` is active, per the composed [`TenantDirectory`].
 /// No directory means no way to tell, so no tenant is (fail closed). A
 /// database failure is a `500`, not evidence about the tenant.
-async fn tenant_is_active(state: &DestinationsState, tenant_id: &str) -> Result<bool, Problem> {
-    let Some(tenants) = state.tenants.as_deref() else {
+async fn tenant_is_active(
+    ctx: &ModuleContext,
+    tenants: Option<&dyn TenantDirectory>,
+    tenant_id: &str,
+) -> Result<bool, Problem> {
+    let Some(tenants) = tenants else {
         return Ok(false);
     };
     tenants
-        .is_active(&state.ctx, tenant_id)
+        .is_active(ctx, tenant_id)
         .await
         .map_err(Problem::from)
 }
@@ -524,7 +534,10 @@ async fn credential_present(
 /// The module keeps no tenant or key table of its own, so tenant *status*
 /// and the key's own row (revocation) are checked separately, through the
 /// composed [`TenantDirectory`] (see [`tenant_of`]).
-fn authenticate(ctx: &ModuleContext, headers: &HeaderMap) -> Result<tenancy::TenantKey, Problem> {
+pub(crate) fn authenticate(
+    ctx: &ModuleContext,
+    headers: &HeaderMap,
+) -> Result<tenancy::TenantKey, Problem> {
     let unauthorized = || Problem::new(&UNAUTHORIZED);
     let Some(raw) = headers
         .get(header::AUTHORIZATION)
@@ -549,15 +562,14 @@ fn authenticate(ctx: &ModuleContext, headers: &HeaderMap) -> Result<tenancy::Ten
 /// The `internal` problem for a required port that `requires()` promised
 /// but the context does not carry: a harness bug, answered rather than
 /// panicked.
-fn required_port_missing(name: &str) -> Problem {
+pub(crate) fn required_port_missing(name: &str) -> Problem {
     Problem::internal().with_detail(format!("required port {name} is missing"))
 }
 
 /// The current instant, RFC 3339, from the `Clock` port when the runtime
 /// resolved one and the system clock otherwise.
-fn iso_now(state: &DestinationsState) -> String {
-    let clock = state
-        .ctx
+pub(crate) fn iso_now(ctx: &ModuleContext) -> String {
+    let clock = ctx
         .ports
         .clock
         .clone()

@@ -8,7 +8,7 @@
 //! `cratefield_core`. And the `judge` stage's output type is
 //! [`Judgment`], to keep `Verdict` free for the judge's actual decision.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 
 use cratefield_core::Severity;
@@ -119,6 +119,9 @@ pub enum Status {
     Duplicate,
     /// The file stage exhausted its retries; parked for a human.
     DeadLetter,
+    /// The ticket was closed after filing (issue #24, part 2). Terminal:
+    /// nothing in the pipeline moves a closed ticket on.
+    Closed,
 }
 
 impl Status {
@@ -135,6 +138,7 @@ impl Status {
             Status::Rejected => "rejected",
             Status::Duplicate => "duplicate",
             Status::DeadLetter => "dead_letter",
+            Status::Closed => "closed",
         }
     }
 }
@@ -155,8 +159,55 @@ impl std::str::FromStr for Status {
             "rejected" => Ok(Status::Rejected),
             "duplicate" => Ok(Status::Duplicate),
             "dead_letter" => Ok(Status::DeadLetter),
+            "closed" => Ok(Status::Closed),
             _ => Err(crate::error::Error::Decode(format!(
                 "unknown ticket status `{raw}`"
+            ))),
+        }
+    }
+}
+
+/// What a conversation is — the routing key that decides where its ticket
+/// is filed (issue #24). A defect goes to engineering, a how-to or account
+/// question to a support desk, and a pricing or buying-intent message to
+/// sales. Stored on `sg_tickets.kind` and `sg_routes.kind` in the serde
+/// (`snake_case`) form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    /// A defect in the product. The original escalation, and the default so
+    /// a payload or row written before this field existed decodes as one.
+    #[default]
+    Defect,
+    /// A how-to or account question a person must answer.
+    SupportCase,
+    /// Pricing, seat counts or other buying intent — a sales lead.
+    Lead,
+}
+
+impl Kind {
+    /// The stored/log form (`"defect"`, `"support_case"`, `"lead"`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Defect => "defect",
+            Kind::SupportCase => "support_case",
+            Kind::Lead => "lead",
+        }
+    }
+}
+
+impl std::str::FromStr for Kind {
+    type Err = crate::error::Error;
+
+    /// Parses the stored form; a decode failure for an unknown kind.
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "defect" => Ok(Kind::Defect),
+            "support_case" => Ok(Kind::SupportCase),
+            "lead" => Ok(Kind::Lead),
+            _ => Err(crate::error::Error::Decode(format!(
+                "unknown ticket kind `{raw}`"
             ))),
         }
     }
@@ -211,27 +262,99 @@ impl std::str::FromStr for Verdict {
 /// The `draft` stage's schema-constrained output: what a fast model
 /// produces from a transcript. Validated against [`Drafted::json_schema`]
 /// by the model adapter before it reaches this type.
+///
+/// One schema covers all three [`Kind`]s: the defect fields, the
+/// support-case fields and the lead fields are all present, and which ones
+/// a draft must fill is decided by its `kind` (see
+/// [`Drafted::missing_fields`]). The `#[serde(default)]`s keep a payload
+/// that predates kinds — or one that omits the fields its kind does not
+/// use — decodable, and `null_default` accepts an explicit `null` for the
+/// defect fields the schema marks nullable (a model may omit them or set
+/// them to `null`; both are valid against [`Drafted::json_schema`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Drafted {
     /// One-line ticket title.
     pub title: String,
-    /// Reproduction steps, in order.
+    /// What the conversation is: a defect, a support case or a lead.
+    #[serde(default)]
+    pub kind: Kind,
+    /// Reproduction steps, in order (defect).
+    #[serde(default, deserialize_with = "null_default")]
     pub repro_steps: Vec<String>,
-    /// What the customer expected to happen.
+    /// What the customer expected to happen (defect).
+    #[serde(default, deserialize_with = "null_default")]
     pub expected: String,
-    /// What actually happened.
+    /// What actually happened (defect).
+    #[serde(default, deserialize_with = "null_default")]
     pub actual: String,
     /// The deployment the ticket is about, where the transcript named one.
     pub environment: Option<String>,
     /// How urgent the ticket is.
     pub severity: Severity,
+    /// What the conversation is about (support case).
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// The customer's actual question, phrased for a person (support case).
+    #[serde(default)]
+    pub customer_ask: Option<String>,
+    /// The customer's company, where the transcript named one (lead).
+    #[serde(default)]
+    pub company: Option<String>,
+    /// How many seats the customer is considering (lead; optional).
+    #[serde(default)]
+    pub seats: Option<i64>,
+    /// What the customer wants to buy or learn about (lead).
+    #[serde(default)]
+    pub intent: Option<String>,
 }
 
 impl Drafted {
+    /// The kind-required fields this draft left empty, by name — the
+    /// deterministic check the pipeline runs before a ticket may be filed
+    /// (see `pipeline::run_draft`). Empty when the draft is complete for
+    /// its kind: defect needs reproduction steps, `expected` and `actual`;
+    /// support case needs `summary` and `customer_ask`; lead needs
+    /// `company` and `intent` (`seats` is optional).
+    #[must_use]
+    pub fn missing_fields(&self) -> Vec<&'static str> {
+        let blank = |value: Option<&str>| value.unwrap_or_default().trim().is_empty();
+        let mut missing = Vec::new();
+        match self.kind {
+            Kind::Defect => {
+                if !self.repro_steps.iter().any(|step| !step.trim().is_empty()) {
+                    missing.push("repro_steps");
+                }
+                if self.expected.trim().is_empty() {
+                    missing.push("expected");
+                }
+                if self.actual.trim().is_empty() {
+                    missing.push("actual");
+                }
+            }
+            Kind::SupportCase => {
+                if blank(self.summary.as_deref()) {
+                    missing.push("summary");
+                }
+                if blank(self.customer_ask.as_deref()) {
+                    missing.push("customer_ask");
+                }
+            }
+            Kind::Lead => {
+                if blank(self.company.as_deref()) {
+                    missing.push("company");
+                }
+                if blank(self.intent.as_deref()) {
+                    missing.push("intent");
+                }
+            }
+        }
+        missing
+    }
+
     /// The JSON Schema (draft 2020-12) the draft prompt constrains the
-    /// model with: exactly the fields above, `environment` the one
-    /// optional field, `severity` pinned to the port's `Severity` wire
-    /// forms.
+    /// model with. One flat schema serves every [`Kind`]: `title`, `kind`
+    /// and `severity` are always required, and each kind's own fields are
+    /// nullable and optional so a draft fills only the ones its kind uses.
     #[must_use]
     pub fn json_schema() -> Value {
         json!({
@@ -239,20 +362,29 @@ impl Drafted {
             "title": "Drafted",
             "type": "object",
             "additionalProperties": false,
-            "required": ["title", "repro_steps", "expected", "actual", "severity"],
+            "required": ["title", "kind", "severity"],
             "properties": {
                 "title": { "type": "string", "minLength": 1 },
+                "kind": {
+                    "type": "string",
+                    "enum": ["defect", "support_case", "lead"]
+                },
                 "repro_steps": {
-                    "type": "array",
+                    "type": ["array", "null"],
                     "items": { "type": "string" }
                 },
-                "expected": { "type": "string" },
-                "actual": { "type": "string" },
-                "environment": { "type": "string" },
+                "expected": { "type": ["string", "null"] },
+                "actual": { "type": ["string", "null"] },
+                "environment": { "type": ["string", "null"] },
                 "severity": {
                     "type": "string",
                     "enum": ["info", "warning", "error", "critical"]
-                }
+                },
+                "summary": { "type": ["string", "null"] },
+                "customer_ask": { "type": ["string", "null"] },
+                "company": { "type": ["string", "null"] },
+                "seats": { "type": ["integer", "null"] },
+                "intent": { "type": ["string", "null"] }
             }
         })
     }
@@ -260,13 +392,15 @@ impl Drafted {
 
 /// The `judge` stage's schema-constrained output: what a strong model —
 /// deliberately a different one from the drafter — says about the draft.
-// The five booleans are the issue's judge checklist, each an independent
+// The six booleans are the issue's judge checklist, each an independent
 // finding; folding them into an enum would invent structure the schema
 // does not have.
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Judgment {
-    /// The draft describes a defect in the product.
+    /// The draft describes a defect in the product. Only meaningful when
+    /// the draft's [`Kind`] is `defect`; a support case or lead is not
+    /// rejected for failing this.
     pub is_defect: bool,
     /// The reproduction steps actually reproduce something.
     pub reproducible: bool,
@@ -279,12 +413,37 @@ pub struct Judgment {
     pub severity_ok: bool,
     /// The draft carries no customer PII that must not reach a tracker.
     pub pii_clean: bool,
+    /// The draft's `kind` fits the conversation and carries the fields
+    /// that kind needs. Defaults to `true` so a stored or scripted
+    /// judgment written before this field existed still files as it did.
+    #[serde(default = "default_true")]
+    pub kind_ok: bool,
     /// What to do with the ticket.
     pub verdict: Verdict,
     /// The judge's reasons, verbatim. Carried in the schema (and in the
     /// audit trail) on purpose: "the judge rejected my ticket" with no
     /// why is not an answer a customer or a support engineer can act on.
     pub reasons: Vec<String>,
+}
+
+/// The serde default for [`Judgment::kind_ok`]: a judgment that predates
+/// the field is treated as having checked out.
+fn default_true() -> bool {
+    true
+}
+
+/// Deserializes a field the draft schema marks nullable: JSON `null`
+/// decodes as the type's [`Default`], exactly as an omitted field does.
+/// `#[serde(default)]` covers omission only, so without this a model that
+/// answers an unused defect field with `null` — a value
+/// [`Drafted::json_schema`] explicitly allows — would fail to decode and
+/// dead-letter the ticket at the draft stage.
+fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl Judgment {
@@ -303,6 +462,7 @@ impl Judgment {
                 "reproducible",
                 "severity_ok",
                 "pii_clean",
+                "kind_ok",
                 "verdict",
                 "reasons"
             ],
@@ -312,6 +472,7 @@ impl Judgment {
                 "duplicate_of": { "type": "string" },
                 "severity_ok": { "type": "boolean" },
                 "pii_clean": { "type": "boolean" },
+                "kind_ok": { "type": "boolean" },
                 "verdict": {
                     "type": "string",
                     "enum": ["file", "needs_info", "reject", "duplicate"]
@@ -396,6 +557,13 @@ pub enum EventKind {
     /// candidates it was shown; the name is ignored and `detail` records
     /// the rejected id and the candidates that were on offer.
     DuplicateIgnored,
+    /// A built-in ticket was closed through `POST /tickets/{id}/status`
+    /// (issue #24, part 2); `detail` carries the previous status. Written
+    /// on the ticket's own row, out of band with the pipeline.
+    Closed,
+    /// A closed built-in ticket was reopened (`filed` again) through the
+    /// same route; `detail` carries the previous status.
+    Reopened,
 }
 
 impl EventKind {
@@ -423,6 +591,8 @@ impl EventKind {
             EventKind::NeedsInfo => "needs_info",
             EventKind::Linked => "linked",
             EventKind::DuplicateIgnored => "duplicate_ignored",
+            EventKind::Closed => "closed",
+            EventKind::Reopened => "reopened",
         }
     }
 }
@@ -453,6 +623,8 @@ impl std::str::FromStr for EventKind {
             "needs_info" => Ok(EventKind::NeedsInfo),
             "linked" => Ok(EventKind::Linked),
             "duplicate_ignored" => Ok(EventKind::DuplicateIgnored),
+            "closed" => Ok(EventKind::Closed),
+            "reopened" => Ok(EventKind::Reopened),
             _ => Err(crate::error::Error::Decode(format!(
                 "unknown event kind `{raw}`"
             ))),
@@ -493,6 +665,10 @@ pub struct Ticket {
     /// The conversation the ticket was escalated from; not unique — one
     /// conversation may escalate more than once.
     pub conversation_id: String,
+    /// What the conversation is (issue #24). Written by the draft stage
+    /// from the drafter's classification; the file stage routes on it.
+    #[serde(default)]
+    pub kind: Kind,
     /// Lifecycle position (`snake_case` wire form).
     pub status: Status,
     /// The stage whose work is currently queued for the ticket.
@@ -594,6 +770,7 @@ mod tests {
             Status::Rejected,
             Status::Duplicate,
             Status::DeadLetter,
+            Status::Closed,
         ] {
             assert_eq!(status.as_str().parse::<Status>(), Ok(status));
             let wire = serde_json::to_string(&status).expect("serialize");
@@ -604,10 +781,27 @@ mod tests {
             );
         }
         assert_eq!("filed".parse::<Status>(), Ok(Status::Filed));
+        assert_eq!("closed".parse::<Status>(), Ok(Status::Closed));
         assert!(
             "FILED".parse::<Status>().is_err(),
             "the wire form is snake_case"
         );
+    }
+
+    #[test]
+    fn kinds_round_trip_through_their_wire_form() {
+        for kind in [Kind::Defect, Kind::SupportCase, Kind::Lead] {
+            assert_eq!(kind.as_str().parse::<Kind>(), Ok(kind));
+            let wire = serde_json::to_string(&kind).expect("serialize");
+            assert_eq!(wire, format!("\"{}\"", kind.as_str()));
+            assert_eq!(serde_json::from_str::<Kind>(&wire).expect("valid"), kind);
+        }
+        assert_eq!(
+            Kind::default(),
+            Kind::Defect,
+            "old payloads default to defect"
+        );
+        assert!("nonsense".parse::<Kind>().is_err());
     }
 
     #[test]
@@ -633,6 +827,8 @@ mod tests {
             EventKind::NeedsInfo,
             EventKind::Linked,
             EventKind::DuplicateIgnored,
+            EventKind::Closed,
+            EventKind::Reopened,
         ] {
             assert_eq!(kind.as_str().parse::<EventKind>(), Ok(kind));
             let wire = serde_json::to_string(&kind).expect("serialize");
@@ -655,11 +851,19 @@ mod tests {
             .map(Value::as_str)
             .collect::<Option<_>>()
             .expect("strings");
-        // `environment` is the one field a transcript may not name.
-        assert_eq!(
-            required,
-            vec!["title", "repro_steps", "expected", "actual", "severity"]
-        );
+        // `title`, `kind` and `severity` are the only fields every kind
+        // must carry; each kind's own fields are optional, so one flat
+        // schema serves a defect, a support case and a lead.
+        assert_eq!(required, vec!["title", "kind", "severity"]);
+        let kind_variants = schema["properties"]["kind"]["enum"]
+            .as_array()
+            .expect("kind enum");
+        for kind in [Kind::Defect, Kind::SupportCase, Kind::Lead] {
+            assert!(
+                kind_variants.contains(&json!(kind.as_str())),
+                "{kind:?} must be in the schema's kind enum"
+            );
+        }
         let severity_variants = schema["properties"]["severity"]["enum"]
             .as_array()
             .expect("severity enum");
@@ -678,17 +882,23 @@ mod tests {
         }
         for field in [
             "title",
+            "kind",
             "repro_steps",
             "expected",
             "actual",
             "environment",
             "severity",
+            "summary",
+            "customer_ask",
+            "company",
+            "seats",
+            "intent",
         ] {
             assert!(schema["properties"].get(field).is_some(), "{field}");
         }
         assert_eq!(
             schema["properties"].as_object().expect("properties").len(),
-            6
+            12
         );
     }
 
@@ -712,6 +922,7 @@ mod tests {
                 "reproducible",
                 "severity_ok",
                 "pii_clean",
+                "kind_ok",
                 "verdict",
                 "reasons"
             ]
@@ -726,6 +937,7 @@ mod tests {
     fn drafted_and_judgment_round_trip_through_serde() {
         let drafted = Drafted {
             title: "Checkout 500s on a used gift card".to_owned(),
+            kind: Kind::Defect,
             repro_steps: vec![
                 "Add an item".to_owned(),
                 "Pay with a part-used gift card".to_owned(),
@@ -734,6 +946,11 @@ mod tests {
             actual: "HTTP 500".to_owned(),
             environment: Some("production".to_owned()),
             severity: Severity::Error,
+            summary: None,
+            customer_ask: None,
+            company: None,
+            seats: None,
+            intent: None,
         };
         let wire = serde_json::to_string(&drafted).expect("serialize");
         assert_eq!(
@@ -741,12 +958,48 @@ mod tests {
             drafted
         );
 
+        // A payload that predates `kind` (and the kind-specific fields)
+        // decodes as a defect — the back-compat contract the serde
+        // defaults exist for.
+        let legacy = json!({
+            "title": "Checkout 500s",
+            "repro_steps": ["pay"],
+            "expected": "an order",
+            "actual": "a 500",
+            "severity": "error",
+        });
+        let decoded: Drafted = serde_json::from_value(legacy).expect("a legacy payload decodes");
+        assert_eq!(decoded.kind, Kind::Defect);
+        assert!(decoded.missing_fields().is_empty());
+
+        // The schema marks the defect fields nullable, so a model that
+        // answers `null` for the fields its kind does not use must decode
+        // (to the same empty defaults an omitted field gets), not
+        // dead-letter the draft stage.
+        let nulled = json!({
+            "title": "How do I add a seat?",
+            "kind": "support_case",
+            "repro_steps": null,
+            "expected": null,
+            "actual": null,
+            "severity": "info",
+            "summary": "Billing question",
+            "customer_ask": "How do I add a seat?",
+        });
+        let decoded: Drafted = serde_json::from_value(nulled).expect("explicit nulls decode");
+        assert_eq!(decoded.kind, Kind::SupportCase);
+        assert!(decoded.repro_steps.is_empty());
+        assert!(decoded.expected.is_empty());
+        assert!(decoded.actual.is_empty());
+        assert!(decoded.missing_fields().is_empty());
+
         let judgment = Judgment {
             is_defect: true,
             reproducible: true,
             duplicate_of: None,
             severity_ok: true,
             pii_clean: true,
+            kind_ok: true,
             verdict: Verdict::File,
             reasons: vec!["the steps hit a real 500".to_owned()],
         };
@@ -755,6 +1008,18 @@ mod tests {
             serde_json::from_str::<Judgment>(&wire).expect("valid"),
             judgment
         );
+
+        // A judgment written before `kind_ok` existed decodes as checked.
+        let legacy = json!({
+            "is_defect": true,
+            "reproducible": true,
+            "severity_ok": true,
+            "pii_clean": true,
+            "verdict": "file",
+            "reasons": ["a real 500"],
+        });
+        let decoded: Judgment = serde_json::from_value(legacy).expect("a legacy judgment decodes");
+        assert!(decoded.kind_ok);
 
         // The stage payload round-trips through the exact string form that
         // rides in the outbox `payload` column.
@@ -771,5 +1036,58 @@ mod tests {
             wire, r#"{"ticket_id":"01JDEMO","tenant_id":"acme"}"#,
             "the payload column stores exactly these two fields"
         );
+    }
+
+    /// `missing_fields` reports exactly the fields a kind needs and no
+    /// others: a defect needs its repro/expected/actual, a support case its
+    /// summary and ask, a lead its company and intent (seats optional).
+    #[test]
+    fn missing_fields_is_kind_specific() {
+        let base = Drafted {
+            title: "t".to_owned(),
+            kind: Kind::Defect,
+            repro_steps: vec!["step".to_owned()],
+            expected: "e".to_owned(),
+            actual: "a".to_owned(),
+            environment: None,
+            severity: Severity::Info,
+            summary: None,
+            customer_ask: None,
+            company: None,
+            seats: None,
+            intent: None,
+        };
+        assert!(base.missing_fields().is_empty());
+
+        let empty_defect = Drafted {
+            kind: Kind::Defect,
+            repro_steps: Vec::new(),
+            expected: String::new(),
+            actual: String::new(),
+            ..base.clone()
+        };
+        assert_eq!(
+            empty_defect.missing_fields(),
+            vec!["repro_steps", "expected", "actual"]
+        );
+
+        // A support case ignores the defect fields entirely.
+        let support = Drafted {
+            kind: Kind::SupportCase,
+            repro_steps: Vec::new(),
+            expected: String::new(),
+            actual: String::new(),
+            summary: Some("how do I export?".to_owned()),
+            ..base.clone()
+        };
+        assert_eq!(support.missing_fields(), vec!["customer_ask"]);
+
+        let lead = Drafted {
+            kind: Kind::Lead,
+            company: Some("Acme".to_owned()),
+            seats: Some(250),
+            ..base.clone()
+        };
+        assert_eq!(lead.missing_fields(), vec!["intent"], "seats is optional");
     }
 }
