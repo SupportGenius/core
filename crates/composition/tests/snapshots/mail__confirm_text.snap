@@ -1,0 +1,16 @@
+---
+source: crates/composition/tests/mail.rs
+expression: rendered.text
+---
+Hold your spot
+
+SupportGenius is admitting members in join order. Confirm your address to hold your place on the waitlist.
+
+Confirm my spot:
+https://supportgeni.us/v1/waitlist/confirm?token=abc123
+
+If you did not join this waitlist, ignore this email: nothing happens until the link is opened.
+
+--
+Sent to ada@example.com because this address was entered on the SupportGenius waitlist.
+SupportGenius · https://supportgeni.us · hello@supportgeni.us

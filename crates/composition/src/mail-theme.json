@@ -1,0 +1,18 @@
+{
+  "brand_name": "SupportGenius",
+  "wordmark": "SupportGenius",
+  "site_url": "https://supportgeni.us",
+  "logo_url": "https://supportgeni.us/assets/email/logo-64.png",
+  "logo_alt": "SupportGenius",
+  "logo_width": 32,
+  "logo_height": 32,
+  "logo_bg": null,
+  "light": {"bg": "#f4f6f9", "card": "#ffffff", "border": "#e1e5ec", "ink": "#0a0c10", "text": "#2b313b", "muted": "#5b6472", "accent": "#1f5fd1", "button": "#5b9dff", "button_text": "#0a0c10", "code_bg": "#eef1f5"},
+  "dark": {"bg": "#0a0c10", "card": "#0f1216", "border": "#272a2e", "ink": "#e7eaef", "text": "#aeb6c3", "muted": "#9aa3b2", "accent": "#5b9dff", "button": "#5b9dff", "button_text": "#0a0c10", "code_bg": "#171b21"},
+  "font": "Geist,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif",
+  "mono": "'Geist Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace",
+  "radius": 14,
+  "button_radius": 10,
+  "footer": [],
+  "contact": "hello@supportgeni.us"
+}

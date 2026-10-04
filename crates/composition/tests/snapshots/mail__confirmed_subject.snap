@@ -1,0 +1,5 @@
+---
+source: crates/composition/tests/mail.rs
+expression: rendered.subject
+---
+You are #42 on the SupportGenius waitlist

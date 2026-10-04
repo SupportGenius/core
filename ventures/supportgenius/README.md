@@ -41,8 +41,13 @@ runs every sweep on the same trigger). The `#[event(scheduled)]` handler in
 4. Set the secrets — each with `npx wrangler secret put <NAME>`:
    - `HARNESS_SECRET` (required, at least 32 bytes; backs the harness
      `Signer` port),
-   - `RESEND_API_KEY` (required; the join endpoint fails loudly without
-     it — there is deliberately no no-op mailer here),
+   - `RESEND_API_KEY` (one of this or `OWLPOST_API_KEY` is required; with
+     neither the join answers `mail-not-configured` — there is
+     deliberately no no-op mailer here),
+   - `OWLPOST_API_KEY` (optional; when set, mail goes through Owlpost and
+     this key takes precedence over `RESEND_API_KEY`. Set
+     `OWLPOST_BASE_URL` to point at a self-hosted instance; verify
+     `send.supportgeni.us` in Owlpost before dropping the Resend key),
    - `TURNSTILE_SECRET` (required for production traffic; without it no
      captcha is mounted),
    - `ANTHROPIC_API_KEY` (optional; mounts the `TextModel` port — see

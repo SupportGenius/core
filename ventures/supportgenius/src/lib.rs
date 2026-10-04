@@ -10,8 +10,11 @@
 //! (this Worker does not mount the module's status UI), while
 //! `GET /v1/waitlist/status` answers the entry's status as JSON.
 //!
-//! **Mail.** When the `RESEND_API_KEY` secret is set, the Resend adapter
-//! sends; when it is absent the adapter reports `SendOutcome::NotConfigured`
+//! **Mail.** When the `OWLPOST_API_KEY` secret is set, the Owlpost
+//! adapter sends (it takes precedence over Resend, so a provider migration
+//! is a secret swap); otherwise, when the `RESEND_API_KEY` secret is set,
+//! the Resend adapter sends. When neither is set the adapter reports
+//! `SendOutcome::NotConfigured`
 //! and every join fails loudly rather than silently capturing an address
 //! whose confirmation never arrives (see `build_mailer` for why this
 //! venture deliberately has no no-op mailer). Mail is sent from
@@ -63,6 +66,7 @@
 use std::sync::{Arc, OnceLock};
 
 use cratefield_adapter_anthropic::Anthropic;
+use cratefield_adapter_owlpost::Owlpost;
 use cratefield_adapter_resend::Resend;
 use cratefield_adapter_turnstile::Turnstile;
 use cratefield_core::{ConfigError, Harness, Mailer, RateLimiter, RoutingTextModel, TextModel};
@@ -165,9 +169,15 @@ pub fn compose(
     Ok((harness, runtime))
 }
 
-/// Resend when `RESEND_API_KEY` is present on the Worker `Env`, else a
-/// keyless Resend adapter that reports `SendOutcome::NotConfigured`
-/// without a network call.
+/// Owlpost when `OWLPOST_API_KEY` is present on the Worker `Env`, else
+/// Resend when `RESEND_API_KEY` is, else a keyless Resend adapter that
+/// reports `SendOutcome::NotConfigured` without a network call.
+///
+/// Owlpost wins when both keys are set — the venture's sending provider is
+/// migrating — and `OWLPOST_BASE_URL` points a self-hosted or proxied
+/// instance at a different origin (unset uses the adapter's default base,
+/// `https://api.owlpost.to`). Both are read from the binding, never
+/// `std::env` (always empty on Workers), exactly as the secrets around them.
 ///
 /// Deliberately different from upstream's fallback, a `NoopMailer` that
 /// reports `SendOutcome::Sent` without sending: reporting success for mail
@@ -176,7 +186,15 @@ pub fn compose(
 /// say so, instead of capturing an address whose confirmation never
 /// arrives.
 fn build_mailer(env: &Env) -> Arc<dyn Mailer> {
-    let key = env
+    let owlpost_key = env
+        .secret("OWLPOST_API_KEY")
+        .ok()
+        .map(|secret| secret.to_string().trim().to_owned())
+        .filter(|key| !key.is_empty());
+    if let Some(key) = owlpost_key {
+        return Arc::new(owlpost(env, Some(key)));
+    }
+    let resend_key = env
         .secret("RESEND_API_KEY")
         .ok()
         .map(|secret| secret.to_string())
@@ -184,10 +202,33 @@ fn build_mailer(env: &Env) -> Arc<dyn Mailer> {
     Arc::new(Resend::new(
         Arc::new(FetchClient),
         Arc::new(WorkersClock),
-        key,
+        resend_key,
         MAIL_FROM,
         None,
     ))
+}
+
+/// An Owlpost adapter with `api_key`, pointed at `OWLPOST_BASE_URL` when
+/// that var is set and non-empty. Factored out so the Worker's `Env` read
+/// of the base URL lives in one place and [`build_mailer`] stays a branch
+/// on which key is present.
+fn owlpost(env: &Env, api_key: Option<String>) -> Owlpost {
+    let adapter = Owlpost::new(
+        Arc::new(FetchClient),
+        Arc::new(WorkersClock),
+        api_key,
+        MAIL_FROM,
+        None,
+    );
+    match env
+        .var("OWLPOST_BASE_URL")
+        .ok()
+        .map(|var| var.to_string().trim().to_owned())
+        .filter(|url| !url.is_empty())
+    {
+        Some(base_url) => adapter.with_base_url(base_url),
+        None => adapter,
+    }
 }
 
 /// Turnstile when `TURNSTILE_SECRET` is present on the Worker `Env`, else

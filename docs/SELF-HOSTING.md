@@ -30,6 +30,8 @@ BLOB_DIR=/var/lib/supportgenius/blobs
 TURNSTILE_SECRET=REPLACE_WITH_YOUR_WIDGET_SECRET
 TURNSTILE_HOSTNAME=supportgeni.us
 RESEND_API_KEY=REPLACE_WITH_YOUR_RESEND_KEY
+# Optional: send through Owlpost instead of Resend (takes precedence):
+# OWLPOST_API_KEY=REPLACE_WITH_YOUR_OWLPOST_KEY
 EOF
 sudo chmod 600 /etc/supportgenius.env
 sudo tee /etc/systemd/system/supportgenius.service >/dev/null <<'EOF'
@@ -65,12 +67,14 @@ variables; only the injection differs. Every knob is in
 | `REDIS_URL` | `ENV=production` | Backs `RateLimiter` + `KeyValue`; production **refuses to boot** without it. |
 | `TURNSTILE_SECRET` | `ENV=production`, for `/v1/*` | Without it the production gate answers `503 not-production-ready` to every `/v1/*`. |
 | `TURNSTILE_HOSTNAME` | with the above | Expected widget hostname; without it the captcha is present but not *effectively configured*, so the gate still refuses `/v1/*`. |
-| `RESEND_API_KEY` | to actually send mail | Unset, no confirmation mail is sent. |
+| `RESEND_API_KEY` | to actually send mail | One of this or `OWLPOST_API_KEY` is required; with neither, a join answers `mail-not-configured` and no confirmation mail is sent. |
+| `OWLPOST_API_KEY` | — | Optional; when set it takes precedence over `RESEND_API_KEY` and mail goes through Owlpost. Pair with `OWLPOST_BASE_URL` for a self-hosted instance. |
 | `ENV` | — | Unset/blank = development. `production` turns on the gates above. |
 
 Everything else is optional with a working default: `LISTEN_ADDR`,
 `DATABASE_URL` (SQLite `./supportgenius.db`), `BLOB_DIR` (unset = uploads
 answer `503 not-ready`), `ANTHROPIC_API_KEY`, `MAIL_FROM`/`MAIL_REPLY_TO`,
+`OWLPOST_BASE_URL`,
 `SUPPORTGENIUS_MODEL_FAST`/`STRONG`, `ADMIN_TOKEN`, `CRONS` (the compiled
 schedule), `FZ_APPLY_MIGRATIONS`, `SUPPORTGENIUS_DOMAIN`/`PUBLIC_URL`/`CORS_ORIGINS`,
 `TRUSTED_PROXY_HEADERS`, `RATE_LIMIT_MAX`/`_PERIOD_SECS`.

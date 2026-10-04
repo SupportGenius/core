@@ -56,6 +56,7 @@ mod dev_fakes;
 use std::sync::Arc;
 
 use cratefield_adapter_anthropic::Anthropic;
+use cratefield_adapter_owlpost::Owlpost;
 use cratefield_adapter_resend::Resend;
 use cratefield_adapter_sqlite::SqliteDatabase;
 use cratefield_adapter_turnstile::Turnstile;
@@ -179,9 +180,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let clock: Arc<dyn Clock> = Arc::new(TokioClock);
 
     // The Mailer port is wired always — the waitlist module `requires()`
-    // Db + Mailer + Signer, so the port must be present to boot. With no
-    // `RESEND_API_KEY`, Resend answers `SendOutcome::NotConfigured` and
-    // sends nothing: the same no-`NoopMailer` policy the Worker
+    // Db + Mailer + Signer, so the port must be present to boot. With
+    // neither `OWLPOST_API_KEY` (which takes precedence) nor
+    // `RESEND_API_KEY` set the adapter answers `SendOutcome::NotConfigured`
+    // and sends nothing: the same no-`NoopMailer` policy the Worker
     // documents, reporting success for mail that was never sent is the
     // silent-failure shape this venture refuses.
     let dev_fakes = config.get("SUPPORTGENIUS_DEV_FAKES").is_some();
@@ -444,21 +446,46 @@ fn venture_from_env(config: EnvConfig) -> Venture {
     })
 }
 
-/// The production mailer: Resend, with the key from the environment. No
-/// key answers `NotConfigured` rather than pretending — see `run`.
+/// The production mailer, in precedence order: **Owlpost** when
+/// `OWLPOST_API_KEY` is set, else **Resend** when `RESEND_API_KEY` is, else
+/// a keyless Resend that answers `NotConfigured` rather than pretending —
+/// see `run`. `OWLPOST_BASE_URL` points Owlpost at a self-hosted or proxied
+/// instance when set (unset uses `https://api.owlpost.to`); `MAIL_FROM` and
+/// `MAIL_REPLY_TO` apply to whichever adapter is chosen.
 fn real_mailer(
     config: EnvConfig,
     http: &Arc<dyn HttpClient>,
     clock: &Arc<dyn Clock>,
 ) -> Arc<dyn Mailer> {
+    let non_empty = |key: &str| {
+        config
+            .get(key)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    let from = config
+        .get("MAIL_FROM")
+        .unwrap_or_else(|| composition::MAIL_FROM.to_owned());
+    let reply_to = config.get("MAIL_REPLY_TO");
+    if let Some(key) = non_empty("OWLPOST_API_KEY") {
+        let adapter = Owlpost::new(
+            Arc::clone(http),
+            Arc::clone(clock),
+            Some(key),
+            from,
+            reply_to,
+        );
+        return Arc::new(match non_empty("OWLPOST_BASE_URL") {
+            Some(base_url) => adapter.with_base_url(base_url),
+            None => adapter,
+        });
+    }
     Arc::new(Resend::new(
         Arc::clone(http),
         Arc::clone(clock),
         config.get("RESEND_API_KEY"),
-        config
-            .get("MAIL_FROM")
-            .unwrap_or_else(|| composition::MAIL_FROM.to_owned()),
-        config.get("MAIL_REPLY_TO"),
+        from,
+        reply_to,
     ))
 }
 

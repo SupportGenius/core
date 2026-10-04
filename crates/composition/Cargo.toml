@@ -14,6 +14,9 @@ workspace = true
 [dependencies]
 cratefield-core = { workspace = true }
 cratefield-module-waitlist = { workspace = true }
+# The venture's mail theme (`MailTheme::from_json` over the committed
+# `src/mail-theme.json`) and the waitlist templates rendered in it.
+cratefield-mail-templates = { workspace = true }
 module-support = { path = "../module-support" }
 # Both modules register here, and this crate adapts escalation to support's
 # handoff port (see `EscalationHandoff`). Not a dependency of either module
@@ -39,3 +42,6 @@ bytes = { workspace = true }
 # the same line cratefield-testing builds against so one tower compiles.
 tower = { version = "0.5.3", features = ["util"] }
 serde_json = { workspace = true }
+# `tests/mail.rs` snapshots both waitlist mails rendered in the venture's
+# theme; the same 1.x line the upstream waitlist snapshots its own with.
+insta = "1.48.0"

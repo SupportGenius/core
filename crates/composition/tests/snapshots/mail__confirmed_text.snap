@@ -1,0 +1,14 @@
+---
+source: crates/composition/tests/mail.rs
+expression: rendered.text
+---
+You are #42
+
+Your spot on the SupportGenius waitlist is confirmed. You are number 42 in line.
+
+Check my place:
+https://supportgeni.us/v1/waitlist/status?token=def456
+
+--
+Sent to ada@example.com because you confirmed your spot on the SupportGenius waitlist.
+SupportGenius · https://supportgeni.us · hello@supportgeni.us

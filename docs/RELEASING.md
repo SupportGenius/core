@@ -58,8 +58,8 @@ used):
   `/__health`'s `mailer`/`captcha` are the harness's own port fields. Note
   the venture always mounts a mailer (a keyless Resend adapter still reports
   its port configured), so the `mailer` check proves the port is mounted,
-  not that `RESEND_API_KEY` is set — the one real join below is what proves
-  that;
+  not that `RESEND_API_KEY` (or an `OWLPOST_API_KEY` that takes precedence
+  over it) is set — the one real join below is what proves that;
 - it skips with a `::notice::` when the `CLOUDFLARE_API_TOKEN` secret is
   unset (`preflight` emits `configured=false` and both deploy jobs skip, so
   `main` stays green), and fails the `preflight` step — naming the
@@ -83,7 +83,8 @@ npx wrangler d1 create supportgenius-staging
 # paste each returned database_id into wrangler.toml ([d1_databases] and [env.staging])
 npx wrangler r2 bucket create supportgenius-uploads
 npx wrangler secret put HARNESS_SECRET      # required, >= 32 bytes
-npx wrangler secret put RESEND_API_KEY      # required
+npx wrangler secret put RESEND_API_KEY      # required, unless OWLPOST_API_KEY is set
+npx wrangler secret put OWLPOST_API_KEY     # optional; takes precedence over RESEND_API_KEY
 npx wrangler secret put TURNSTILE_SECRET    # required for production traffic
 npx wrangler secret put ADMIN_TOKEN         # optional (admin CSV export)
 npx wrangler secret put ANTHROPIC_API_KEY   # optional (grounded answers)
@@ -91,6 +92,10 @@ npx wrangler secret put ANTHROPIC_API_KEY   # optional (grounded answers)
 npx wrangler d1 migrations apply DB --remote
 npx wrangler deploy                          # or push the tag and let deploy.yml deploy
 ```
+
+Before setting `OWLPOST_API_KEY`, verify the sending domain
+(`send.supportgeni.us`) in Owlpost; keep `RESEND_API_KEY` until a real join
+confirms Owlpost delivers, then remove it.
 
 Confirm the `RATE_LIMITER`/`VISITOR_RATE_LIMITER` `namespace_id`s are unique in the account (1001/1002 production, 1003/1004 staging), then smoke and do one real join before opening the form:
 

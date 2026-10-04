@@ -1,0 +1,5 @@
+---
+source: crates/composition/tests/mail.rs
+expression: rendered.subject
+---
+Confirm your spot on the SupportGenius waitlist
