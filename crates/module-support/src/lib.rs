@@ -83,14 +83,20 @@ mod connectors;
 mod extract;
 mod handlers;
 mod handoff;
+/// MCP over Streamable HTTP (issue #34). Public so an MCP client test can
+/// name the tool argument types and compare their derived schemas with
+/// what `tools/list` serves.
+pub mod mcp;
 mod messages;
+mod openapi;
 pub mod store;
 mod uploads;
 mod widget;
 
 pub use answer::DEFAULT_ANSWER_THRESHOLD;
 pub use chunk::tokenize;
-pub use handoff::HandoffSink;
+pub use handoff::{HandoffSink, TicketView};
+pub use messages::MessageBody;
 // The tokenizer and BM25 ranker now live in the shared `lexical` crate
 // (escalation's duplicate scoring tokenizes with the same rules); this
 // re-export keeps `module_support::bm25` — and `crate::bm25` inside the
@@ -263,6 +269,12 @@ pub struct Support {
     /// `needs_escalation` and nothing files a ticket.
     handoff: Option<Arc<dyn HandoffSink>>,
     visitor_rate_limiter: Option<Arc<dyn cratefield_core::RateLimiter>>,
+    /// Other modules' surfaces the `OpenAPI` document (`GET /openapi.json`,
+    /// issue #34) covers, paired with the module name their paths mount
+    /// under. The composition injects `("escalation", …)` because
+    /// module-support cannot depend on module-escalation; the document
+    /// then spans `/v1/support` and `/v1/escalation`.
+    api_surfaces: Vec<(String, cratefield_core::Surface)>,
 }
 
 impl Support {
@@ -275,7 +287,23 @@ impl Support {
         Self {
             handoff: None,
             visitor_rate_limiter: None,
+            api_surfaces: Vec::new(),
         }
+    }
+
+    /// Adds another module's `surface` to the `OpenAPI` document this module
+    /// serves at `GET /openapi.json`, under `module`'s mount (`/v1/<module>`).
+    /// The composition calls this with escalation's surface, so one
+    /// document describes both `/v1/support/*` and `/v1/escalation/*`
+    /// without this module depending on that one.
+    #[must_use]
+    pub fn with_api_surface(
+        mut self,
+        module: impl Into<String>,
+        surface: cratefield_core::Surface,
+    ) -> Self {
+        self.api_surfaces.push((module.into(), surface));
+        self
     }
 
     /// A `Support` that hands an escalating turn to `handoff`: the sink's
@@ -528,7 +556,16 @@ impl Module for Support {
             text_model,
             self.handoff.clone(),
             visitor_rate_limiter,
+            self.api_surfaces.clone(),
         )
+    }
+
+    /// The routes this module mounts (ADR 0010), plus whatever
+    /// [`with_api_surface`](Support::with_api_surface) added is **not**
+    /// declared here: it belongs to its own module, whose `surface()` the
+    /// harness composes. This is support's own declaration alone.
+    fn surface(&self) -> cratefield_core::Surface {
+        handlers::surface()
     }
 
     /// The re-index drain: every chunk whose `tokenizer_version` stamp

@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::put;
 use serde::Deserialize;
@@ -29,8 +29,8 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use cratefield_core::{
-    Credential, Database, Destination, Json, ModuleContext, Problem, ProblemDef, Scope,
-    SystemClock, TrackerError, require_admin,
+    Action, Audience, Credential, Database, Destination, Json, ModuleContext, Outcome, Problem,
+    ProblemDef, RoutePolicy, Scope, Surface, SystemClock, TrackerError, require_admin,
 };
 use cratefield_kms::Kms;
 use cratefield_secrets::{Actor, SecretBytes};
@@ -132,6 +132,55 @@ pub(crate) fn router(
             put(put_admin).get(get_admin).delete(delete_admin),
         )
         .with_state(state)
+}
+
+/// The module's declared surface (ADR 0010): one action per route
+/// [`router`] mounts, so `GET /__surface` and the `OpenAPI` document
+/// describe exactly what exists. The tenant routes carry
+/// [`RoutePolicy::ApiKey`]; the admin routes are [`Audience::Admin`].
+pub(crate) fn surface() -> Surface {
+    let key = RoutePolicy::ApiKey;
+    Surface::new()
+        .action(
+            Action::new("put-destinations", Method::PUT, "/destinations")
+                .policy(key)
+                .outcome(Outcome::Json),
+        )
+        .action(
+            Action::get("get-destinations", "/destinations")
+                .audience(Audience::Public)
+                .policy(key)
+                .outcome(Outcome::Json),
+        )
+        .action(
+            Action::delete("delete-destinations", "/destinations")
+                .audience(Audience::Public)
+                .policy(key),
+        )
+        .action(
+            Action::new(
+                "put-admin-destinations",
+                Method::PUT,
+                "/admin/tenants/{tenant_id}/destinations",
+            )
+            .audience(Audience::Admin)
+            .outcome(Outcome::Json),
+        )
+        .action(
+            Action::get(
+                "get-admin-destinations",
+                "/admin/tenants/{tenant_id}/destinations",
+            )
+            .audience(Audience::Admin)
+            .outcome(Outcome::Json),
+        )
+        .action(
+            Action::delete(
+                "delete-admin-destinations",
+                "/admin/tenants/{tenant_id}/destinations",
+            )
+            .audience(Audience::Admin),
+        )
 }
 
 /// One `PUT` body: the destination and the credential to file with, the

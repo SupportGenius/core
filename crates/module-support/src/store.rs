@@ -1607,6 +1607,66 @@ pub(crate) struct Turn {
     pub lang: Option<String>,
 }
 
+/// Opens a conversation with no turn behind it: a new `sg_conversations`
+/// row, `escalated` when `escalated`. Used by [`turn_statements`] when a
+/// turn creates its conversation, and by the MCP `escalate` tool's
+/// transcript-only form (issue #34), which mints a conversation id for a
+/// handoff that never passed through `POST /messages`.
+pub(crate) fn open_conversation_stmt(
+    tenant_id: &str,
+    conversation_id: &str,
+    escalated: bool,
+    now: &str,
+) -> Statement {
+    let status = if escalated {
+        CONVERSATION_ESCALATED
+    } else {
+        CONVERSATION_OPEN
+    };
+    let mut insert = Query::insert();
+    insert
+        .into_table(iden("sg_conversations"))
+        .columns([
+            "id",
+            "tenant_id",
+            "status",
+            "needs_escalation",
+            "created_at",
+            "updated_at",
+        ])
+        .values_panic([
+            conversation_id.to_owned().into(),
+            tenant_id.to_owned().into(),
+            status.into(),
+            i64::from(escalated).into(),
+            now.to_owned().into(),
+            now.to_owned().into(),
+        ]);
+    Statement::render(&insert)
+}
+
+/// Marks an existing conversation `escalated` — `status = 'escalated'`,
+/// `needs_escalation = 1` — the monotonic flag a handoff sets. Shared by
+/// [`turn_statements`] and the MCP `escalate` tool's conversation form
+/// (issue #34), so both leave a conversation exactly as the other does.
+pub(crate) fn escalate_conversation_stmt(
+    tenant_id: &str,
+    conversation_id: &str,
+    now: &str,
+) -> Statement {
+    let mut update = Query::update();
+    update
+        .table(iden("sg_conversations"))
+        .values([
+            (iden("status"), CONVERSATION_ESCALATED.into()),
+            (iden("needs_escalation"), 1_i64.into()),
+        ])
+        .value(iden("updated_at"), now.to_owned())
+        .and_where(Expr::col(iden("id")).eq(conversation_id))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id));
+    Statement::render(&update)
+}
+
 /// The statements for one turn: the conversation (insert or update) plus
 /// the user message and the assistant message. The caller runs them in
 /// **one** `batch_atomic`, so a half turn — a conversation with no
@@ -1614,45 +1674,24 @@ pub(crate) struct Turn {
 /// crash between statements.
 pub(crate) fn turn_statements(turn: &Turn) -> Vec<Statement> {
     let conversation = if turn.conversation_existed {
-        let mut update = Query::update();
-        update.table(iden("sg_conversations"));
         if turn.escalates {
-            update.values([
-                (iden("status"), CONVERSATION_ESCALATED.into()),
-                (iden("needs_escalation"), 1_i64.into()),
-            ]);
-        }
-        update
-            .value(iden("updated_at"), turn.now.clone())
-            .and_where(Expr::col(iden("id")).eq(turn.conversation_id.as_str()))
-            .and_where(Expr::col(iden("tenant_id")).eq(turn.tenant_id.as_str()));
-        Statement::render(&update)
-    } else {
-        let status = if turn.escalates {
-            CONVERSATION_ESCALATED
+            escalate_conversation_stmt(&turn.tenant_id, &turn.conversation_id, &turn.now)
         } else {
-            CONVERSATION_OPEN
-        };
-        let mut insert = Query::insert();
-        insert
-            .into_table(iden("sg_conversations"))
-            .columns([
-                "id",
-                "tenant_id",
-                "status",
-                "needs_escalation",
-                "created_at",
-                "updated_at",
-            ])
-            .values_panic([
-                turn.conversation_id.clone().into(),
-                turn.tenant_id.clone().into(),
-                status.into(),
-                i64::from(turn.escalates).into(),
-                turn.now.clone().into(),
-                turn.now.clone().into(),
-            ]);
-        Statement::render(&insert)
+            let mut update = Query::update();
+            update.table(iden("sg_conversations"));
+            update
+                .value(iden("updated_at"), turn.now.clone())
+                .and_where(Expr::col(iden("id")).eq(turn.conversation_id.as_str()))
+                .and_where(Expr::col(iden("tenant_id")).eq(turn.tenant_id.as_str()));
+            Statement::render(&update)
+        }
+    } else {
+        open_conversation_stmt(
+            &turn.tenant_id,
+            &turn.conversation_id,
+            turn.escalates,
+            &turn.now,
+        )
     };
 
     let mut messages = Query::insert();

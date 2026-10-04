@@ -2313,6 +2313,7 @@ dependencies = [
  "lexical",
  "lopdf",
  "pollster",
+ "schemars",
  "sea-query",
  "serde",
  "serde_json",
