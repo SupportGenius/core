@@ -55,7 +55,14 @@ comes from crates.io on that one core line — see the comment in
 
 ## Destinations
 
-An escalation is filed into one tracker per tenant (`sg_destinations`).
+An escalation is routed by its *kind* (`defect`, `support_case` or `lead`,
+issue #24): a `(tenant, kind)` row in `sg_routes` names the tracker it
+files into, a defect with no such row falls back to the tenant's legacy
+`sg_destinations` row, and a kind with no route at all files into the
+module's own built-in ticketing (`local:<ticket-id>`) rather than
+dead-lettering. A tenant lists, reads and closes its built-in tickets with
+`GET /v1/escalation/tickets`, `GET /v1/escalation/tickets/{id}` and
+`POST /v1/escalation/tickets/{id}/status`, all scoped by its `sg_…` key.
 Which trackers a build *can* file into is a compile-time fact, not config:
 the adapters are cargo features (`tracker-github`, `tracker-webhook`, both
 on by default), and `module-escalation`'s `check_destination` refuses any

@@ -90,6 +90,9 @@ impl Intake {
             id: ticket_id.clone(),
             tenant_id: tenant_id.to_owned(),
             conversation_id: conversation_id.to_owned(),
+            // The drafter classifies the conversation; until it does, the
+            // ticket is the only kind that could be known at intake.
+            kind: crate::model::Kind::Defect,
             status: crate::model::Status::Intake,
             stage: Stage::Draft,
             transcript: transcript.to_owned(),
@@ -302,7 +305,11 @@ mod tests {
         let db = cratefield_adapter_sqlite::SqliteDatabase::in_memory().expect("in-memory db");
         db.apply_migrations(
             "module-escalation",
-            &[crate::MIGRATION_ESCALATION, crate::MIGRATION_DUPLICATES],
+            &[
+                crate::MIGRATION_ESCALATION,
+                crate::MIGRATION_DUPLICATES,
+                crate::MIGRATION_ROUTING,
+            ],
         )
         .expect("migration applies");
 

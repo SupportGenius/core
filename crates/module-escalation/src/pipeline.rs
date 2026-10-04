@@ -41,7 +41,7 @@ use time::format_description::well_known::Rfc3339;
 use crate::error::Error;
 use crate::intake::OUTBOX_TABLE;
 use crate::model::{
-    Drafted, EventKind, Judgment, Stage, StagePayload, Status, Ticket, Verdict, stage_seq,
+    Drafted, EventKind, Judgment, Kind, Stage, StagePayload, Status, Ticket, Verdict, stage_seq,
     webhook_events,
 };
 use crate::store;
@@ -185,6 +185,18 @@ impl Default for RetryPolicy {
 
 // ---------------------------------------------------------------------------
 // Pipeline
+
+/// Where the file stage sent a ticket: to the `Tracker` port, or into the
+/// module's own built-in ticketing (no route configured, or a route naming
+/// [`store::RouteTarget::Local`]).
+enum FileOutcome {
+    /// Handed to the `Tracker` port: its reference and the destination's
+    /// [`kind`](cratefield_core::Destination::kind).
+    Tracker(Filed, &'static str),
+    /// Filed into built-in ticketing: no tracker call was made and the
+    /// reference is the synthetic `local:<ticket id>`.
+    Local,
+}
 
 /// The four-stage runner. Owned and `Clone` (every field is an `Arc` or
 /// smaller), so a stage can hand a clone of the whole pipeline into a
@@ -446,6 +458,17 @@ impl Pipeline {
             }
         };
 
+        // A draft that left out a field its kind requires is parked as
+        // `needs_info` here, deterministically, before the judge is even
+        // asked: an incomplete lead or support case must never reach a
+        // tracker, and no model gets to overrule that (issue #24).
+        let missing = drafted.missing_fields();
+        if !missing.is_empty() {
+            return self
+                .commit_draft_needs_info(record, ticket, &drafted, &missing, at)
+                .await;
+        }
+
         let body = render_body_markdown(&drafted);
         let mut detail = serde_json::to_value(&drafted).map_err(Error::from)?;
         insert_detail(&mut detail, "body_markdown", json!(body));
@@ -478,6 +501,73 @@ impl Pipeline {
                 &ticket.id,
                 &ticket.tenant_id,
                 Stage::Judge,
+                at,
+            ),
+            store::outbox_complete_stmt(OUTBOX_TABLE, &record.id),
+        ];
+        self.commit(&batch).await?;
+        self.defer_next();
+        Ok(())
+    }
+
+    /// The deterministic completion gate's outcome (issue #24): a draft
+    /// missing a field its kind requires is committed as-is and parked as
+    /// `needs_info`, with a question naming what is missing, then handed to
+    /// the notify stage — never to the judge, never to a tracker. The
+    /// batch mirrors the `needs_info` verdict's (see `commit_judgment`),
+    /// but there is no judgment yet to record.
+    async fn commit_draft_needs_info(
+        &self,
+        record: &OutboxRecord,
+        ticket: &Ticket,
+        drafted: &Drafted,
+        missing: &[&str],
+        at: &str,
+    ) -> Result<(), Error> {
+        let question = compose_missing_fields_question(drafted.kind, missing);
+        let body = render_body_markdown(drafted);
+        let mut detail = serde_json::to_value(drafted).map_err(Error::from)?;
+        insert_detail(&mut detail, "body_markdown", json!(body));
+        let asked = json!({
+            "kind": drafted.kind.as_str(),
+            "missing_fields": missing,
+            "question": question,
+        });
+        let batch = [
+            store::insert_event_stmt(
+                &self.idgen.ulid(),
+                &ticket.id,
+                stage_seq(Stage::Draft, 0),
+                at,
+                Stage::Draft,
+                EventKind::DraftCompleted,
+                &detail,
+            ),
+            store::insert_event_stmt(
+                &self.idgen.ulid(),
+                &ticket.id,
+                stage_seq(Stage::Draft, 1),
+                at,
+                Stage::Draft,
+                EventKind::NeedsInfo,
+                &asked,
+            ),
+            store::update_ticket_draft_stmt(
+                &ticket.id,
+                drafted,
+                &body,
+                ticket.customer_question.as_deref(),
+                at,
+            ),
+            store::update_ticket_question_stmt(&ticket.id, &question, at),
+            store::update_ticket_status_stmt(&ticket.id, Status::NeedsInfo, at),
+            store::update_ticket_stage_stmt(&ticket.id, Stage::Notify, at),
+            store::enqueue_stage_stmt(
+                &self.outbox,
+                &self.idgen.ulid(),
+                &ticket.id,
+                &ticket.tenant_id,
+                Stage::Notify,
                 at,
             ),
             store::outbox_complete_stmt(OUTBOX_TABLE, &record.id),
@@ -591,18 +681,6 @@ impl Pipeline {
         judge_completed: Statement,
         at: &str,
     ) -> Result<(), Error> {
-        // Two of the branches enqueue the stage the verdict leads to.
-        let enqueue = |stage: Stage| {
-            store::enqueue_stage_stmt(
-                &self.outbox,
-                &self.idgen.ulid(),
-                &ticket.id,
-                &ticket.tenant_id,
-                stage,
-                at,
-            )
-        };
-
         match judgment.verdict {
             // `commit_file` refuses a draft the judge found carrying
             // customer PII (`pii_clean: false`): it is blocked, never filed.
@@ -629,6 +707,7 @@ impl Pipeline {
                     "reasons": judgment.reasons,
                     "flags": {
                         "is_defect": judgment.is_defect,
+                        "kind_ok": judgment.kind_ok,
                         "reproducible": judgment.reproducible,
                         "severity_ok": judgment.severity_ok,
                         "pii_clean": judgment.pii_clean,
@@ -657,32 +736,67 @@ impl Pipeline {
                 // Not a filing: a question for the customer, phrased from
                 // the judge's reasons and stored on the ticket, then the
                 // *notify* stage (not file) delivers it.
-                let question = compose_needs_info_question(&judgment.reasons);
-                let asked = json!({ "question": question, "reasons": judgment.reasons });
-                let needs_info = store::insert_event_stmt(
-                    &self.idgen.ulid(),
-                    &ticket.id,
-                    stage_seq(Stage::Judge, 1),
+                self.commit_needs_info(
+                    record,
+                    ticket,
+                    judgment,
+                    vec![judge_completed],
+                    &judgment.reasons,
                     at,
-                    Stage::Judge,
-                    EventKind::NeedsInfo,
-                    &asked,
-                );
-                let batch = [
-                    judge_completed,
-                    needs_info,
-                    store::update_ticket_judgment_stmt(&ticket.id, judgment, at),
-                    store::update_ticket_question_stmt(&ticket.id, &question, at),
-                    store::update_ticket_status_stmt(&ticket.id, Status::NeedsInfo, at),
-                    store::update_ticket_stage_stmt(&ticket.id, Stage::Notify, at),
-                    enqueue(Stage::Notify),
-                    store::outbox_complete_stmt(OUTBOX_TABLE, &record.id),
-                ];
-                self.commit(&batch).await?;
-                self.defer_next();
-                Ok(())
+                )
+                .await
             }
         }
+    }
+
+    /// Parks a ticket as `needs_info` at the judge stage: a question
+    /// phrased from `reasons` is stored on the ticket, and the notify
+    /// stage (not file) delivers it. Shared by the `needs_info` verdict
+    /// and the kind-completion gate (`kind_ok: false`) so both answer the
+    /// customer the same way. `leading` carries the statements that come
+    /// first in the batch — the `judge_completed` row, plus the
+    /// `duplicate_ignored` event when a `duplicate` verdict fell back to
+    /// needing more information.
+    async fn commit_needs_info(
+        &self,
+        record: &OutboxRecord,
+        ticket: &Ticket,
+        judgment: &Judgment,
+        leading: Vec<Statement>,
+        reasons: &[String],
+        at: &str,
+    ) -> Result<(), Error> {
+        let question = compose_needs_info_question(reasons);
+        let asked = json!({ "question": question, "reasons": reasons });
+        let needs_info = store::insert_event_stmt(
+            &self.idgen.ulid(),
+            &ticket.id,
+            stage_seq(Stage::Judge, 1),
+            at,
+            Stage::Judge,
+            EventKind::NeedsInfo,
+            &asked,
+        );
+        let mut batch = leading;
+        batch.extend([
+            needs_info,
+            store::update_ticket_judgment_stmt(&ticket.id, judgment, at),
+            store::update_ticket_question_stmt(&ticket.id, &question, at),
+            store::update_ticket_status_stmt(&ticket.id, Status::NeedsInfo, at),
+            store::update_ticket_stage_stmt(&ticket.id, Stage::Notify, at),
+            store::enqueue_stage_stmt(
+                &self.outbox,
+                &self.idgen.ulid(),
+                &ticket.id,
+                &ticket.tenant_id,
+                Stage::Notify,
+                at,
+            ),
+            store::outbox_complete_stmt(OUTBOX_TABLE, &record.id),
+        ]);
+        self.commit(&batch).await?;
+        self.defer_next();
+        Ok(())
     }
 
     /// Resolves a `duplicate` verdict: link when the judge named a shown
@@ -729,7 +843,11 @@ impl Pipeline {
     /// `duplicate` verdict that had to fall back (invalid or missing
     /// target). `ignored` is the `duplicate_ignored` event for that
     /// fallback — so the trail shows the duplicate verdict was seen and
-    /// what (if anything) it named.
+    /// what (if anything) it named. Two gates stand between the verdict and
+    /// the tracker: the PII gate (never file a draft the judge found
+    /// unclean) and the kind gate (never file a draft whose kind the judge
+    /// could not confirm), the latter parking the ticket for more
+    /// information (issue #24).
     async fn commit_file(
         &self,
         record: &OutboxRecord,
@@ -746,6 +864,28 @@ impl Pipeline {
         if !judgment.pii_clean {
             return self
                 .block_for_pii(record, ticket, judgment, judge_completed, ignored, at)
+                .await;
+        }
+        // The judge's kind gate (issue #24): a draft whose kind does not
+        // fit, or that is missing a field its kind requires, must not be
+        // filed — but it is not a rejection either, so it is parked as
+        // `needs_info` for the customer to complete, exactly as a
+        // `needs_info` verdict is. Checked after the PII gate so blocking
+        // for PII keeps its own distinguishable trail.
+        if !judgment.kind_ok {
+            let fallback = vec![format!(
+                "we could not confirm this is a complete {} as written",
+                ticket.kind.as_str()
+            )];
+            let reasons = if judgment.reasons.is_empty() {
+                &fallback
+            } else {
+                &judgment.reasons
+            };
+            let mut leading = vec![judge_completed];
+            leading.extend(ignored);
+            return self
+                .commit_needs_info(record, ticket, judgment, leading, reasons, at)
                 .await;
         }
         let mut batch = vec![judge_completed];
@@ -892,12 +1032,15 @@ impl Pipeline {
     // ------------------------------------------------------------------
     // Stage: file
 
-    /// One tracker call. Everything before it — destination lookup,
-    /// credential resolution from the Config port, the draft — is local
-    /// resolution; the call is the stage's one HttpClient-bound port call.
-    /// The idempotency key is derived from the ticket id alone, so a retry
-    /// after a lost response presents the same key and the tracker
-    /// collapses it instead of filing a second ticket.
+    /// One tracker call — or none at all. Everything before it (route
+    /// lookup, credential resolution, the draft) is local resolution; the
+    /// call is the stage's one HttpClient-bound port call. The idempotency
+    /// key is derived from the ticket id alone, so a retry after a lost
+    /// response presents the same key and the tracker collapses it instead
+    /// of filing a second ticket. A ticket with no route — or one whose
+    /// route is the built-in ticketing — files locally and never touches
+    /// the port (issue #24), so a tenant that has not configured a tracker
+    /// still gets a filed ticket rather than a dead-lettered one.
     async fn run_file(
         &self,
         record: &OutboxRecord,
@@ -905,12 +1048,28 @@ impl Pipeline {
         at: &str,
     ) -> Result<(), Error> {
         match self.file_ticket(ticket).await {
-            Ok((filed, kind)) => {
-                // A tracker's `Filed::url` is its public issue link (useful in
-                // a notification); a `webhook` destination's is the endpoint
-                // *itself* — credential material (issue #23) — so it reaches
-                // neither the audit row nor the event payload.
-                let url_is_public = kind != "webhook";
+            Ok(outcome) => {
+                let (filed, kind, url_is_public) = match outcome {
+                    FileOutcome::Tracker(filed, kind) => {
+                        // A tracker's `Filed::url` is its public issue link
+                        // (useful in a notification); a `webhook`
+                        // destination's is the endpoint *itself* — credential
+                        // material (issue #23) — so it reaches neither the
+                        // audit row nor the event payload.
+                        let url_is_public = kind != "webhook";
+                        (filed, kind, url_is_public)
+                    }
+                    // Built-in ticketing: a synthetic reference, no URL
+                    // (there is none to link to, and one is never invented).
+                    FileOutcome::Local => (
+                        Filed {
+                            external_id: format!("{}:{}", store::LOCAL_ROUTE, ticket.id),
+                            url: String::new(),
+                        },
+                        store::LOCAL_ROUTE,
+                        false,
+                    ),
+                };
                 let mut detail = json!({
                     "external_id": filed.external_id.clone(),
                 });
@@ -966,9 +1125,9 @@ impl Pipeline {
                 Ok(())
             }
             // A transient tracker failure retries under the policy; a
-            // rejection, an unauthorized credential or a missing
-            // destination dead-letters — `fail` sorts one from the other,
-            // and both write their reason into a `file_dead_lettered`
+            // rejection, an unauthorized credential or an undecodable
+            // draft dead-letters — `fail` sorts one from the other, and
+            // both write their reason into a `file_dead_lettered`
             // / `file_retry_scheduled` row.
             Err(err) => {
                 self.fail(record, Stage::File, &ticket.id, &ticket.tenant_id, err, at)
@@ -977,17 +1136,15 @@ impl Pipeline {
         }
     }
 
-    /// The file stage's port call, with the tenant's destination and
-    /// per-call credential resolved first. Any gap — no drafted ticket to
-    /// file, no destination row, no credential behind the stored ref — is
-    /// a terminal decode error, which dead-letters. A webhook's filed URL
-    /// is blanked: it is the destination's own secret.
-    ///
-    /// Returns the tracker's [`Filed`] answer and the destination's
-    /// [`kind`](cratefield_core::Destination::kind) (never the destination
-    /// itself — a `Webhook` variant is credential material), which the
-    /// `escalation.filed` event reports.
-    async fn file_ticket(&self, ticket: &Ticket) -> Result<(Filed, &'static str), Error> {
+    /// The file stage's decision and, for an external route, its one port
+    /// call. The route is resolved first (issue #24): a `(tenant, kind)`
+    /// row from `sg_routes` wins, a defect falls back to the legacy
+    /// `sg_destinations` row, and a kind with no route at all files
+    /// locally — never a dead-letter, so an unconfigured tenant still
+    /// files. A drafted-title/body/severity gap is still a terminal decode
+    /// error (dead-letter). A webhook's filed URL is blanked: it is the
+    /// destination's own secret.
+    async fn file_ticket(&self, ticket: &Ticket) -> Result<FileOutcome, Error> {
         let title = ticket
             .title
             .clone()
@@ -999,22 +1156,20 @@ impl Pipeline {
         let severity = ticket.severity.ok_or_else(|| {
             Error::Decode(format!("ticket `{}` has no drafted severity", ticket.id))
         })?;
-        let Some((destination, credential_ref)) =
-            store::load_destination(&*self.db, &ticket.tenant_id).await?
-        else {
-            return Err(Error::Decode(format!(
-                "tenant `{}` has no tracker destination configured",
-                ticket.tenant_id
-            )));
+        let Some(route) = self.resolve_route(&ticket.tenant_id, ticket.kind).await? else {
+            return Ok(FileOutcome::Local);
+        };
+        let store::RouteTarget::Tracker(destination) = route.target else {
+            return Ok(FileOutcome::Local);
         };
         let (destination, credential) = self
-            .resolve_credential(&ticket.tenant_id, destination, &credential_ref)
+            .resolve_credential(&ticket.tenant_id, destination, &route.credential_ref)
             .await?;
         let idempotency_key = format!("escalation:{}", ticket.id);
         let body = with_conversation_link(body, &*self.config, &ticket.conversation_id);
         let kind = destination.kind();
         let mut draft = TicketDraft::new(idempotency_key, title, body, severity)
-            .labels(escalation_labels(severity));
+            .labels(escalation_labels(ticket.kind, severity, &route.priority));
         if let Some(environment) = &ticket.environment {
             draft = draft.environment(environment.clone());
         }
@@ -1031,7 +1186,34 @@ impl Pipeline {
         } else {
             filed
         };
-        Ok((filed, kind))
+        Ok(FileOutcome::Tracker(filed, kind))
+    }
+
+    /// Resolves where a ticket of `kind` files, in this order: a
+    /// `(tenant, kind)` row from `sg_routes`; for a defect only, the legacy
+    /// `sg_destinations` row (which predates kinds and carried every
+    /// escalation); otherwise no route, which files locally. A route's
+    /// `credential_ref` is never resolved here — only at file-time, so a
+    /// secret is read for exactly one call.
+    async fn resolve_route(
+        &self,
+        tenant_id: &str,
+        kind: Kind,
+    ) -> Result<Option<store::Route>, Error> {
+        if let Some(route) = store::load_route(&*self.db, tenant_id, kind).await? {
+            return Ok(Some(route));
+        }
+        if kind == Kind::Defect
+            && let Some((destination, credential_ref)) =
+                store::load_destination(&*self.db, tenant_id).await?
+        {
+            return Ok(Some(store::Route {
+                target: store::RouteTarget::Tracker(destination),
+                credential_ref,
+                priority: BTreeMap::new(),
+            }));
+        }
+        Ok(None)
     }
 
     /// Resolves the tenant's credential and destination from the stored
@@ -1529,6 +1711,7 @@ fn stage_already_committed(ticket: &Ticket, stage: Stage) -> bool {
                 | Status::NeedsInfo
                 | Status::Duplicate
                 | Status::DeadLetter
+                | Status::Closed
         )
 }
 
@@ -1573,11 +1756,27 @@ fn failure_kind(stage: Stage) -> EventKind {
     }
 }
 
-/// The labels every filed escalation carries: a `bug` marker, and the
-/// drafted severity as `severity:<level>` (`severity:error`), so a tracker's
-/// label filter can find escalations and rank them without parsing the body.
-fn escalation_labels(severity: Severity) -> Vec<String> {
-    vec!["bug".to_owned(), format!("severity:{}", severity.name())]
+/// The labels every filed escalation carries: a kind marker and the
+/// drafted severity as `severity:<level>` (`severity:error`), so a
+/// tracker's label filter can find escalations and rank them without
+/// parsing the body. A defect keeps its long-standing `bug` marker; other
+/// kinds carry `kind:<kind>`. When the route names a priority for this
+/// severity it rides along as `priority:<value>`, the only shape core's
+/// [`TicketDraft`] accepts (it has no priority field of its own).
+fn escalation_labels(
+    kind: Kind,
+    severity: Severity,
+    priority: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let marker = match kind {
+        Kind::Defect => "bug".to_owned(),
+        other => format!("kind:{}", other.as_str()),
+    };
+    let mut labels = vec![marker, format!("severity:{}", severity.name())];
+    if let Some(value) = priority.get(severity.name()) {
+        labels.push(format!("priority:{value}"));
+    }
+    labels
 }
 
 /// Appends a link back to the support conversation the ticket came from,
@@ -1592,22 +1791,71 @@ fn with_conversation_link(body: String, config: &dyn Config, conversation_id: &s
     format!("{body}\n\n---\n\nEscalated from the support conversation: {base}/{conversation_id}\n")
 }
 
-/// The ticket body the draft stage renders: the reproduction steps as a
-/// numbered list, then expected/actual sections — exactly the fields the
-/// schema guarantees, in an order an engineer can act on.
+/// The ticket body the draft stage renders, per kind. A defect is the
+/// reproduction steps as a numbered list, then expected/actual sections —
+/// exactly the fields the schema guarantees, in an order an engineer can
+/// act on. A support case is a summary and the customer's ask; a lead is
+/// the company, the seat count and the intent — each rendered from the
+/// fields that kind's schema requires.
 #[must_use]
 pub(crate) fn render_body_markdown(drafted: &Drafted) -> String {
     use std::fmt::Write as _;
 
-    let mut body = String::from("## Repro steps\n");
-    for (index, step) in drafted.repro_steps.iter().enumerate() {
-        let _ = writeln!(body, "{}. {step}", index + 1);
+    match drafted.kind {
+        Kind::Defect => {
+            let mut body = String::from("## Repro steps\n");
+            for (index, step) in drafted.repro_steps.iter().enumerate() {
+                let _ = writeln!(body, "{}. {step}", index + 1);
+            }
+            body.push_str("\n## Expected\n");
+            let _ = writeln!(body, "{}", drafted.expected.trim());
+            body.push_str("\n## Actual\n");
+            let _ = writeln!(body, "{}", drafted.actual.trim());
+            body
+        }
+        Kind::SupportCase => {
+            let mut body = String::from("## Summary\n");
+            let _ = writeln!(body, "{}", drafted.summary.as_deref().unwrap_or("").trim());
+            body.push_str("\n## Customer ask\n");
+            let _ = writeln!(
+                body,
+                "{}",
+                drafted.customer_ask.as_deref().unwrap_or("").trim()
+            );
+            body
+        }
+        Kind::Lead => {
+            let mut body = String::from("## Company\n");
+            let _ = writeln!(body, "{}", drafted.company.as_deref().unwrap_or("").trim());
+            body.push_str("\n## Seats\n");
+            if let Some(seats) = drafted.seats {
+                let _ = writeln!(body, "{seats}");
+            } else {
+                body.push('\n');
+            }
+            body.push_str("\n## Intent\n");
+            let _ = writeln!(body, "{}", drafted.intent.as_deref().unwrap_or("").trim());
+            body
+        }
     }
-    body.push_str("\n## Expected\n");
-    let _ = writeln!(body, "{}", drafted.expected.trim());
-    body.push_str("\n## Actual\n");
-    let _ = writeln!(body, "{}", drafted.actual.trim());
-    body
+}
+
+/// The question parked against a draft that is missing a field its kind
+/// requires (see [`Drafted::missing_fields`]): one bullet per field, named
+/// in plain words, so the customer can supply what the drafter could not
+/// read out of the conversation.
+#[must_use]
+pub(crate) fn compose_missing_fields_question(kind: Kind, missing: &[&str]) -> String {
+    use std::fmt::Write as _;
+
+    let mut question = format!(
+        "Before we pass this on, the {} is missing some detail. Could you provide:\n",
+        kind.as_str()
+    );
+    for field in missing {
+        let _ = writeln!(question, "- {}", field.replace('_', " "));
+    }
+    question
 }
 
 /// The customer-facing question the judge's `NeedsInfo` verdict asks, from
@@ -1634,16 +1882,24 @@ pub(crate) fn compose_notify_message(ticket: &Ticket) -> (String, String) {
     match ticket.status {
         Status::Filed => {
             let subject = format!("Update on your support request: {title}");
+            // The ticket is escalated to the team that owns its kind: a
+            // defect to engineering, a support case to the support team, a
+            // lead to the sales team (issue #24).
+            let team = match ticket.kind {
+                Kind::Defect => "engineering",
+                Kind::SupportCase => "the support team",
+                Kind::Lead => "the sales team",
+            };
             let message = match (&ticket.external_id, &ticket.external_url) {
                 (Some(id), Some(url)) => format!(
-                    "We escalated this to engineering and it was accepted as {id}.\n\nTracker link: {url}\n\nWe will follow up here when there is news."
+                    "We escalated this to {team} and it was accepted as {id}.\n\nTracker link: {url}\n\nWe will follow up here when there is news."
                 ),
                 (Some(id), None) => format!(
-                    "We escalated this to engineering and it was accepted as {id}.\n\nWe will follow up here when there is news."
+                    "We escalated this to {team} and it was accepted as {id}.\n\nWe will follow up here when there is news."
                 ),
-                _ => "We escalated this to engineering and will follow up here when there is \
-                      news."
-                    .to_owned(),
+                _ => format!(
+                    "We escalated this to {team} and will follow up here when there is news."
+                ),
             };
             (subject, message)
         }
@@ -1696,22 +1952,34 @@ pub(crate) fn notify_recipient(_ticket: &Ticket) -> Option<String> {
     None
 }
 
-/// The draft prompt's standing instruction.
-const DRAFT_SYSTEM: &str = "You draft a defect ticket from a customer support conversation. \
-     Read the transcript and answer only with JSON matching the given schema: a one-line ticket \
-     title, the reproduction steps in order, what the customer expected to happen, what actually \
-     happened, the deployment the transcript names (if any), and how urgent this is.";
+/// The draft prompt's standing instruction. The drafter first classifies
+/// the conversation — a `defect`, a `support_case` (a how-to or question
+/// that needs a person) or a `lead` (buying intent) — and fills only that
+/// kind's fields.
+const DRAFT_SYSTEM: &str = "You draft a ticket from a customer support conversation. First \
+     classify it as one of `defect`, `support_case` or `lead`, then fill that kind's fields. A \
+     `defect` is a bug in our product: give a one-line title, the reproduction steps in order, \
+     what the customer expected to happen and what actually happened. A `support_case` is a \
+     how-to or account question that needs a person: give the `summary` and the customer's \
+     actual `customer_ask`. A `lead` is buying or upgrade intent: give the `company`, the \
+     `intent`, and the `seats` if the transcript names a number. Always give a title and a \
+     severity. Answer only with JSON matching the given schema; leave the other kinds' fields \
+     out.";
 
 /// The judge prompt's standing instruction. The judge is deliberately
 /// independent of the drafter and checks the draft against the source.
-const JUDGE_SYSTEM: &str = "You are an independent judge of a drafted defect ticket; you did \
-     not write it. Check the draft against the original transcript: is this a defect in our \
-     product, do the reproduction steps actually reproduce something, is the severity \
-     proportionate, does the draft carry customer personal data that must not reach a tracker? \
-     If the brief lists existing tickets and this draft is the same defect as one of them, set \
-     `verdict` to `duplicate` and `duplicate_of` to that ticket's id from the list — never any \
-     other id, and never when it is not the same defect. Answer only with JSON matching the \
-     given schema, and always give your reasons.";
+const JUDGE_SYSTEM: &str = "You are an independent judge of a drafted support ticket; you did \
+     not write it. First check that the draft's `kind` fits the conversation — a how-to or \
+     account question is a `support_case`, buying or upgrade intent is a `lead`, and only a bug \
+     in our product is a `defect`. Do not reject a support case or a lead merely because it is \
+     not a defect. Then check the draft against the original transcript: is the kind's required \
+     fields complete (a defect needs its reproduction steps; a support case its summary and ask; \
+     a lead its company and intent), and does the draft carry customer personal data that must \
+     not reach a tracker? Set `kind_ok` to `false` when the kind is wrong or its required fields \
+     are incomplete. If the brief lists existing tickets and this draft is the same defect as \
+     one of them, set `verdict` to `duplicate` and `duplicate_of` to that ticket's id from the \
+     list — never any other id, and never when it is not the same defect. Answer only with JSON \
+     matching the given schema, and always give your reasons.";
 
 /// One duplicate candidate as the judge's brief shows it: the filed
 /// ticket's id (the only value a valid `duplicate_of` may carry) and its
@@ -1935,6 +2203,7 @@ mod tests {
     fn the_draft_body_renders_steps_and_sections() {
         let drafted = Drafted {
             title: "Checkout 500s on a used gift card".to_owned(),
+            kind: Kind::Defect,
             repro_steps: vec![
                 "Add an item to the cart".to_owned(),
                 "Pay with a part-used gift card".to_owned(),
@@ -1943,6 +2212,11 @@ mod tests {
             actual: "HTTP 500 from /checkout".to_owned(),
             environment: Some("production".to_owned()),
             severity: Severity::Error,
+            summary: None,
+            customer_ask: None,
+            company: None,
+            seats: None,
+            intent: None,
         };
         assert_eq!(
             render_body_markdown(&drafted),
@@ -1965,6 +2239,67 @@ mod tests {
         assert!(render_body_markdown(&empty).starts_with("## Repro steps\n\n## Expected\n"));
     }
 
+    /// A support case and a lead render their own sections, and never the
+    /// defect's — the body matches the kind, not a fixed defect shape.
+    #[test]
+    fn the_body_renders_the_support_case_and_lead_sections() {
+        let support = Drafted {
+            title: "How do I add a seat?".to_owned(),
+            kind: Kind::SupportCase,
+            repro_steps: Vec::new(),
+            expected: String::new(),
+            actual: String::new(),
+            environment: None,
+            severity: Severity::Info,
+            summary: Some("Billing question about adding a seat".to_owned()),
+            customer_ask: Some("How do I add a seat to my plan?".to_owned()),
+            company: None,
+            seats: None,
+            intent: None,
+        };
+        assert_eq!(
+            render_body_markdown(&support),
+            "## Summary\n\
+             Billing question about adding a seat\n\
+             \n\
+             ## Customer ask\n\
+             How do I add a seat to my plan?\n"
+        );
+
+        let lead = Drafted {
+            title: "Acme wants 50 seats".to_owned(),
+            kind: Kind::Lead,
+            severity: Severity::Info,
+            company: Some("Acme".to_owned()),
+            seats: Some(50),
+            intent: Some("wants to buy the enterprise plan".to_owned()),
+            summary: None,
+            customer_ask: None,
+            repro_steps: Vec::new(),
+            expected: String::new(),
+            actual: String::new(),
+            environment: None,
+        };
+        assert_eq!(
+            render_body_markdown(&lead),
+            "## Company\n\
+             Acme\n\
+             \n\
+             ## Seats\n\
+             50\n\
+             \n\
+             ## Intent\n\
+             wants to buy the enterprise plan\n"
+        );
+
+        // A lead with no seat count leaves the section empty, not invented.
+        let no_seats = Drafted {
+            seats: None,
+            ..lead
+        };
+        assert!(render_body_markdown(&no_seats).contains("## Seats\n\n"));
+    }
+
     #[test]
     fn the_needs_info_question_quotes_the_judges_reasons() {
         let question = compose_needs_info_question(&[
@@ -1983,6 +2318,7 @@ mod tests {
             id: "01JTICKET".to_owned(),
             tenant_id: "acme".to_owned(),
             conversation_id: "conv-1".to_owned(),
+            kind: Kind::Defect,
             status,
             stage: Stage::Notify,
             transcript: "customer: it broke".to_owned(),
@@ -2078,6 +2414,7 @@ mod tests {
             Status::Rejected,
             Status::NeedsInfo,
             Status::DeadLetter,
+            Status::Closed,
         ] {
             let parked = Ticket {
                 status,
