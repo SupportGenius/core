@@ -64,9 +64,9 @@
 use std::sync::Arc;
 
 use cratefield_core::{
-    BoxFuture, Completion, ConfigError, Credential, Defer, Destination, Filed, HarnessBuilder,
-    Module, ModuleContext, Port, Prompt, Statement, TextModel, TextModelError, TicketDraft,
-    TicketStatus, Tracker, TrackerError, Venture,
+    BoxFuture, Completion, ConfigError, Credential, Database, DbError, Defer, Destination, Filed,
+    HarnessBuilder, Module, ModuleContext, Port, Prompt, Statement, TextModel, TextModelError,
+    TicketDraft, TicketStatus, Tracker, TrackerError, Venture,
 };
 use cratefield_mail_templates::MailTheme;
 use cratefield_module_waitlist::Waitlist;
@@ -76,6 +76,7 @@ use module_escalation::{Escalation, TenantDirectory};
 /// KMS outside `ENV=development` (see the module's docs), re-exported so
 /// the native binary checks it through this crate like the cron gates.
 pub use module_escalation::local_kms_refusal;
+use module_support::analytics::{TicketCounts, TicketStats};
 use module_support::{HandoffSink, Support, TicketView};
 
 /// The venture name, kebab-case.
@@ -214,8 +215,10 @@ pub fn waitlist() -> OnCron<Waitlist> {
 
 /// The `support` module as this venture composes it: the module's own
 /// behaviour, plus the [`EscalationHandoff`] sink so an escalating turn
-/// files an escalation ticket, wrapped so its scheduled sweeps run on the
-/// daily cron only (see [`SUPPORT_CRONS`]).
+/// files an escalation ticket and the [`EscalationTicketStats`] port so
+/// the daily analytics rollup can read escalation's ticket events,
+/// wrapped so its scheduled sweeps run on the daily cron only (see
+/// [`SUPPORT_CRONS`]).
 ///
 /// Public so a test can stand the same module up in a harness without
 /// reaching into the private sink.
@@ -225,9 +228,9 @@ pub fn support() -> OnCron<Support> {
 }
 
 /// `support` exactly as a caller built it (the Worker sets
-/// [`Support::visitor_rate_limiter`]), given the venture's handoff sink
-/// and daily-cron gate — the one place both are applied, so [`support`]
-/// and [`modules_with`] cannot drift.
+/// [`Support::visitor_rate_limiter`]), given the venture's handoff sink,
+/// ticket-stats port and daily-cron gate — the one place they are
+/// applied, so [`support`] and [`modules_with`] cannot drift.
 fn compose_support(support: Support) -> OnCron<Support> {
     OnCron::new(
         support
@@ -236,7 +239,8 @@ fn compose_support(support: Support) -> OnCron<Support> {
             // (issue #34): support serves `GET /v1/support/openapi.json`,
             // and this crate is the one place that knows escalation's
             // surface to give it.
-            .with_api_surface("escalation", Escalation::new().surface()),
+            .with_api_surface("escalation", Escalation::new().surface())
+            .with_ticket_stats(Arc::new(EscalationTicketStats)),
         SUPPORT_CRONS,
     )
 }
@@ -526,6 +530,44 @@ impl HandoffSink for EscalationHandoff {
                 external_url: ticket.external_url,
                 conversation_id: ticket.conversation_id,
             })
+        })
+    }
+}
+
+/// Adapts `module-escalation`'s ticket events to support's
+/// [`TicketStats`] port, the other direction of the same seam
+/// [`EscalationHandoff`] bridges: support's daily analytics rollup asks
+/// for a UTC day's ticket counts, escalation answers from its own
+/// `sg_ticket_events`, and neither module reads the other's tables.
+///
+/// Escalation's `Error` is flattened to a `DbError::Query` because the
+/// port speaks the database's vocabulary — the rollup treats a failure to
+/// reach the port as it would any failed read, and failing the whole
+/// recompute is the honest response: a day must not be written with
+/// zeros because the ticket lookup happened to fail.
+struct EscalationTicketStats;
+
+impl TicketStats for EscalationTicketStats {
+    fn day_counts<'a>(
+        &'a self,
+        db: &'a dyn Database,
+        day: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<TicketCounts>, DbError>> {
+        Box::pin(async move {
+            let counts = module_escalation::store::ticket_counts_for_day(db, day)
+                .await
+                .map_err(|err| DbError::Query(err.to_string()))?;
+            Ok(counts
+                .into_iter()
+                .map(|counts| TicketCounts {
+                    tenant_id: counts.tenant_id,
+                    filed: counts.filed,
+                    rejected: counts.rejected,
+                    needs_info: counts.needs_info,
+                    duplicates: counts.duplicates,
+                    dead_lettered: counts.dead_lettered,
+                })
+                .collect())
         })
     }
 }

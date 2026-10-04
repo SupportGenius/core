@@ -1699,6 +1699,12 @@ pub(crate) struct Turn {
     /// the turn is the unit, and the user's question and the answer shown
     /// for it share one language by construction.
     pub lang: Option<String>,
+    /// How many chunks retrieval returned for this turn. Only the
+    /// assistant row carries it (the user message has no retrieval
+    /// behind it), and it is what the analytics gap rollup reads: an
+    /// unanswered turn with zero retrieved is a corpus gap, while one
+    /// that retrieved and still would not answer is a different failure.
+    pub retrieved_chunks: i64,
 }
 
 /// Opens a conversation with no turn behind it: a new `sg_conversations`
@@ -1842,6 +1848,7 @@ fn turn_message_statement(turn: &Turn) -> Statement {
             "citations",
             "lang",
             "created_at",
+            "retrieved_chunks",
         ])
         .values_panic([
             turn.user_message_id.clone().into(),
@@ -1856,6 +1863,7 @@ fn turn_message_statement(turn: &Turn) -> Statement {
             Option::<String>::None.into(),
             turn.lang.clone().into(),
             turn.now.clone().into(),
+            Option::<i64>::None.into(),
         ])
         .values_panic([
             turn.assistant_message_id.clone().into(),
@@ -1870,6 +1878,7 @@ fn turn_message_statement(turn: &Turn) -> Statement {
             turn.citations_json.clone().into(),
             turn.lang.clone().into(),
             turn.now.clone().into(),
+            turn.retrieved_chunks.into(),
         ]);
     Statement::render(&messages)
 }

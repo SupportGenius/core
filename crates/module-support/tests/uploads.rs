@@ -1036,6 +1036,7 @@ fn the_upload_migration_follows_internationalization() {
             ("0007", "search_stats"),
             ("0008", "widget_settings"),
             ("0009", "human_handoff"),
+            ("0010", "analytics"),
         ],
         "uploads is support/0005, after the two migrations main gained (connectors follow it)"
     );

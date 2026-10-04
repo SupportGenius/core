@@ -592,9 +592,12 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    /// The stored form (`"intake"`, `"file_dead_lettered"`, ...).
+    /// The stored form (`"intake"`, `"file_dead_lettered"`, ...). `const`
+    /// so a compile-time table of kinds (the analytics rollup's counted
+    /// set) can be written from the variants rather than from literals
+    /// that could drift.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             EventKind::Intake => "intake",
             EventKind::DraftStarted => "draft_started",

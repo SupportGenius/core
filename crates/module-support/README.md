@@ -37,6 +37,9 @@ the optional `RateLimiter` port. The staff routes (`/inbox` and
 | `POST /conversations/{id}/takeover` | staff key | a person takes the conversation: `state=human`, `assignee` = caller; answers the transcript |
 | `POST /conversations/{id}/reply` | staff key | `{"body", "save_as_answer"?}` → append a `staff` message as the assignee; `save_as_answer` also ingests a reviewed source and returns its `source_id` |
 | `POST /conversations/{id}/handback` | staff key | `{"close"?}` → `state=bot` (or `closed`), `assignee` cleared; the bot resumes with the staff turns in its history |
+| `GET /analytics?from=…&to=…` | API key | the tenant's per-day deflection and escalation numbers, day by day, plus the range's totals and deflection rate (inclusive UTC days; `to` defaults to today, `from` to 29 days before it) |
+| `GET /analytics/gaps?from=…&to=…&limit=…` | API key | the normalized query terms behind the range's unanswered turns, most hits first (default 20, 1..=100) |
+| `GET /analytics/citations?from=…&to=…&limit=…` | API key | the range's most-cited sources, and the tenant's current sources none of them cited |
 | `GET /keys` | API key | the tenant's own API keys — `{kid, label, created_at}` each, oldest first |
 | `POST /keys` | API key | `{"label"?, "staff_id"?}` → mint another API key for the tenant (shown once, like provisioning); a `staff_id` makes it a staff key |
 | `DELETE /keys/{kid}` | API key | delete one of the tenant's own keys; `204`, or `404` for a foreign/unknown kid and `409` for the last remaining key |
@@ -266,6 +269,66 @@ before cutting back to `k`, so a correction written to be the answer wins
 a close call without beating a clearly better document. Sources expose
 `reviewed` / `reviewed_by` / `reviewed_conversation_id`, and a saved
 correction is deleted through the ordinary `DELETE /sources/{id}`.
+
+### Analytics
+
+`GET /analytics` answers one row per day the tenant was active in the
+range, oldest first, under `days`, plus `totals` (the same counters
+summed) and `deflection_rate`. Every column is a **UTC day** bucket,
+taken from the date part of the stored timestamp — every timestamp here
+is written from a `Clock` in UTC, so the first ten characters of the
+RFC 3339 value are its day. A day with no rows at all is simply absent
+from `days`; the range's `from` and `to` are echoed back as given.
+`from` after `to`, a malformed day, or a range past 366 inclusive days
+is `400 validation-failed`.
+
+What each column means:
+
+| Column | Meaning |
+| --- | --- |
+| `conversations` | conversations **created** on the day |
+| `answered` / `clarify` / `handoff` | assistant turns written that day, by the outcome the decision reached |
+| `handed_off` | among the conversations created that day, those with **any** assistant `handoff` turn, whenever it ran — a conversation opened today and escalated tomorrow is today's cohort's failure, not tomorrow's |
+| `filed` / `rejected` / `needs_info` / `duplicates` / `dead_lettered` | escalation ticket events on the day: filed with the tracker, rejected by the judge, sent back for more information, recognised as a duplicate of an already-filed ticket (`linked` — not `duplicate_ignored`, which records a duplicate the judge named but was never shown), and dead-lettered after the file stage exhausted its retries. These come through the `TicketStats` port; a deployment that wires no escalation reports zeros |
+| `median_confidence` | the median of the day's assistant-turn confidence percentages — the middle value, or the floor of the middle pair's mean for an even count. `null` when the day had no assistant turn |
+
+`deflection_rate` is `(Σconversations − Σhanded_off) / Σconversations`
+over the range: of the conversations opened, the share that never
+reached a person. It is `null` — not `0` — when the range holds no
+conversation, so "no data" and "nothing deflected" stay distinguishable.
+
+`/analytics/gaps` lists the terms behind the range's unanswered turns:
+assistant turns with outcome `handoff` or `clarify` that retrieved **no
+chunks at all**, each contributing its preceding user message — the
+question the turn answered — normalized with the same tokenizer
+`/search` runs. Only the normalized terms are stored and returned, never
+the question text, and a term is one an operator can paste straight into
+`GET /search`.
+
+`/analytics/citations` lists the range's most-cited sources (by how many
+of the day's `answered` turns cited at least one of their chunks) and,
+separately, the tenant's current sources that earned no citation at all
+in the range — the coverage gap a workspace's dashboard exists to show.
+A citation naming a chunk the index no longer holds is skipped, so a
+source deleted after the fact neither appears nor blocks its siblings.
+
+**The numbers are a rollup, recomputed — never incremented.** The
+module's own `scheduled` hook (the venture's daily cron, sharing the tick
+with the re-index, uploads and connector sweeps) recomputes the trailing
+`analytics::ROLLUP_DAYS` (7) days: today and the six before it. Each day
+is written as a delete-then-insert of its rows in all three rollup
+tables, in one `batch_atomic`, so the day flips as a unit and running the
+sweep twice — or after a backfill — converges on the same numbers
+instead of double-counting. Because the routes read only the rollup
+tables, a dashboard's cost is the range it asks for, never the size of
+the workspace's message and ticket tables.
+
+The window is also the horizon of the one counter that reaches past its
+own day: `handed_off` is re-derived from the conversation's turns only
+while the cohort day is still inside the 7-day window, so once a day has
+fallen out, a `handoff` turn more than six days after its conversation
+opened is no longer folded in. A day's other columns are written from
+that day's own rows and do not change after the day closes.
 
 ## Retrieval, and its constraints on purpose
 

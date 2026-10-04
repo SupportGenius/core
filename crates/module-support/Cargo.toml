@@ -48,6 +48,9 @@ tracing = { workspace = true }
 time = { version = "0.3", default-features = false, features = [
     "std",
     "formatting",
+    # The analytics rollup subtracts days (a trailing window) and the
+    # routes validate `from`/`to`; both parse a `YYYY-MM-DD` UTC day.
+    "parsing",
     "wasm-bindgen",
 ] }
 # Pure Rust and wasm32-safe: detects the language of an incoming message.
