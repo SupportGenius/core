@@ -32,6 +32,14 @@ SUPPORTGENIUS_MODEL_STRONG = "claude-sonnet-5"
 #                    `send.supportgeni.us`. Without it the mailer answers
 #                    `NotConfigured` and every join fails loudly (by
 #                    design; there is no no-op mailer here).
+#   OWLPOST_API_KEY  optional. When set it takes precedence over
+#                    RESEND_API_KEY and mail is sent through Owlpost;
+#                    without either key the mailer answers
+#                    `NotConfigured`. `OWLPOST_BASE_URL` (an optional
+#                    plain var, not a secret) overrides Owlpost's base URL
+#                    for a self-hosted instance. Verify
+#                    `send.supportgeni.us` in Owlpost before dropping the
+#                    Resend key.
 #   TURNSTILE_SECRET required for production traffic. The Turnstile widget
 #                    secret paired with the sitekey on the site's form.
 #                    Without it no Captcha port is mounted; because ENV is

@@ -35,6 +35,8 @@ cratefield-runtime-cloudflare = { workspace = true }
 cratefield-module-waitlist = { workspace = true }
 module-support = { path = "../../crates/module-support" }
 cratefield-adapter-resend = { workspace = true }
+# The preferred `Mailer` when `OWLPOST_API_KEY` is set (see `build_mailer`).
+cratefield-adapter-owlpost = { workspace = true }
 cratefield-adapter-turnstile = { workspace = true }
 # The `TextModel` port, one Anthropic adapter per tier (issue #22).
 cratefield-adapter-anthropic = { workspace = true }

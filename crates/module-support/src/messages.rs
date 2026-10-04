@@ -601,9 +601,13 @@ async fn ask(
         Err(err @ TextModelError::Transient { .. }) => Err(TurnFailure::Response(Box::new(
             unavailable(scope, err.retry_after()),
         ))),
-        Err(TextModelError::Rejected(_) | TextModelError::Transport(_)) => {
-            Err(problem(&TEXT_MODEL_BAD_ANSWER))
-        }
+        // `Rejected`, `Transport` and — since core 0.8 — `Unsupported`
+        // (the adapter cannot serve this prompt) are an upstream failure
+        // that gave no usable answer: `502`, like the two before it.
+        // `TextModelError` is `#[non_exhaustive]`, so a future variant
+        // lands here too rather than failing to compile; the wildcard is
+        // the deliberate default, not a swallowed case.
+        Err(_) => Err(problem(&TEXT_MODEL_BAD_ANSWER)),
     }
 }
 

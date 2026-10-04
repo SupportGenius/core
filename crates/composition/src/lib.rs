@@ -68,6 +68,7 @@ use cratefield_core::{
     Module, ModuleContext, Port, Prompt, Statement, TextModel, TextModelError, TicketDraft,
     TicketStatus, Tracker, TrackerError, Venture,
 };
+use cratefield_mail_templates::MailTheme;
 use cratefield_module_waitlist::Waitlist;
 use module_escalation::{Escalation, TenantDirectory};
 
@@ -170,6 +171,25 @@ pub fn venture() -> Venture {
     Venture::new(NAME, DOMAIN)
         .public_url("https://supportgeni.us")
         .cors_origins(["https://supportgeni.us", "https://www.supportgeni.us"])
+}
+
+/// The SupportGenius mail theme: supportgeni.us's tokens, logo and contact,
+/// committed as `mail-theme.json` beside this file and parsed here so the
+/// venture's mail and the venture's site are one style. Both link targets
+/// register the waitlist's templates in it (see [`modules_with`]).
+///
+/// Public so a test can render the themed mails and pin them with a
+/// snapshot, the same way upstream's `tests/templates.rs` pins its own.
+///
+/// # Panics
+///
+/// Panics if `mail-theme.json` is not a valid `MailTheme` — it is committed
+/// source, so a malformed one is a bug to catch at `cargo test`, not a
+/// deployment to degrade.
+#[must_use]
+pub fn mail_theme() -> MailTheme {
+    MailTheme::from_json(include_str!("mail-theme.json"))
+        .expect("mail-theme.json is a valid MailTheme")
 }
 
 /// The `waitlist` module as this venture composes it: the module's own
@@ -286,8 +306,10 @@ pub fn modules_with(builder: HarnessBuilder, support: Support) -> HarnessBuilder
         .module(compose_support(support))
         .module(escalation())
         // Templates register on the harness builder — `Waitlist` itself
-        // has no `.templates` method.
-        .templates(cratefield_module_waitlist::default_templates())
+        // has no `.templates` method. The venture's own theme, not the
+        // module's neutral default: the confirmation mail wears
+        // supportgeni.us's tokens (see [`mail_theme`]).
+        .templates(cratefield_module_waitlist::themed_templates(&mail_theme()))
 }
 
 /// A module wrapper that forwards every [`Module`] method to `inner`
