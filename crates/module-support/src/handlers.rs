@@ -5,20 +5,23 @@
 //! to its own index.
 
 use axum::extract::{Path, Query, RawQuery, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use bytes::Bytes;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use cratefield_core::{
-    Clock, Database, HttpClient, IdGen, Json, ModuleConfig, ModuleContext, Problem, ProblemDef,
-    RateLimit, RateLimitFailure, RateLimiter, Scope, Signer, TextModel, check_rate_limit,
-    rate_limited, require_admin,
+    Action, Audience, Clock, Database, HttpClient, IdGen, Json, ModuleConfig, ModuleContext,
+    Outcome, Problem, ProblemDef, RateLimit, RateLimitFailure, RateLimiter, RoutePolicy, Scope,
+    Signer, Surface, TextModel, check_rate_limit, rate_limited, require_admin,
 };
+
+use crate::openapi;
 
 use crate::bm25;
 use crate::chunk::{Chunker, tokenize};
@@ -44,9 +47,10 @@ pub(crate) const MAX_TEXT_BYTES: usize = 48 * 1024;
 /// for a search hit, not a path).
 pub(crate) const MAX_NAME_BYTES: usize = 200;
 
-/// `limit` handling for `GET /search`: default 10, hard range 1..=50.
-const DEFAULT_LIMIT: u32 = 10;
-const MAX_LIMIT: u32 = 50;
+/// `limit` handling for `GET /search`: default 10, hard range 1..=50. The
+/// MCP `search_sources` tool borrows both, so the two cannot diverge.
+pub(crate) const DEFAULT_LIMIT: u32 = 10;
+pub(crate) const MAX_LIMIT: u32 = 50;
 
 /// `limit` handling for `GET /sources`: default 50, hard range 1..=100.
 const DEFAULT_SOURCES_LIMIT: u32 = 50;
@@ -113,19 +117,33 @@ pub(crate) struct ModuleState {
     /// buckets then share the tenant limiter — and to no limiting at all
     /// when that is absent too.
     pub visitor_rate_limiter: Option<Arc<dyn RateLimiter>>,
+    /// The `OpenAPI` 3.1 document `GET /openapi.json` serves (issue #34),
+    /// built once here from this module's surface plus whatever other
+    /// modules' surfaces the composition injected (`Support::with_api_
+    /// surface`) — a document read is not a place to rebuild a schema.
+    pub openapi: Value,
 }
 
+/// Builds the module's router. `api_surfaces` are other modules' surfaces
+/// the composition injected for the `OpenAPI` document (module-support
+/// cannot depend on them), each paired with the module name its paths
+/// mount under.
 pub(crate) fn router(
     ctx: Arc<ModuleContext>,
     text_model: Option<Arc<dyn TextModel>>,
     handoff: Option<Arc<dyn HandoffSink>>,
     visitor_rate_limiter: Option<Arc<dyn RateLimiter>>,
+    api_surfaces: Vec<(String, Surface)>,
 ) -> axum::Router {
+    let mut modules = vec![(crate::MODULE_NAME.to_owned(), surface())];
+    modules.extend(api_surfaces);
+    let document = openapi::document(&modules);
     let state = Arc::new(ModuleState {
         ctx,
         text_model,
         handoff,
         visitor_rate_limiter,
+        openapi: document,
     });
     axum::Router::new()
         .route("/admin/tenants", post(create_tenant))
@@ -160,7 +178,160 @@ pub(crate) fn router(
             get(widget::get_widget_conversation),
         )
         .route("/w.js", get(widget::serve_w_js))
+        .route("/mcp", post(crate::mcp::post_mcp))
+        .route("/openapi.json", get(openapi))
         .with_state(state)
+}
+
+/// `GET /openapi.json` — the `OpenAPI` 3.1 document for `/v1/support/*` and
+/// every module surface the composition injected (issue #34). Public on
+/// purpose: it is a contract document, and a caller reads it before it
+/// holds any key.
+async fn openapi(State(state): State<Arc<ModuleState>>) -> Response {
+    Json(state.openapi.clone()).into_response()
+}
+
+/// The module's declared surface (ADR 0010): one action per route
+/// [`router`] mounts, so `GET /__surface` and the `OpenAPI` document
+/// describe exactly what exists. The route split is the policy split —
+/// tenant-key routes carry [`RoutePolicy::ApiKey`], admin routes
+/// [`Audience::Admin`], and the widget's write is a captcha-guarded public
+/// form. An input schema is declared where the handler's body is a typed
+/// `JsonSchema` (the search query, the message body).
+// One flat declaration per route: splitting it would scatter the mapping
+// from routes to policies across helpers, which is the thing this list is
+// meant to make readable at a glance.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn surface() -> Surface {
+    let key = RoutePolicy::ApiKey;
+    Surface::new()
+        .action(
+            Action::post("create-tenant", "/admin/tenants")
+                .audience(Audience::Admin)
+                .outcome(Outcome::Json),
+        )
+        .action(
+            Action::new(
+                "put-tenant-settings",
+                Method::PUT,
+                "/admin/tenants/{tenant_id}/settings",
+            )
+            .audience(Audience::Admin),
+        )
+        .action(
+            Action::post(
+                "create-publishable-key",
+                "/admin/tenants/{tenant_id}/publishable-keys",
+            )
+            .audience(Audience::Admin)
+            .outcome(Outcome::Json),
+        )
+        .action(
+            Action::post("ingest-source", "/sources")
+                .policy(key)
+                .outcome(Outcome::Json),
+        )
+        .action(
+            Action::get("list-sources", "/sources")
+                .audience(Audience::Public)
+                .policy(key)
+                .outcome(Outcome::Json),
+        )
+        .action(
+            Action::get("get-source", "/sources/{source_id}")
+                .audience(Audience::Public)
+                .policy(key)
+                .outcome(Outcome::Json),
+        )
+        .action(
+            Action::new("put-source", Method::PUT, "/sources/{source_id}")
+                .policy(key)
+                .outcome(Outcome::Json),
+        )
+        .action(
+            Action::delete("delete-source", "/sources/{source_id}")
+                .audience(Audience::Public)
+                .policy(key),
+        )
+        .action(
+            Action::post("create-upload", "/uploads")
+                .policy(key)
+                .outcome(Outcome::Json),
+        )
+        .action(
+            Action::new(
+                "put-upload-part",
+                Method::PUT,
+                "/uploads/{upload_id}/parts/{n}",
+            )
+            .policy(key)
+            .outcome(Outcome::Json),
+        )
+        .action(
+            Action::post("complete-upload", "/uploads/{upload_id}/complete")
+                .policy(key)
+                .outcome(Outcome::Json),
+        )
+        .action(
+            Action::get("get-upload", "/uploads/{upload_id}")
+                .audience(Audience::Public)
+                .policy(key)
+                .outcome(Outcome::Json),
+        )
+        .action(
+            Action::post("create-connector", "/connectors")
+                .policy(key)
+                .outcome(Outcome::Json),
+        )
+        .action(
+            Action::get("search", "/search")
+                .audience(Audience::Public)
+                .policy(key)
+                .input::<SearchQuery>()
+                .outcome(Outcome::Json),
+        )
+        .action(
+            Action::post("post-message", "/messages")
+                .policy(key)
+                .input::<messages::MessageBody>()
+                .outcome(Outcome::Json),
+        )
+        .action(
+            Action::get("list-keys", "/keys")
+                .audience(Audience::Public)
+                .policy(key)
+                .outcome(Outcome::Json),
+        )
+        .action(
+            Action::post("create-key", "/keys")
+                .policy(key)
+                .outcome(Outcome::Json),
+        )
+        .action(
+            Action::delete("delete-key", "/keys/{kid}")
+                .audience(Audience::Public)
+                .policy(key),
+        )
+        .action(Action::post("post-widget-message", "/widget/messages").captcha())
+        .action(
+            Action::get(
+                "get-widget-conversation",
+                "/widget/conversations/{conversation_id}",
+            )
+            .audience(Audience::Public)
+            .outcome(Outcome::Json),
+        )
+        .action(Action::get("w-js", "/w.js").audience(Audience::Public))
+        .action(
+            Action::post("mcp", "/mcp")
+                .policy(key)
+                .outcome(Outcome::Json),
+        )
+        .action(
+            Action::get("openapi", "/openapi.json")
+                .audience(Audience::Public)
+                .outcome(Outcome::Json),
+        )
 }
 
 /// A required port, absent. `requires()` names every port used here, so
@@ -1319,7 +1490,9 @@ async fn delete_source(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-#[derive(Deserialize)]
+/// `GET /search`'s query string. `JsonSchema` so the `OpenAPI` document
+/// derives its parameters from this very type (issue #34).
+#[derive(Deserialize, JsonSchema)]
 struct SearchQuery {
     q: Option<String>,
     limit: Option<u32>,
@@ -1349,6 +1522,13 @@ async fn search(
         limit as usize,
     )
     .await?;
+
+    Ok(Json(search_body(&hits)).into_response())
+}
+
+/// The `/search` result body — the same shape the MCP `search_sources`
+/// tool answers with (issue #34), so the route and the tool cannot drift.
+pub(crate) fn search_body(hits: &[Retrieved]) -> Value {
     let results: Vec<Value> = hits
         .iter()
         .map(|hit| {
@@ -1361,8 +1541,7 @@ async fn search(
             })
         })
         .collect();
-
-    Ok(Json(json!({ "results": results })).into_response())
+    json!({ "results": results })
 }
 
 /// One ranked hit from [`retrieve`]: the chunk and its BM25 score.

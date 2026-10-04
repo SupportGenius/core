@@ -11,136 +11,15 @@ mod common;
 
 use std::sync::Arc;
 
-use axum::body::{Body, to_bytes};
-use axum::http::{Method, Request, StatusCode, header};
-use cratefield_core::{Destination, MapConfig, ModelTier, Statement};
+use axum::http::{Method, StatusCode};
+use cratefield_core::{MapConfig, ModelTier};
 use cratefield_testing::{TestHarness, TextModelMode};
-use serde_json::{Value, json};
-use tower::ServiceExt;
+use serde_json::json;
 
-use module_escalation::store;
-
-use common::{CREDENTIAL_REF, CREDENTIAL_SECRET, count_of, fast_completion, file_completion};
-
-const ADMIN_TOKEN: &str = "test-admin-token-0123456789abcdef";
-const ADMIN: &str = "/v1/support/admin/tenants";
-const MESSAGES: &str = "/v1/support/messages";
-
-/// A question the (empty) workspace can answer nothing from, so the turn
-/// always hands off — retrieval finds no chunk to ground an answer on.
-const MESSAGE: &str = "reset password";
-
-/// A buffered response, parsed as JSON (every route here answers JSON or
-/// problem+json).
-struct Reply {
-    status: StatusCode,
-    body: Value,
-}
-
-impl Reply {
-    async fn of(response: axum::response::Response) -> Self {
-        let status = response.status();
-        let bytes = to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .expect("response body reads");
-        let body = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-        };
-        Self { status, body }
-    }
-}
-
-/// `cratefield_testing::request` sends no headers and the support routes
-/// need an `Authorization` bearer, so this is the kit's oneshot pattern
-/// with a header slot.
-async fn send(
-    router: &axum::Router,
-    method: Method,
-    path: &str,
-    bearer: Option<&str>,
-    json_body: Option<&str>,
-) -> Reply {
-    let mut builder = Request::builder().method(method).uri(path);
-    if let Some(key) = bearer {
-        builder = builder.header(header::AUTHORIZATION, format!("Bearer {key}"));
-    }
-    let body = match json_body {
-        Some(payload) => {
-            builder = builder.header(header::CONTENT_TYPE, "application/json");
-            Body::from(payload.to_owned())
-        }
-        None => Body::empty(),
-    };
-    Reply::of(
-        router
-            .clone()
-            .oneshot(builder.body(body).expect("request builds"))
-            .await
-            .expect("router answers"),
-    )
-    .await
-}
-
-/// The composition's own modules over the published doubles, with the
-/// admin token and the tracker credential in config and both model tiers
-/// scripted.
-fn kit() -> TestHarness {
-    let kit = TestHarness::with_ports(
-        vec![
-            Box::new(supportgenius_composition::support()),
-            Box::new(supportgenius_composition::escalation()),
-        ],
-        |ports| {
-            ports.config = Arc::new(MapConfig::from_pairs([
-                ("ADMIN_TOKEN", ADMIN_TOKEN),
-                (CREDENTIAL_REF, CREDENTIAL_SECRET),
-            ]));
-        },
-    );
-    kit.text_model
-        .set_mode_for(ModelTier::Fast, TextModelMode::Complete(fast_completion()));
-    kit.text_model.set_mode_for(
-        ModelTier::Strong,
-        TextModelMode::Complete(file_completion()),
-    );
-    kit
-}
-
-/// Mints one tenant and returns `(tenant_id, api_key)`.
-async fn mint_tenant(kit: &TestHarness) -> (String, String) {
-    let reply = send(
-        &kit.router,
-        Method::POST,
-        ADMIN,
-        Some(ADMIN_TOKEN),
-        Some(&json!({ "name": "Acme" }).to_string()),
-    )
-    .await;
-    assert_eq!(reply.status, StatusCode::CREATED, "{:?}", reply.body);
-    let tenant_id = reply.body["tenant_id"]
-        .as_str()
-        .expect("tenant_id")
-        .to_owned();
-    let api_key = reply.body["api_key"].as_str().expect("api_key").to_owned();
-    (tenant_id, api_key)
-}
-
-/// Seeds the tenant's tracker destination — a GitHub repo with the
-/// credential *reference* the file stage resolves through `Config`.
-fn seed_destination(kit: &TestHarness, tenant_id: &str) {
-    let stmt = store::put_destination_stmt(
-        tenant_id,
-        &Destination::GitHub {
-            owner: "acme".to_owned(),
-            repo: "api".to_owned(),
-        },
-        CREDENTIAL_REF,
-        "2027-01-15T00:00:00Z",
-    );
-    pollster::block_on(kit.db.batch_atomic(&[stmt])).expect("destination seeds");
-}
+use common::{
+    ADMIN_TOKEN, CREDENTIAL_REF, CREDENTIAL_SECRET, MESSAGE, MESSAGES, Reply, count_of,
+    fast_completion, kit, mint_tenant, seed_destination, send, ticket_column,
+};
 
 /// One `POST /messages` turn.
 async fn turn(kit: &TestHarness, api_key: &str) -> Reply {
@@ -152,15 +31,6 @@ async fn turn(kit: &TestHarness, api_key: &str) -> Reply {
         Some(&json!({ "message": MESSAGE }).to_string()),
     )
     .await
-}
-
-/// The single text column of the one ticket row, aliased `v`.
-fn ticket_column(kit: &TestHarness, column: &str) -> Option<String> {
-    let rows = pollster::block_on(kit.db.query(&Statement::new(format!(
-        "SELECT {column} AS v FROM sg_tickets"
-    ))))
-    .expect("ticket query runs");
-    rows.rows.first().and_then(|row| row.get::<String>("v"))
 }
 
 #[pollster::test]

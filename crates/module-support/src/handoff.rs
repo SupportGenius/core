@@ -21,7 +21,26 @@
 
 use std::sync::Arc;
 
-use cratefield_core::{Defer, ModuleContext, Statement};
+use cratefield_core::{BoxFuture, Defer, ModuleContext, Statement};
+use serde::Serialize;
+
+/// One ticket as the MCP `get_ticket` tool (issue #34) shows it: the
+/// support module's own small view of an escalation ticket, so it never
+/// learns `module-escalation`'s `Ticket` type. A [`HandoffSink`] that can
+/// look a ticket up maps its row into this.
+#[derive(Debug, Clone, Serialize)]
+pub struct TicketView {
+    pub id: String,
+    /// The module's own status wire form (`"filed"`, `"dead_letter"`, …).
+    pub status: String,
+    /// The stage whose work is queued for the ticket.
+    pub stage: String,
+    /// The tracker's ticket id, once the file stage has run.
+    pub external_id: Option<String>,
+    /// The tracker's ticket URL, once the file stage has run.
+    pub external_url: Option<String>,
+    pub conversation_id: String,
+}
 
 /// What the support module calls when a turn hands off.
 ///
@@ -52,4 +71,37 @@ pub trait HandoffSink: Send + Sync {
     /// rides the runtime's background execution rather than blocking the
     /// response.
     fn kick(&self, ctx: &ModuleContext, defer: Arc<dyn Defer>);
+
+    /// [`enqueue`](Self::enqueue), handing back the minted ticket id when
+    /// the sink can name it. The MCP `escalate` tool (issue #34) answers
+    /// with the id, which only a sink that reached escalation's
+    /// `Intake::handoff` can supply; the default drops it and keeps the
+    /// old one-value shape for every existing implementor.
+    fn handoff(
+        &self,
+        ctx: &ModuleContext,
+        tenant_id: &str,
+        conversation_id: &str,
+        transcript: &str,
+    ) -> (Option<String>, Vec<Statement>) {
+        (
+            None,
+            self.enqueue(ctx, tenant_id, conversation_id, transcript),
+        )
+    }
+
+    /// Looks a ticket up for the MCP `get_ticket` tool, scoped to
+    /// `tenant_id`: a sink that has no ticket store, or none by that id
+    /// for this tenant, answers `None` — a ticket from another tenant
+    /// looks exactly like a missing one. Defaults to `None`, so a sink
+    /// that only files keeps compiling.
+    fn ticket<'a>(
+        &'a self,
+        ctx: &'a ModuleContext,
+        tenant_id: &'a str,
+        id: &'a str,
+    ) -> BoxFuture<'a, Option<TicketView>> {
+        let _ = (ctx, tenant_id, id);
+        Box::pin(async { None })
+    }
 }

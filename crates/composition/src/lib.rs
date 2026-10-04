@@ -64,9 +64,9 @@
 use std::sync::Arc;
 
 use cratefield_core::{
-    Completion, ConfigError, Credential, Defer, Destination, Filed, HarnessBuilder, Module,
-    ModuleContext, Port, Prompt, Statement, TextModel, TextModelError, TicketDraft, TicketStatus,
-    Tracker, TrackerError, Venture,
+    BoxFuture, Completion, ConfigError, Credential, Defer, Destination, Filed, HarnessBuilder,
+    Module, ModuleContext, Port, Prompt, Statement, TextModel, TextModelError, TicketDraft,
+    TicketStatus, Tracker, TrackerError, Venture,
 };
 use cratefield_module_waitlist::Waitlist;
 use module_escalation::{Escalation, TenantDirectory};
@@ -75,7 +75,7 @@ use module_escalation::{Escalation, TenantDirectory};
 /// KMS outside `ENV=development` (see the module's docs), re-exported so
 /// the native binary checks it through this crate like the cron gates.
 pub use module_escalation::local_kms_refusal;
-use module_support::{HandoffSink, Support};
+use module_support::{HandoffSink, Support, TicketView};
 
 /// The venture name, kebab-case.
 pub const NAME: &str = "supportgenius";
@@ -210,7 +210,13 @@ pub fn support() -> OnCron<Support> {
 /// and [`modules_with`] cannot drift.
 fn compose_support(support: Support) -> OnCron<Support> {
     OnCron::new(
-        support.with_handoff(Arc::new(EscalationHandoff)),
+        support
+            .with_handoff(Arc::new(EscalationHandoff))
+            // Escalation's own routes ride in support's OpenAPI document
+            // (issue #34): support serves `GET /v1/support/openapi.json`,
+            // and this crate is the one place that knows escalation's
+            // surface to give it.
+            .with_api_surface("escalation", Escalation::new().surface()),
         SUPPORT_CRONS,
     )
 }
@@ -441,8 +447,51 @@ impl HandoffSink for EscalationHandoff {
             .enqueue(tenant_id, conversation_id, transcript)
     }
 
+    /// The ticket id the handoff minted, for the MCP `escalate` tool
+    /// (issue #34): `Intake::handoff` is `Intake::enqueue` with the id
+    /// handed back, so support's answer names the ticket it just staged.
+    fn handoff(
+        &self,
+        _ctx: &ModuleContext,
+        tenant_id: &str,
+        conversation_id: &str,
+        transcript: &str,
+    ) -> (Option<String>, Vec<Statement>) {
+        let handoff = Escalation::new()
+            .intake()
+            .handoff(tenant_id, conversation_id, transcript);
+        (Some(handoff.ticket_id), handoff.statements)
+    }
+
     fn kick(&self, ctx: &ModuleContext, defer: Arc<dyn Defer>) {
         Escalation::kick(ctx, defer);
+    }
+
+    /// The tenant-scoped ticket lookup for the MCP `get_ticket` tool
+    /// (issue #34). The row is read by id alone, so the tenant is checked
+    /// here: a ticket belonging to another tenant answers `None`, exactly
+    /// like one that does not exist.
+    fn ticket<'a>(
+        &'a self,
+        ctx: &'a ModuleContext,
+        tenant_id: &'a str,
+        id: &'a str,
+    ) -> BoxFuture<'a, Option<TicketView>> {
+        Box::pin(async move {
+            let db = ctx.ports.db.as_deref()?;
+            let ticket = module_escalation::store::load_ticket(db, id).await.ok()??;
+            if ticket.tenant_id != tenant_id {
+                return None;
+            }
+            Some(TicketView {
+                id: ticket.id,
+                status: ticket.status.as_str().to_owned(),
+                stage: ticket.stage.as_topic().to_owned(),
+                external_id: ticket.external_id,
+                external_url: ticket.external_url,
+                conversation_id: ticket.conversation_id,
+            })
+        })
     }
 }
 

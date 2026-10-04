@@ -86,6 +86,12 @@ bytes = "1.12"
 # Types the module crates serialise, wrap and classify directly.
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# `JsonSchema` on the request bodies module-support deserializes (issue
+# #34): the MCP tool input schemas and the OpenAPI paths are generated
+# from the very types the handlers read, so the two cannot drift. Same
+# 1.2 line cratefield-core already uses, so one `schemars` is in the
+# graph and the `derive` feature is additive to core's `preserve_order`.
+schemars = { version = "1.2", features = ["derive"] }
 thiserror = "2.0.20"
 # Pure Rust and wasm32-safe: script/trigram language detection for the
 # support module's per-turn `lang`.

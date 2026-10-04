@@ -15,6 +15,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -100,7 +101,7 @@ pub(crate) fn handoff_message(lang: Option<&str>) -> String {
 /// failure-prone read on the hot path of every escalating turn. The turn
 /// that escalates — the question that could not be answered and the notice
 /// that says so — is the part an agent needs to start from.
-fn handoff_transcript(message: &str, reply: &str) -> String {
+pub(crate) fn handoff_transcript(message: &str, reply: &str) -> String {
     format!("Customer: {message}\n\nSupport: {reply}")
 }
 
@@ -230,10 +231,13 @@ const SYSTEM_PROMPT: &str = "You answer customer-support questions using only th
      `confidence` in 0.0..=1.0, your own confidence that the answer is correct and fully \
      grounded.";
 
-#[derive(Deserialize)]
-struct MessageBody {
-    message: String,
-    conversation_id: Option<String>,
+/// The `POST /messages` body. Public because it is also the MCP `answer`
+/// tool's argument type (issue #34) — the tool's `inputSchema` is
+/// `schema_for::<MessageBody>()`, the same type this route deserializes.
+#[derive(Deserialize, JsonSchema)]
+pub struct MessageBody {
+    pub(crate) message: String,
+    pub(crate) conversation_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -326,30 +330,42 @@ pub(crate) async fn post_message(
         return Ok(rate_limited);
     }
     let body = parse_message(&body).map_err(|problem| problem.instance(&scope.request_id))?;
+    let accept_language = headers
+        .get(header::ACCEPT_LANGUAGE)
+        .and_then(|value| value.to_str().ok());
+    match answer(&state, &scope, &tenant_id, body, accept_language).await {
+        Ok(reply) => Ok(Json(reply.to_json()).into_response()),
+        Err(failure) => Ok(failure.into_response()),
+    }
+}
+
+/// One answer turn, shared by `POST /messages` (tenant API key) and the
+/// MCP `answer` tool (issue #34): the language fallback, then [`run_turn`].
+/// Both call it, so the tool makes exactly the decision the route makes —
+/// no copy-pasted divergence. The caller has already authenticated and
+/// rate-limited.
+pub(crate) async fn answer(
+    state: &ModuleState,
+    scope: &Scope,
+    tenant_id: &str,
+    body: MessageBody,
+    accept_language: Option<&str>,
+) -> Result<TurnReply, TurnFailure> {
     let message = body.message.as_str();
     // The turn's language, from the message's own words first and the
     // caller's Accept-Language below that. Decided here, before anything
     // can fail, so the prompt, the canned texts and both stored messages
     // of the turn speak one language.
-    let lang = turn_language(
-        message,
-        headers
-            .get(header::ACCEPT_LANGUAGE)
-            .and_then(|value| value.to_str().ok()),
-    );
-    match run_turn(
-        &state,
-        &scope,
-        &tenant_id,
+    let lang = turn_language(message, accept_language);
+    run_turn(
+        state,
+        scope,
+        tenant_id,
         message,
         body.conversation_id.as_deref(),
         lang,
     )
     .await
-    {
-        Ok(reply) => Ok(Json(reply.to_json()).into_response()),
-        Err(failure) => Ok(failure.into_response()),
-    }
 }
 
 /// One support turn, shared by `POST /messages` (tenant API key) and the
@@ -540,12 +556,19 @@ async fn commit_turn(
 
 /// The request body, with `message` trimmed and length-checked.
 fn parse_message(body: &[u8]) -> Result<MessageBody, Problem> {
-    let mut body: MessageBody = serde_json::from_slice(body).map_err(|_| {
+    let body: MessageBody = serde_json::from_slice(body).map_err(|_| {
         Problem::validation_failed(
             "body: expected a JSON object with a string \"message\" and an optional string \
              \"conversation_id\"",
         )
     })?;
+    validate_message(body)
+}
+
+/// The `message` rules: trimmed, non-empty, within
+/// [`MAX_MESSAGE_CHARS`]. Shared by the raw HTTP body above and the MCP
+/// `answer` tool, whose `arguments` are already JSON.
+pub(crate) fn validate_message(mut body: MessageBody) -> Result<MessageBody, Problem> {
     let trimmed = body.message.trim();
     if trimmed.is_empty() || trimmed.chars().count() > MAX_MESSAGE_CHARS {
         return Err(Problem::validation_failed(format!(

@@ -32,6 +32,11 @@ bytes = "1"
 axum = { version = "0.8", default-features = false, features = ["query"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `JsonSchema` on `MessageBody`/`SearchQuery` (issue #34), so the MCP tool
+# schemas and the OpenAPI document are generated from the same types the
+# handlers deserialize — the `surface()` declaration cannot drift from the
+# routes.
+schemars = { workspace = true }
 # PDF text extraction for the upload extract job (issue #30). Pure Rust
 # with a lean, wasm-safe dependency set at these features (the parser is
 # `pom`, not `nom`), so the same extraction runs in a Worker isolate and

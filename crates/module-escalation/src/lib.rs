@@ -457,6 +457,14 @@ impl Module for Escalation {
         destinations::router(Arc::new(ctx), kms, self.tenants.clone())
     }
 
+    /// The destination routes, declared (ADR 0010). The composition also
+    /// injects this surface into `module-support`'s `OpenAPI` document
+    /// (issue #34), so one document describes both `/v1/support/*` and
+    /// `/v1/escalation/*`.
+    fn surface(&self) -> cratefield_core::Surface {
+        destinations::surface()
+    }
+
     /// The drain: build a [`Pipeline`] from whatever ports the runtime
     /// resolved and sweep the outbox until a sweep comes back empty or
     /// [`Pipeline::MAX_SWEEPS`] is spent — bounded, so a row that keeps
