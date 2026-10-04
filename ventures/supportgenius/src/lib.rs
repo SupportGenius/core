@@ -274,22 +274,41 @@ fn build_visitor_rate_limiter(env: &Env) -> Option<Arc<dyn RateLimiter>> {
         .map(|limiter| Arc::new(cratefield_runtime_cloudflare::RateLimitPort(limiter)) as _)
 }
 
+/// The ports this venture mounts on top of the harness, which the
+/// harness's own `/__ready` probe cannot see (`ready_handler` in
+/// `cratefield-core` `harness.rs` is a DB-only probe): what `fetch`
+/// reports as `"configured" | "missing"` on the healthiest answer.
+struct Mounted {
+    text_model: bool,
+    captcha: bool,
+    rate_limiter: bool,
+}
+
 /// Composes once per isolate, from the secrets actually set on this
 /// deployment. The returned triple is the harness/runtime pair
-/// [`compose`] builds — so what was validated is what serves — plus
-/// whether a text model was mounted, which `fetch` needs to decorate
-/// `/__ready` (the harness's own probe cannot see the port).
-fn instance(env: &Env) -> &'static (Harness, Cloudflare, bool) {
-    static INSTANCE: OnceLock<(Harness, Cloudflare, bool)> = OnceLock::new();
+/// [`compose`] builds — so what was validated is what serves — plus the
+/// [`Mounted`] ports `fetch` needs to decorate `/__ready`.
+fn instance(env: &Env) -> &'static (Harness, Cloudflare, Mounted) {
+    static INSTANCE: OnceLock<(Harness, Cloudflare, Mounted)> = OnceLock::new();
     INSTANCE.get_or_init(|| {
         let mailer = build_mailer(env);
         let captcha = build_captcha(env);
         let text_model = build_text_model(env);
-        let text_model_mounted = text_model.is_some();
+        let mounted = Mounted {
+            text_model: text_model.is_some(),
+            // The same decision `build_captcha` makes: a `TURNSTILE_SECRET`
+            // mounts a `Captcha` port, its absence mounts none.
+            captcha: captcha.is_some(),
+            // Whether the `RATE_LIMITER` binding `compose` names actually
+            // resolves on this deployment — the same lookup the runtime's
+            // `rate_limiter_port` makes at request time
+            // (`cratefield-runtime-cloudflare` `runtime.rs`).
+            rate_limiter: env.rate_limiter("RATE_LIMITER").is_ok(),
+        };
         let visitor_rate_limiter = build_visitor_rate_limiter(env);
         let (harness, runtime) = compose(mailer, captcha, text_model, visitor_rate_limiter)
             .expect("supportgenius harness is valid");
-        (harness, runtime, text_model_mounted)
+        (harness, runtime, mounted)
     })
 }
 
@@ -326,31 +345,47 @@ fn build_mailer_no_secrets() -> Arc<dyn Mailer> {
 /// harness's `/__ready` is a DB-only probe that cannot see the ports the
 /// venture mounts on top (`cratefield-core` `harness.rs`
 /// `ready_handler`), so for that one path the response body is rebuilt
-/// with the `text_model` field added. The status code stays the
-/// harness's — a missing model is a degradation, not unreadiness, which
-/// is exactly how the module serves it (`503 text-model-not-configured`
-/// from `POST /v1/support/messages`).
+/// with `text_model`, `captcha` and `rate_limiter` added. The status code
+/// stays the harness's — a missing port is a degradation, not
+/// unreadiness, which is exactly how the module serves a missing text
+/// model (`503 text-model-not-configured` from
+/// `POST /v1/support/messages`).
 ///
 /// # Errors
 ///
 /// Propagates `worker::Error` from the harness router.
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, ctx: Context) -> worker::Result<Response> {
-    let (harness, runtime, text_model_mounted) = instance(&env);
+    let (harness, runtime, mounted) = instance(&env);
     let is_ready_probe = req.path() == "/__ready";
     let response = serve(harness, runtime, req, env, ctx).await;
     if is_ready_probe {
-        report_text_model(response, *text_model_mounted).await
+        report_readiness(response, mounted).await
     } else {
         response
     }
 }
 
-/// Adds `"text_model": "configured" | "missing"` to a 200 `/__ready`
-/// body. Any other status — the probe's `503` when the database did not
-/// answer — is passed through untouched: readiness is the harness's
-/// verdict to give, and the field is this deployment's annotation on the
-/// healthy answer, not a second opinion about it.
+/// The `/__ready` annotations this venture adds, in the vocabulary the
+/// `text_model` field already used: `"configured"` when the port is
+/// mounted, `"missing"` when it is not. One entry per port, so the body
+/// always carries all three — a missing one reads as `"missing"`, never
+/// as an omitted field.
+fn ready_annotations(mounted: &Mounted) -> [(&'static str, &'static str); 3] {
+    let state = |on: bool| if on { "configured" } else { "missing" };
+    [
+        ("text_model", state(mounted.text_model)),
+        ("captcha", state(mounted.captcha)),
+        ("rate_limiter", state(mounted.rate_limiter)),
+    ]
+}
+
+/// Adds the venture's `/__ready` fields — `text_model`, `captcha`,
+/// `rate_limiter`, each `"configured" | "missing"` — to a 200 body. Any
+/// other status — the probe's `503` when the database did not answer — is
+/// passed through untouched: readiness is the harness's verdict to give,
+/// and the fields are this deployment's annotation on the healthy answer,
+/// not a second opinion about it.
 ///
 /// An annotation must never be the reason a healthy deployment reads as
 /// unready, so the two ways the body can surprise us do not fail the
@@ -360,9 +395,9 @@ pub async fn fetch(req: Request, env: Env, ctx: Context) -> worker::Result<Respo
 /// no body to annotate. Every rebuilt response re-applies the status and
 /// headers the harness set, so the `application/json` content type its
 /// `Json` responder chose stays correct for the body rebuilt here.
-async fn report_text_model(
+async fn report_readiness(
     response: worker::Result<Response>,
-    mounted: bool,
+    mounted: &Mounted,
 ) -> worker::Result<Response> {
     let mut response = response?;
     let status = response.status_code();
@@ -390,10 +425,9 @@ async fn report_text_model(
         return Response::from_bytes(body.into_bytes())
             .map(|rebuilt| rebuilt.with_status(status).with_headers(headers));
     };
-    ready.insert(
-        "text_model".to_owned(),
-        Value::from(if mounted { "configured" } else { "missing" }),
-    );
+    for (field, state) in ready_annotations(mounted) {
+        ready.insert(field.to_owned(), Value::from(state));
+    }
     Response::from_json(&Value::Object(ready))
         .map(|rebuilt| rebuilt.with_status(status).with_headers(headers))
 }
@@ -410,4 +444,37 @@ async fn report_text_model(
 pub async fn scheduled(event: worker::ScheduledEvent, env: Env, ctx: worker::ScheduleContext) {
     let (harness, runtime, _) = instance(&env);
     serve_scheduled(harness, runtime, event, env, ctx).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One vocabulary for every port, and all three fields always present:
+    /// a port the harness cannot see must read as `"missing"`, never as an
+    /// omitted field a client would have to tell apart from an old build.
+    #[test]
+    fn ready_annotations_name_every_port_in_one_vocabulary() {
+        let state = |text_model, captcha, rate_limiter| Mounted {
+            text_model,
+            captcha,
+            rate_limiter,
+        };
+        assert_eq!(
+            ready_annotations(&state(false, false, false)),
+            [
+                ("text_model", "missing"),
+                ("captcha", "missing"),
+                ("rate_limiter", "missing"),
+            ]
+        );
+        assert_eq!(
+            ready_annotations(&state(true, true, true)),
+            [
+                ("text_model", "configured"),
+                ("captcha", "configured"),
+                ("rate_limiter", "configured"),
+            ]
+        );
+    }
 }
