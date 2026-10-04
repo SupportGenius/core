@@ -16,7 +16,7 @@ Resend; a Cloudflare Turnstile widget gates the site's form.
 | `GET /v1/waitlist/status` | The entry's status as JSON (position, referrals, referral code), addressed by the status token the confirm redirect and the confirmation mail carry. |
 | `GET /v1/waitlist/admin/export.csv` | The list as CSV, gated by `ADMIN_TOKEN` (Bearer auth). |
 | `GET /__health` | Liveness: lists the composed modules. |
-| `GET /__ready` | Readiness (the harness's DB probe), with this venture's `text_model` field added by the Worker itself: `"configured"` when `ANTHROPIC_API_KEY` is set, `"missing"` otherwise. A missing model is a degradation, not unreadiness — the status code stays the harness's. |
+| `GET /__ready` | Readiness (the harness's DB probe), with this venture's `text_model`, `captcha` and `rate_limiter` fields added by the Worker itself, each `"configured"` or `"missing"`: `text_model` when `ANTHROPIC_API_KEY` is set, `captcha` when `TURNSTILE_SECRET` is set, `rate_limiter` when the `RATE_LIMITER` binding resolves. A missing port is a degradation, not unreadiness — the status code stays the harness's. |
 | `GET /__surface` | UI surface metadata for the mounted modules. |
 
 The Worker also answers the daily cron (`23 4 * * *`, `[triggers]` in
@@ -74,8 +74,9 @@ at all (there is no keyless adapter pretending), and
 every other route works; the dev-fakes binary below mounts its stub
 instead. `/__ready` reports the port as
 `"text_model": "configured"` or `"missing"` (the Worker decorates the
-harness's own body; the binary's `/__ready` is the harness's unchanged —
-the native runtime offers no hook for the venture to annotate it).
+harness's own body with `text_model`, `captcha` and `rate_limiter`; the
+binary's `/__ready` is the harness's unchanged `{"ok":true}` — the native
+runtime offers no hook for the venture to annotate it).
 
 [Anthropic]: https://docs.anthropic.com/en/api/messages
 

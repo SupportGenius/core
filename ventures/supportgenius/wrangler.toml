@@ -124,3 +124,65 @@ crons = ["*/5 * * * *", "23 4 * * *"]
 [[routes]]
 pattern = "api.supportgeni.us"
 custom_domain = true
+
+# Staging: a whole separate deployment, so a merge to `main` can be smoked
+# against real infrastructure before a tag promotes the same commit to
+# production (issue #40). The top-level configuration above stays
+# production, so a bare `wrangler deploy` keeps meaning production; every
+# staging command passes `--env staging`.
+#
+# Named environments inherit only the non-binding keys — `main`,
+# `compatibility_date`, `build` and `triggers` carry over, so staging runs
+# the same `worker-build` command and the same crons. Bindings, `vars` and
+# `routes` are NOT inherited (Cloudflare's Environments docs: "Bindings,
+# such as `vars` or `kv_namespaces`, are not inheritable and need to be
+# defined explicitly"), so D1, R2, both rate-limit namespaces, the vars and
+# the route are all redeclared below against staging-only resources — the
+# same non-inheritance that stops staging from ever reading production's
+# database.
+[env.staging]
+name = "supportgenius-staging"
+
+[env.staging.vars]
+# `VentureEnv::parse` accepts "staging" (cratefield-core `venture.rs`), so
+# staging is its own environment: joins skip human verification rather than
+# fail closed, and the production-readiness gate does not apply (src/lib.rs
+# documents that split, and why Turnstile is effectively required in
+# production but not here). Same model knobs as production; overridable at
+# deploy like the top-level pair.
+ENV = "staging"
+SUPPORTGENIUS_MODEL_FAST = "claude-haiku-4-5"
+SUPPORTGENIUS_MODEL_STRONG = "claude-sonnet-5"
+
+# Staging's own rate-limit namespaces. `namespace_id` must be unique across
+# the whole account, not just this Worker, so staging never shares a bucket
+# (or its counters) with production: 1003/1004 beside the top-level
+# 1001/1002, with the same limits.
+[[env.staging.unsafe.bindings]]
+name = "RATE_LIMITER"
+type = "ratelimit"
+namespace_id = "1003"
+simple = { limit = 60, period = 60 }
+
+[[env.staging.unsafe.bindings]]
+name = "VISITOR_RATE_LIMITER"
+type = "ratelimit"
+namespace_id = "1004"
+simple = { limit = 10, period = 60 }
+
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "supportgenius-staging"
+# NOT A REAL ID, same as production's above. A human runs
+# `wrangler d1 create supportgenius-staging` and pastes the returned UUID
+# here; the deploy workflow's preflight fails until this is replaced.
+database_id = "REPLACE_ME_WITH_THE_UUID_FROM_WRANGLER_D1_CREATE"
+migrations_dir = "migrations"
+
+[[env.staging.r2_buckets]]
+binding = "BLOB"
+bucket_name = "supportgenius-uploads-staging"
+
+[[env.staging.routes]]
+pattern = "api-staging.supportgeni.us"
+custom_domain = true
