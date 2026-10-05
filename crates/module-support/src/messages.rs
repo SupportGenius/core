@@ -525,6 +525,11 @@ pub(crate) async fn run_turn(
         confidence_pct,
         citations_json: citations_json(&reply),
         lang: lang.map(str::to_owned),
+        // How many chunks retrieval put in front of the model — the
+        // assistant row's `retrieved_chunks`, which the gap rollup reads
+        // to tell "nothing to answer from" from "retrieved, but would not
+        // answer".
+        retrieved_chunks: i64::try_from(chunks.len()).unwrap_or(i64::MAX),
     };
     // A takeover can land between step 1's read and this write (issue
     // #35). Re-read the state once, last before the bot answers: if a

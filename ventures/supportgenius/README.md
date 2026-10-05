@@ -24,9 +24,11 @@ The Worker also answers the daily cron (`23 4 * * *`, `[triggers]` in
 retention window and prunes expired mail-cooldown claims; the support
 module re-indexes chunks written by an older tokenizer, drains any
 leftover upload `extract` jobs, collects uploads abandoned before
-completion, and re-syncs its connectors' sources (issue #29; there is no
+completion, re-syncs its connectors' sources (issue #29; there is no
 per-connector schedule to configure — the module's one `scheduled` hook
-runs every sweep on the same trigger). The `#[event(scheduled)]` handler in
+runs every sweep on the same trigger), and recomputes the trailing week
+of analytics rollups the `/v1/support/analytics` routes read (issue #36).
+The `#[event(scheduled)]` handler in
 `src/lib.rs` is the other half.
 
 ## Deploying (a human runs these)

@@ -1722,6 +1722,7 @@ fn the_connector_migration_is_support_0006() {
             ("0007", "search_stats"),
             ("0008", "widget_settings"),
             ("0009", "human_handoff"),
+            ("0010", "analytics"),
         ],
         "connectors is support/0006, after main's 0003/0004 and the uploads 0005"
     );

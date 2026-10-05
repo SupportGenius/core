@@ -18,9 +18,10 @@ use std::sync::Arc;
 use cratefield_core::{
     Action, Audience, Clock, Database, HttpClient, IdGen, Json, ModuleConfig, ModuleContext,
     Outcome, Problem, ProblemDef, RateLimit, RateLimitFailure, RateLimiter, RoutePolicy, Scope,
-    Signer, Surface, TextModel, check_rate_limit, rate_limited, require_admin,
+    Signer, Surface, SystemClock, TextModel, check_rate_limit, rate_limited, require_admin,
 };
 
+use crate::analytics;
 use crate::openapi;
 
 use crate::bm25;
@@ -170,6 +171,9 @@ pub(crate) fn router(
         .route("/uploads/{upload_id}", get(uploads::get_upload))
         .route("/connectors", post(create_connector))
         .route("/search", get(search))
+        .route("/analytics", get(analytics))
+        .route("/analytics/gaps", get(analytics_gaps))
+        .route("/analytics/citations", get(analytics_citations))
         .route("/messages", post(messages::post_message))
         .route("/inbox", get(human::inbox))
         .route(
@@ -299,6 +303,25 @@ pub(crate) fn surface() -> Surface {
                 .audience(Audience::Public)
                 .policy(key)
                 .input::<SearchQuery>()
+                .outcome(Outcome::Json),
+        )
+        // Analytics (issue #36): read-only rollup routes.
+        .action(
+            Action::get("get-analytics", "/analytics")
+                .audience(Audience::Public)
+                .policy(key)
+                .outcome(Outcome::Json),
+        )
+        .action(
+            Action::get("get-analytics-gaps", "/analytics/gaps")
+                .audience(Audience::Public)
+                .policy(key)
+                .outcome(Outcome::Json),
+        )
+        .action(
+            Action::get("get-analytics-citations", "/analytics/citations")
+                .audience(Audience::Public)
+                .policy(key)
                 .outcome(Outcome::Json),
         )
         .action(
@@ -1633,7 +1656,12 @@ pub(crate) struct Retrieved {
 /// left-to-right order is what fixes the postings fetch order, so scores
 /// are reproducible), and capped at [`store::MAX_QUERY_TERMS`] so a
 /// keyword-stuffed query cannot buy more reads than the invariant allows.
-fn query_terms(query: &str) -> Vec<String> {
+///
+/// Shared with the analytics rollup, which normalizes a gap turn's
+/// preceding question with exactly this function — a gap's terms are the
+/// same terms a search would have run, so a term that appears in
+/// `/analytics/gaps` is one an operator can paste into `GET /search`.
+pub(crate) fn query_terms(query: &str) -> Vec<String> {
     let mut terms: Vec<String> = Vec::new();
     for term in tokenize(query) {
         if !terms.contains(&term) {
@@ -1808,6 +1836,291 @@ pub(crate) fn boost_reviewed(ranked: &mut [bm25::Scored], reviewed: &HashSet<Str
         }
     }
     ranked.sort_by(|a, b| b.score.total_cmp(&a.score));
+}
+
+// ---------------------------------------------------------------------
+// Analytics (issue #36): three read-only routes over the daily rollups
+// `crate::analytics` recomputes on the daily cron. Each reads the
+// rollup tables (and `sg_sources` for the never-cited list) and nothing
+// else, so a dashboard's cost is the range it asks for, never the size
+// of the workspace's message and ticket tables.
+// ---------------------------------------------------------------------
+
+/// `limit` handling for the gap and citation lists: default 20, hard
+/// range 1..=100.
+const DEFAULT_ANALYTICS_LIMIT: i64 = 20;
+const MAX_ANALYTICS_LIMIT: i64 = 100;
+
+/// The widest range `/analytics` answers, in days — a year plus the leap
+/// day. A dashboard reads a trailing window; a caller asking for the
+/// whole history wants an export path, and this bound keeps one request's
+/// row count predictable.
+const MAX_ANALYTICS_DAYS: i64 = 366;
+
+/// The default window when `from` is omitted: `to` and the 29 days
+/// before it, so a bare `GET /analytics` is the trailing 30 days.
+const DEFAULT_ANALYTICS_DAYS: i64 = 30;
+
+/// The `?from=&to=&limit=` query the three analytics routes share. Parsed
+/// by hand *after* [`authorize`] (the `list_sources` pattern), so a
+/// malformed value earns the same 401/429 any other request would and
+/// only an authenticated, under-budget caller sees the 400.
+#[derive(Deserialize, Default)]
+struct AnalyticsQuery {
+    from: Option<String>,
+    to: Option<String>,
+    limit: Option<i64>,
+}
+
+/// What the analytics routes run before they read anything: the caller
+/// the guards authenticated, the inclusive UTC day range it resolved, and
+/// the parsed query (for `limit`) — or the response the guards already
+/// built. The [`Authed`] shape, one layer up.
+enum AnalyticsAsk<'a> {
+    Ready {
+        auth: Authorized<'a>,
+        from: String,
+        to: String,
+        query: AnalyticsQuery,
+    },
+    Done(Response),
+}
+
+/// The authorize → parse → resolve-range preamble the three analytics
+/// routes share: the guarded `401`/`429` when authorization answered, or
+/// the authenticated caller with its range. A malformed query or range is
+/// the `400` the caller returns as a `Problem`.
+async fn analytics_ask<'a>(
+    ctx: &'a ModuleContext,
+    scope: &Scope,
+    raw: Option<&str>,
+    headers: &HeaderMap,
+) -> Result<AnalyticsAsk<'a>, Problem> {
+    let auth = match authorize(ctx, headers).await {
+        Authed::Ready(auth) => auth,
+        Authed::Done(done) => return Ok(AnalyticsAsk::Done(done)),
+    };
+    let query = parse_analytics_query(raw, scope)?;
+    let (from, to) = resolve_range(&query, &utc_today(auth.ctx), scope)?;
+    Ok(AnalyticsAsk::Ready {
+        auth,
+        from,
+        to,
+        query,
+    })
+}
+
+/// `GET /analytics?from=&to=` — the tenant's day-by-day deflection and
+/// escalation numbers, oldest day first, plus the range's totals and the
+/// deflection rate. `from` and `to` are inclusive UTC days (`to` defaults
+/// to today, `from` to 29 days before it); `from > to` or a span past
+/// [`MAX_ANALYTICS_DAYS`] is a `400`. Every value is read from
+/// `sg_daily_stats`, which the daily rollup writes — see the module
+/// README for what each column means.
+async fn analytics(
+    scope: Scope,
+    State(state): State<Arc<ModuleState>>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+) -> Result<Response, Problem> {
+    let (auth, from, to) = match analytics_ask(&state.ctx, &scope, raw.as_deref(), &headers).await?
+    {
+        AnalyticsAsk::Ready { auth, from, to, .. } => (auth, from, to),
+        AnalyticsAsk::Done(done) => return Ok(done),
+    };
+    let days = analytics::day_stats(auth.db, &auth.tenant_id, &from, &to).await?;
+
+    // The range's totals, summed here rather than in a second query: the
+    // day rows are already in hand. The deflection rate is the share of
+    // the range's conversations that never reached a person — `null`, not
+    // `0`, when the range holds none, because "no data" and "nothing
+    // deflected" are different answers a dashboard must not conflate.
+    let total = |pick: fn(&analytics::DayRow) -> i64| days.iter().map(pick).sum::<i64>();
+    let conversations = total(|day| day.conversations);
+    let handed_off = total(|day| day.handed_off);
+    // A rate is a fraction; the counters are counts. A range with more
+    // than 2^53 conversations would lose a precision no ratio could show.
+    #[expect(clippy::cast_precision_loss)]
+    let deflection_rate =
+        (conversations > 0).then(|| (conversations - handed_off) as f64 / conversations as f64);
+    let totals = json!({
+        "conversations": conversations,
+        "answered": total(|day| day.answered),
+        "clarify": total(|day| day.clarify),
+        "handoff": total(|day| day.handoff),
+        "handed_off": handed_off,
+        "filed": total(|day| day.filed),
+        "rejected": total(|day| day.rejected),
+        "needs_info": total(|day| day.needs_info),
+        "duplicates": total(|day| day.duplicates),
+        "dead_lettered": total(|day| day.dead_lettered),
+    });
+
+    Ok(Json(json!({
+        "from": from,
+        "to": to,
+        "days": days,
+        "totals": totals,
+        "deflection_rate": deflection_rate,
+    }))
+    .into_response())
+}
+
+/// `GET /analytics/gaps?from=&to=&limit=` — the normalized query terms
+/// behind the range's unanswered turns, most hits first (`limit` default
+/// 20, capped at 100). Only terms are stored and returned, never the
+/// questions they came from; a term is one an operator can search for.
+async fn analytics_gaps(
+    scope: Scope,
+    State(state): State<Arc<ModuleState>>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+) -> Result<Response, Problem> {
+    let (auth, from, to, query) =
+        match analytics_ask(&state.ctx, &scope, raw.as_deref(), &headers).await? {
+            AnalyticsAsk::Ready {
+                auth,
+                from,
+                to,
+                query,
+            } => (auth, from, to, query),
+            AnalyticsAsk::Done(done) => return Ok(done),
+        };
+    let limit = analytics_limit(&query);
+    let terms = analytics::gap_terms(auth.db, &auth.tenant_id, &from, &to, limit).await?;
+    let terms: Vec<Value> = terms
+        .iter()
+        .map(|(term, hits)| json!({ "term": term, "hits": hits }))
+        .collect();
+
+    Ok(Json(json!({ "from": from, "to": to, "terms": terms })).into_response())
+}
+
+/// `GET /analytics/citations?from=&to=&limit=` — the range's most-cited
+/// sources (most cites first, `limit` default 20, capped at 100) and the
+/// tenant's current sources that earned no citation in the range.
+async fn analytics_citations(
+    scope: Scope,
+    State(state): State<Arc<ModuleState>>,
+    RawQuery(raw): RawQuery,
+    headers: HeaderMap,
+) -> Result<Response, Problem> {
+    let (auth, from, to, query) =
+        match analytics_ask(&state.ctx, &scope, raw.as_deref(), &headers).await? {
+            AnalyticsAsk::Ready {
+                auth,
+                from,
+                to,
+                query,
+            } => (auth, from, to, query),
+            AnalyticsAsk::Done(done) => return Ok(done),
+        };
+    let limit = analytics_limit(&query);
+    let most_cited = analytics::most_cited(auth.db, &auth.tenant_id, &from, &to, limit).await?;
+    let never_cited = analytics::never_cited(auth.db, &auth.tenant_id, &from, &to, limit).await?;
+
+    Ok(Json(json!({
+        "from": from,
+        "to": to,
+        "most_cited": most_cited,
+        "never_cited": never_cited,
+    }))
+    .into_response())
+}
+
+/// The `limit` a gap or citation request asks for, defaulted and clamped
+/// into 1..=[`MAX_ANALYTICS_LIMIT`] — the `list_sources` clamp shape, so
+/// the route never answers an unbounded list.
+fn analytics_limit(query: &AnalyticsQuery) -> usize {
+    usize::try_from(
+        query
+            .limit
+            .unwrap_or(DEFAULT_ANALYTICS_LIMIT)
+            .clamp(1, MAX_ANALYTICS_LIMIT),
+    )
+    .unwrap_or(usize::MAX)
+}
+
+/// Today's UTC day from the `Clock` port — the anchor the default range
+/// is measured back from, and the same `YYYY-MM-DD` the rollup buckets
+/// by. `Db`, `Clock` and `IdGen` are required ports, so this is a harness
+/// bug when it is somehow absent; the empty string then parses to a 400
+/// rather than a panic in a Worker isolate.
+fn utc_today(ctx: &ModuleContext) -> String {
+    let clock = ctx
+        .ports
+        .clock
+        .clone()
+        .unwrap_or_else(|| Arc::new(SystemClock));
+    store::iso_now(clock.as_ref())
+        .get(..10)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Parses the raw query string into [`AnalyticsQuery`], or the 400 a
+/// malformed `from`/`to`/`limit` earns.
+fn parse_analytics_query(raw: Option<&str>, scope: &Scope) -> Result<AnalyticsQuery, Problem> {
+    let Some(raw) = raw.filter(|raw| !raw.is_empty()) else {
+        return Ok(AnalyticsQuery::default());
+    };
+    let bad = || {
+        Problem::validation_failed(
+            "query: from and to are YYYY-MM-DD UTC days and limit is an integer",
+        )
+        .instance(&scope.request_id)
+    };
+    let uri: http::Uri = format!("https://support.local/?{raw}")
+        .parse()
+        .map_err(|_| bad())?;
+    Ok(Query::<AnalyticsQuery>::try_from_uri(&uri)
+        .map_err(|_| bad())?
+        .0)
+}
+
+/// Resolves the inclusive UTC day range a request asks for: `to` defaults
+/// to `today`, `from` to `to` less [`DEFAULT_ANALYTICS_DAYS`] − 1; both
+/// must be real `YYYY-MM-DD` days, `from` must not be after `to`, and the
+/// span must not exceed [`MAX_ANALYTICS_DAYS`]. Returns the two days in
+/// the exact form the rollup stores them.
+fn resolve_range(
+    query: &AnalyticsQuery,
+    today: &str,
+    scope: &Scope,
+) -> Result<(String, String), Problem> {
+    let bad = |detail: String| Problem::validation_failed(detail).instance(&scope.request_id);
+    let today = analytics::parse_day(today)
+        .map_err(|_| bad("analytics: the server clock gave no usable day".to_owned()))?;
+    let to = match query.to.as_deref() {
+        Some(raw) => analytics::parse_day(raw)
+            .map_err(|_| bad(format!("query: to={raw:?} is not a YYYY-MM-DD UTC day")))?,
+        None => today,
+    };
+    let from = match query.from.as_deref() {
+        Some(raw) => analytics::parse_day(raw)
+            .map_err(|_| bad(format!("query: from={raw:?} is not a YYYY-MM-DD UTC day")))?,
+        None => to - time::Duration::days(DEFAULT_ANALYTICS_DAYS - 1),
+    };
+    if from > to {
+        return Err(bad(format!(
+            "query: from={} is after to={}",
+            analytics::format_day(from).unwrap_or_default(),
+            analytics::format_day(to).unwrap_or_default(),
+        )));
+    }
+    if (to - from).whole_days() >= MAX_ANALYTICS_DAYS {
+        return Err(bad(format!(
+            "query: the range is longer than {MAX_ANALYTICS_DAYS} days"
+        )));
+    }
+    let day = |date| {
+        analytics::format_day(date).map_err(|err| {
+            Problem::internal()
+                .with_detail(err.to_string())
+                .instance(&scope.request_id)
+        })
+    };
+    Ok((day(from)?, day(to)?))
 }
 
 #[cfg(test)]

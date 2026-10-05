@@ -67,6 +67,10 @@
     "file": "0023_support_0009_human_handoff.sql",
     "sha256": "9ff5c686d79602ccc95a2000987ad7e405a32cd25645e602df6fe77912de0671"
   },
+  "support/0010": {
+    "file": "0024_support_0010_analytics.sql",
+    "sha256": "7a1e97c3d2cbfa088cef90a533adf42fbc7f673dd7b7d80bb3cddf0b1f487017"
+  },
   "waitlist/0001": {
     "file": "0001_waitlist_0001_init.sql",
     "sha256": "504c3e013f921975e286b27f6253ac5f2b9f884bf2b89f6d077c4931760c54ea"

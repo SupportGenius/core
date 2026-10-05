@@ -77,6 +77,7 @@
 //! native binary takes a comma-separated `CRONS` environment variable of
 //! standard five-field cron expressions.
 
+pub mod analytics;
 mod answer;
 pub mod chunk;
 mod connectors;
@@ -94,6 +95,7 @@ pub mod store;
 mod uploads;
 mod widget;
 
+pub use analytics::TicketStats;
 pub use answer::DEFAULT_ANSWER_THRESHOLD;
 pub use chunk::tokenize;
 pub use handlers::{MAX_BOOST_CANDIDATES, REVIEWED_BOOST};
@@ -244,6 +246,16 @@ const MIGRATION_HUMAN_HANDOFF: SqlMigration = SqlMigration::new(
     include_str!("../migrations/sqlite/0009_human_handoff.sql"),
 );
 
+/// Analytics (issue #36): the daily rollups `/v1/support/analytics` reads
+/// (`analytics`), plus `sg_messages.retrieved_chunks` — how many chunks a
+/// turn's retrieval returned, which is what tells a gap ("nothing was
+/// retrieved") from a turn that retrieved and still would not answer.
+const MIGRATION_ANALYTICS: SqlMigration = SqlMigration::new(
+    "0010",
+    "analytics",
+    include_str!("../migrations/sqlite/0010_analytics.sql"),
+);
+
 /// The support module: tenant provisioning behind the harness admin
 /// token, API-key-authenticated source ingest, BM25 search and grounded
 /// answers, the cron-driven connectors that keep a workspace's index
@@ -280,6 +292,10 @@ pub struct Support {
     /// `None` is the unwired module: a handoff still marks
     /// `needs_escalation` and nothing files a ticket.
     handoff: Option<Arc<dyn HandoffSink>>,
+    /// `None` is the unwired module: the daily rollup still runs, but the
+    /// five ticket columns report zero — support rolls up its own numbers
+    /// without reaching into another module's tables.
+    ticket_stats: Option<Arc<dyn TicketStats>>,
     visitor_rate_limiter: Option<Arc<dyn cratefield_core::RateLimiter>>,
     /// Other modules' surfaces the `OpenAPI` document (`GET /openapi.json`,
     /// issue #34) covers, paired with the module name their paths mount
@@ -298,6 +314,7 @@ impl Support {
     pub fn new() -> Self {
         Self {
             handoff: None,
+            ticket_stats: None,
             visitor_rate_limiter: None,
             api_surfaces: Vec::new(),
         }
@@ -326,6 +343,18 @@ impl Support {
     #[must_use]
     pub fn with_handoff(mut self, handoff: Arc<dyn HandoffSink>) -> Self {
         self.handoff = Some(handoff);
+        self
+    }
+
+    /// A `Support` that reads its ticket columns from `stats`: the daily
+    /// rollup asks the port for each day's filed/rejected/needs-info/
+    /// duplicate/dead-lettered counts. The other seam the composition
+    /// wires, and unwired it is simply absent — the ticket columns roll
+    /// up as zero rather than the module refusing to compute its own
+    /// numbers.
+    #[must_use]
+    pub fn with_ticket_stats(mut self, stats: Arc<dyn TicketStats>) -> Self {
+        self.ticket_stats = Some(stats);
         self
     }
     /// Gives the widget routes their own limiter, for the per-visitor and
@@ -424,6 +453,9 @@ impl Module for Support {
             "sg_connectors",
             "sg_ingest_pages",
             "sg_ingest_outbox",
+            "sg_daily_stats",
+            "sg_daily_gaps",
+            "sg_daily_citations",
         ]
     }
 
@@ -485,7 +517,7 @@ impl Module for Support {
     }
 
     fn migrations(&self) -> Migrations {
-        const MIGRATIONS: [SqlMigration; 9] = [
+        const MIGRATIONS: [SqlMigration; 10] = [
             MIGRATION_INIT,
             MIGRATION_CONVERSATIONS,
             MIGRATION_SOURCE_MANAGEMENT,
@@ -495,6 +527,7 @@ impl Module for Support {
             MIGRATION_SEARCH_STATS,
             MIGRATION_WIDGET_SETTINGS,
             MIGRATION_HUMAN_HANDOFF,
+            MIGRATION_ANALYTICS,
         ];
         // Refuses a gap, a duplicate or an out-of-order id at compile
         // time.
@@ -609,6 +642,13 @@ impl Module for Support {
     /// failing re-index must not strand an upload at `complete` or skip a
     /// connector re-sync, nor any other way round — and the first error,
     /// in that order, is what the tick reports.
+    ///
+    /// A fourth step rides the same daily tick: the analytics rollup
+    /// recomputes the trailing [`analytics::ROLLUP_DAYS`] days
+    /// ([`analytics::rollup_recent`]), so `/v1/support/analytics` reads
+    /// precomputed rows. It is the last of the four, so the numbers a
+    /// dashboard sees are computed from a corpus the same tick has
+    /// already brought up to date.
     fn scheduled<'a>(
         &'a self,
         ctx: &'a ModuleContext,
@@ -618,7 +658,8 @@ impl Module for Support {
             let reindexed = reindex_sweep(ctx).await;
             let uploads = uploads::scheduled(ctx, cron).await;
             let connectors = connector_resync(ctx).await;
-            reindexed.and(uploads).and(connectors)
+            let analytics = analytics::scheduled(ctx, self.ticket_stats.as_deref()).await;
+            reindexed.and(uploads).and(connectors).and(analytics)
         })
     }
 }
@@ -800,6 +841,31 @@ const PERSONAL_DATA: &[PersonalDataSet] = &[
              with no column identifying a person, so no erasure predicate can match \
              one into the queue. The queue drains to the same page rows (above) and \
              leaves when the workspace's account is closed.",
+    ),
+    PersonalDataSet::none(
+        "sg_daily_stats",
+        "One rolled-up day per workspace: how many conversations opened and turns \
+             were answered, clarified or handed off, how many tickets were filed or \
+             rejected, and the day's median model confidence. Counts and one \
+             percentage; nothing here names anyone.",
+    ),
+    PersonalDataSet::unreachable(
+        "sg_daily_gaps",
+        DataKind::Content,
+        "The normalized query terms behind a day's unanswered turns — the words a \
+             workspace's end users asked about and the index could not serve, counted \
+             per term. The words are the workspace's own vocabulary and may include a \
+             name.",
+        "Only normalized terms are stored — never the question they came from — so \
+             there is no sentence and no column identifying a person for an erasure \
+             predicate to match. The rows are a projection of sg_messages and leave \
+             when the workspace's account is closed.",
+    ),
+    PersonalDataSet::none(
+        "sg_daily_citations",
+        "One rolled-up day per workspace and source: how many times that source's \
+             passages were cited by the day's answers. Two ids and a count; nothing \
+             here names a person.",
     ),
 ];
 

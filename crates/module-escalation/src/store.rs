@@ -985,6 +985,122 @@ pub async fn outbox_created_at(
     }
 }
 
+/// One tenant's ticket events on one UTC day, as the support module's
+/// analytics rollup reads them (issue #36).
+///
+/// The five counts are the five outcome events a day can produce:
+/// `filed` (the tracker accepted the ticket), `rejected` (the judge
+/// closed it as not a defect), `needs_info` (the judge asked the
+/// customer for more), `duplicates` and `dead_lettered` (the file stage
+/// exhausted its retries). `duplicates` counts `linked` — the judge
+/// recognising the draft as a duplicate of an already-filed ticket — and
+/// deliberately *not* `duplicate_ignored`, which records the opposite
+/// outcome: a `duplicate_of` the judge named but was not shown among its
+/// candidates, so nothing was linked and no duplicate was actually
+/// actioned. Counting that would report duplicates the pipeline refused
+/// to recognise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DayCounts {
+    pub tenant_id: String,
+    pub filed: i64,
+    pub rejected: i64,
+    pub needs_info: i64,
+    pub duplicates: i64,
+    pub dead_lettered: i64,
+}
+
+/// The event kinds [`DayCounts`] counts, in the stored form
+/// ([`EventKind::as_str`]).
+const COUNTED_KINDS: [&str; 5] = [
+    EventKind::Filed.as_str(),
+    EventKind::Rejected.as_str(),
+    EventKind::NeedsInfo.as_str(),
+    EventKind::Linked.as_str(),
+    EventKind::FileDeadLettered.as_str(),
+];
+
+/// The day's ticket events, grouped by tenant and kind, one
+/// [`DayCounts`] per tenant with any event on `day` (a tenant with none
+/// is simply absent). `day` is a UTC `YYYY-MM-DD`; events are matched on
+/// the date part of their `at` timestamp, which every writer stamps from
+/// a `Clock` in UTC.
+///
+/// `sg_ticket_events` carries no `tenant_id` — a ticket's tenant lives on
+/// `sg_tickets` — so this is the one query in the crate that joins the
+/// two.
+///
+/// # Errors
+///
+/// The database's error when the read fails.
+pub async fn ticket_counts_for_day(db: &dyn Database, day: &str) -> Result<Vec<DayCounts>, Error> {
+    let mut query = Query::select();
+    query
+        .expr_as(
+            Expr::col((Alias::new("t"), Alias::new("tenant_id"))),
+            Alias::new("tenant_id"),
+        )
+        .expr_as(
+            Expr::col((Alias::new("e"), Alias::new("kind"))),
+            Alias::new("kind"),
+        )
+        .expr_as(
+            Func::count(Expr::col((Alias::new("e"), Alias::new("id")))),
+            Alias::new("events"),
+        )
+        .from_as(Alias::new("sg_ticket_events"), Alias::new("e"))
+        .join_as(
+            sea_query::JoinType::InnerJoin,
+            Alias::new("sg_tickets"),
+            Alias::new("t"),
+            Expr::col((Alias::new("e"), Alias::new("ticket_id")))
+                .eq(Expr::col((Alias::new("t"), Alias::new("id")))),
+        )
+        .and_where(Expr::col((Alias::new("e"), Alias::new("at"))).like(format!("{day}%")))
+        .and_where(Expr::col((Alias::new("e"), Alias::new("kind"))).is_in(COUNTED_KINDS))
+        .group_by_col((Alias::new("t"), Alias::new("tenant_id")))
+        .group_by_col((Alias::new("e"), Alias::new("kind")));
+
+    let rows = db.query(&Statement::render(&query)).await?;
+    let mut counts: Vec<DayCounts> = Vec::new();
+    // First-seen order for the tenants, so the result is deterministic
+    // without imposing an order the caller has no use for.
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for row in &rows.rows {
+        let tenant_id = required_text(row, "tenant_id")?;
+        let kind = required_text(row, "kind")?;
+        let events = row
+            .get::<i64>("events")
+            .ok_or_else(|| Error::Decode("column `events` missing or not an integer".to_owned()))?;
+        let index = *seen.entry(tenant_id.clone()).or_insert_with(|| {
+            counts.push(DayCounts {
+                tenant_id: tenant_id.clone(),
+                filed: 0,
+                rejected: 0,
+                needs_info: 0,
+                duplicates: 0,
+                dead_lettered: 0,
+            });
+            counts.len() - 1
+        });
+        let entry = &mut counts[index];
+        match kind.as_str() {
+            "filed" => entry.filed = events,
+            "rejected" => entry.rejected = events,
+            "needs_info" => entry.needs_info = events,
+            "linked" => entry.duplicates = events,
+            "file_dead_lettered" => entry.dead_lettered = events,
+            // `COUNTED_KINDS` bounds the filter, so this arm is the
+            // schema drifting from the model: decode, do not guess.
+            other => {
+                return Err(Error::Decode(format!(
+                    "column `kind`: unexpected counted event kind `{other}`"
+                )));
+            }
+        }
+    }
+    Ok(counts)
+}
+
 // ---------------------------------------------------------------------------
 // Decoding
 // ---------------------------------------------------------------------------
