@@ -345,6 +345,9 @@ pub(crate) async fn post_widget_message(
         &tenant_id,
         message,
         body.conversation_id.as_deref(),
+        // The widget collects no contact address; only `POST /messages`
+        // carries one.
+        None,
         lang,
     )
     .await

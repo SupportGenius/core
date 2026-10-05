@@ -104,4 +104,23 @@ pub trait HandoffSink: Send + Sync {
         let _ = (ctx, tenant_id, id);
         Box::pin(async { None })
     }
+
+    /// The statements that remember one conversation's contact address, to
+    /// be appended to the turn's own `batch_atomic` whenever the customer
+    /// supplied one. The address is the notify stage's recipient; without
+    /// escalation composed there is no table to store it in, and the
+    /// default does nothing — the address is simply not kept, and the
+    /// notify stage reports `no_recipient`.
+    ///
+    /// Defaulted, unlike [`enqueue`](Self::enqueue): a sink that files
+    /// tickets can still decline to hold contact details.
+    fn remember_contact(
+        &self,
+        _ctx: &ModuleContext,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _email: &str,
+    ) -> Vec<Statement> {
+        Vec::new()
+    }
 }

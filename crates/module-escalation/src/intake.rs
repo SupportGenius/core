@@ -76,6 +76,22 @@ impl Intake {
             .statements
     }
 
+    /// The statements that record the customer's contact address for one
+    /// conversation, for the caller to append to its own `batch_atomic`.
+    /// `HandoffSink::remember_contact` delegates here, so an escalating turn
+    /// that also names an address stores it exactly when the turn commits —
+    /// never an address for a turn that rolled back. An upsert: a later
+    /// turn's address replaces an earlier one for the same conversation.
+    pub fn contact(&self, tenant_id: &str, conversation_id: &str, email: &str) -> Vec<Statement> {
+        let now = self.clock.now().format(&Rfc3339).unwrap_or_default();
+        vec![store::upsert_contact_stmt(
+            tenant_id,
+            conversation_id,
+            email,
+            &now,
+        )]
+    }
+
     /// The same work as [`Intake::enqueue`], handing back the ticket id
     /// it minted alongside the statements.
     pub fn handoff(&self, tenant_id: &str, conversation_id: &str, transcript: &str) -> Handoff {
@@ -106,6 +122,7 @@ impl Intake {
             external_id: None,
             external_url: None,
             match_count: 0,
+            tracker_state: None,
             created_at: now.clone(),
             updated_at: now.clone(),
         };
@@ -130,6 +147,7 @@ impl Intake {
             &ticket_id,
             tenant_id,
             Stage::Draft,
+            None,
             &now,
         );
 
@@ -250,6 +268,7 @@ mod tests {
             crate::model::StagePayload {
                 ticket_id: handoff.ticket_id.clone(),
                 tenant_id: "acme".to_owned(),
+                event_id: None,
             }
         );
     }
@@ -264,8 +283,10 @@ mod tests {
         assert_eq!(ticket.values.0[3], Status::Intake.as_str().into());
         assert_eq!(ticket.values.0[4], Stage::Draft.as_topic().into());
         assert_eq!(ticket.values.0[5], "customer: it broke".into());
-        // Nothing is drafted yet: every late-stage column binds NULL.
-        for column in 6..15 {
+        // Nothing is drafted yet: every late-stage column binds NULL, and
+        // `tracker_state` (19, after `kind`) is NULL until the ticket files
+        // (`match_count`, column 15, is the zero default).
+        for column in (6..15).chain(19..20) {
             assert!(
                 bind(&ticket.values.0[column])
                     .expect("a bind is present")
@@ -309,6 +330,7 @@ mod tests {
                 crate::MIGRATION_ESCALATION,
                 crate::MIGRATION_DUPLICATES,
                 crate::MIGRATION_ROUTING,
+                crate::MIGRATION_FOLLOW,
             ],
         )
         .expect("migration applies");

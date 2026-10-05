@@ -30,7 +30,7 @@ the optional `RateLimiter` port.
 | `GET /uploads/{id}` | API key | the upload's status, `received_bytes`, and once extracted its `source_id` |
 | `POST /connectors` | API key | `{"kind": "sitemap" \| "url_prefix", "url"}` or `{"kind": "github", "owner", "repo", "path_glob"?, "ref"?, "credential_ref"?}`, with optional `max_pages`/`max_bytes`/`max_depth` → `201`; the crawl runs asynchronously and re-syncs on cron |
 | `GET /search?q=…&limit=…` | API key | BM25 over the tenant's own index |
-| `POST /messages` | API key | `{"message", "conversation_id"?}` → one support turn |
+| `POST /messages` | API key | `{"message", "conversation_id"?, "contact"?: {"email"}}` → one support turn |
 | `GET /keys` | API key | the tenant's own API keys — `{kid, label, created_at}` each, oldest first |
 | `POST /keys` | API key | `{"label"?}` → mint another API key for the tenant (shown once, like provisioning) |
 | `DELETE /keys/{kid}` | API key | delete one of the tenant's own keys; `204`, or `404` for a foreign/unknown kid and `409` for the last remaining key |
@@ -177,6 +177,15 @@ whatever the confidence. That includes a chunk that exists but belongs to
 another tenant. The model's raw answer and citations are still stored
 (`sg_messages.model_answer`, `citations`), but only an `answered` turn
 ever returns them.
+
+**The optional contact.** A request may carry `"contact": {"email": "…"}`.
+The address is validated (one `@` splitting a non-empty local part from a
+non-empty domain, no whitespace, at most 254 characters) and a malformed
+one is a `400` before anything is written. A valid address is handed to
+the composed `HandoffSink`'s `remember_contact` and stored in the same
+atomic batch as the turn, so the escalation notify stage has a recipient
+for a filed ticket. Without a handoff sink (a bare `Support::new()`) the
+address is simply not kept.
 
 **Escalation is sticky.** Once a conversation needs escalation, an
 answered follow-up does not clear it. Only an escalating turn writes the

@@ -12,7 +12,7 @@ mod common;
 use std::sync::Arc;
 
 use axum::http::{Method, StatusCode};
-use cratefield_core::{MapConfig, ModelTier};
+use cratefield_core::{MapConfig, ModelTier, Statement};
 use cratefield_testing::{TestHarness, TextModelMode};
 use serde_json::json;
 
@@ -31,6 +31,84 @@ async fn turn(kit: &TestHarness, api_key: &str) -> Reply {
         Some(&json!({ "message": MESSAGE }).to_string()),
     )
     .await
+}
+
+/// Issue #26: a `contact` on the turn is remembered for the escalation
+/// notify stage, in the turn's own atomic batch, so a filed ticket has
+/// somewhere to send.
+#[pollster::test]
+async fn a_contact_on_the_turn_is_stored_for_the_notify_stage() {
+    let kit = kit();
+    let (tenant_id, api_key) = mint_tenant(&kit).await;
+    seed_destination(&kit, &tenant_id);
+
+    let reply = send(
+        &kit.router,
+        Method::POST,
+        MESSAGES,
+        Some(&api_key),
+        Some(&json!({ "message": MESSAGE, "contact": { "email": "jane@acme.test" } }).to_string()),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{:?}", reply.body);
+    let conversation_id = reply.body["conversation_id"]
+        .as_str()
+        .expect("conversation_id")
+        .to_owned();
+
+    let rows = pollster::block_on(kit.db.query(&Statement::new(
+        "SELECT tenant_id, conversation_id, email FROM sg_contacts",
+    )))
+    .expect("contact query runs");
+    assert_eq!(rows.rows.len(), 1, "one contact row");
+    let row = &rows.rows[0];
+    assert_eq!(
+        row.get::<String>("tenant_id").expect("tenant_id"),
+        tenant_id
+    );
+    assert_eq!(
+        row.get::<String>("conversation_id")
+            .expect("conversation_id"),
+        conversation_id,
+        "the address is stored against the conversation"
+    );
+    assert_eq!(row.get::<String>("email").expect("email"), "jane@acme.test");
+}
+
+/// An address that is not one is a 400 before anything is written: no
+/// conversation, no message, no ticket, no contact.
+#[pollster::test]
+async fn an_invalid_contact_is_rejected_without_writing_anything() {
+    let kit = kit();
+    let (_tenant_id, api_key) = mint_tenant(&kit).await;
+
+    for bad in [
+        "",
+        "not-an-email",
+        "two@@acme.test",
+        "jane@ac me.test",
+        "@acme.test",
+    ] {
+        let reply = send(
+            &kit.router,
+            Method::POST,
+            MESSAGES,
+            Some(&api_key),
+            Some(&json!({ "message": MESSAGE, "contact": { "email": bad } }).to_string()),
+        )
+        .await;
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "`{bad}` is not an address: {:?}",
+            reply.body
+        );
+    }
+
+    assert_eq!(count_of(&kit, "sg_conversations"), 0, "no conversation");
+    assert_eq!(count_of(&kit, "sg_messages"), 0, "no message");
+    assert_eq!(count_of(&kit, "sg_tickets"), 0, "no ticket");
+    assert_eq!(count_of(&kit, "sg_contacts"), 0, "no contact");
 }
 
 #[pollster::test]

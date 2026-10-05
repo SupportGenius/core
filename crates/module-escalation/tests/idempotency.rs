@@ -41,11 +41,11 @@ async fn a_redelivered_file_row_files_once_and_audits_once() {
     );
 
     // Re-deliver the same stage's work: fresh job id, same ticket, same
-    // tenant — exactly the row a redelivery would replay.
+    // tenant — exactly the row a redelivery would replay. It queues
+    // alongside the `follow` poll the filing left behind.
     support::requeue_file_stage(&fixture);
-    assert_eq!(
-        support::outbox_count(&fixture),
-        1,
+    assert!(
+        support::outbox_row(&fixture, "file").is_some(),
         "the redelivered row is queued"
     );
 
@@ -59,9 +59,14 @@ async fn a_redelivered_file_row_files_once_and_audits_once() {
     );
     assert_eq!(support::ticket(&fixture).status, Status::Filed);
     assert_eq!(
-        support::outbox_count(&fixture),
+        support::outbox_count_of(&fixture, "file"),
         0,
         "the redelivered row was completed, not retried"
+    );
+    assert_eq!(
+        support::outbox_count_of(&fixture, "follow"),
+        1,
+        "the follow poll is the only row left, rescheduling itself"
     );
     assert_eq!(
         filed_event_count(&fixture),
@@ -99,9 +104,14 @@ async fn a_held_claim_with_uncommitted_work_re_runs_the_stage() {
         fixture.tracker.filed()
     );
     assert_eq!(
-        support::outbox_count(&fixture),
+        support::outbox_count_of(&fixture, "file"),
         0,
         "the row completed once the re-run committed"
+    );
+    assert_eq!(
+        support::outbox_count_of(&fixture, "follow"),
+        1,
+        "only the follow poll remains"
     );
     assert_eq!(
         filed_event_count(&fixture),

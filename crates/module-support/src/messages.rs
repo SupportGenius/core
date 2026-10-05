@@ -107,18 +107,35 @@ pub(crate) fn handoff_transcript(message: &str, reply: &str) -> String {
 
 /// The turn's one atomic batch: its own statements, then — when this turn
 /// escalates and a [`HandoffSink`](crate::HandoffSink) is composed — the
-/// sink's statements for `transcript`. Appending here is what makes the
-/// answer and the ticket all-or-nothing. `Support::new()` composes no
-/// sink, so this is just the turn and a handoff only marks
-/// `needs_escalation`.
-fn turn_batch(state: &ModuleState, turn: &store::Turn, transcript: Option<&str>) -> Vec<Statement> {
+/// sink's statements for `transcript`, and, whenever the request carried a
+/// `contact` and a sink is composed, the sink's statements remembering that
+/// address. Appending here is what makes the answer, the ticket and the
+/// stored contact all-or-nothing. `Support::new()` composes no sink, so
+/// this is just the turn and a handoff only marks `needs_escalation`.
+fn turn_batch(
+    state: &ModuleState,
+    turn: &store::Turn,
+    transcript: Option<&str>,
+    contact: Option<&str>,
+) -> Vec<Statement> {
     let mut statements = store::turn_statements(turn);
-    if let (Some(transcript), Some(sink)) = (transcript, state.handoff.as_deref()) {
+    let Some(sink) = state.handoff.as_deref() else {
+        return statements;
+    };
+    if let Some(transcript) = transcript {
         statements.extend(sink.enqueue(
             &state.ctx,
             &turn.tenant_id,
             &turn.conversation_id,
             transcript,
+        ));
+    }
+    if let Some(email) = contact {
+        statements.extend(sink.remember_contact(
+            &state.ctx,
+            &turn.tenant_id,
+            &turn.conversation_id,
+            email,
         ));
     }
     statements
@@ -238,6 +255,18 @@ const SYSTEM_PROMPT: &str = "You answer customer-support questions using only th
 pub struct MessageBody {
     pub(crate) message: String,
     pub(crate) conversation_id: Option<String>,
+    /// The customer's contact address, when they offered one. Kept by the
+    /// composed handoff sink (see [`HandoffSink::remember_contact`]) so the
+    /// escalation notify stage has somewhere to send; a turn without one
+    /// behaves exactly as before.
+    pub(crate) contact: Option<ContactBody>,
+}
+
+/// The nested contact object: `{"contact": {"email": "…"}}`, so an address
+/// is never confused with a second bare string field.
+#[derive(Deserialize, JsonSchema)]
+pub(crate) struct ContactBody {
+    pub(crate) email: String,
 }
 
 #[derive(Deserialize)]
@@ -312,7 +341,8 @@ impl From<cratefield_core::DbError> for TurnFailure {
     }
 }
 
-/// `POST /messages` — `{"message": "…", "conversation_id": "…"?}`. Answers
+/// `POST /messages` — `{"message": "…", "conversation_id": "…"?,
+/// "contact": {"email": "…"}?}`. Answers
 /// `{conversation_id, message_id, outcome, answer, citations, confidence,
 /// needs_escalation}`, where `outcome` is `answered`, `clarify` or
 /// `handoff` (see [`answer::decide`]).
@@ -363,6 +393,7 @@ pub(crate) async fn answer(
         tenant_id,
         message,
         body.conversation_id.as_deref(),
+        body.contact.as_ref().map(|contact| contact.email.as_str()),
         lang,
     )
     .await
@@ -380,6 +411,7 @@ pub(crate) async fn run_turn(
     tenant_id: &str,
     message: &str,
     conversation_id: Option<&str>,
+    contact: Option<&str>,
     lang: Option<String>,
 ) -> Result<TurnReply, TurnFailure> {
     let ctx = &state.ctx;
@@ -471,6 +503,7 @@ pub(crate) async fn run_turn(
         db,
         &turn,
         transcript.as_deref(),
+        contact,
         scope.defer.clone(),
     )
     .await?;
@@ -528,10 +561,12 @@ async fn resolve_conversation(
 ///
 /// The batch is the turn's own statements plus, when `transcript` is
 /// `Some` (an escalating turn with a [`HandoffSink`](crate::HandoffSink)
-/// composed), the sink's for that transcript — so the "escalated" answer
-/// and the ticket behind it commit or roll back together. The kick runs
-/// only *after* the commit: a failure there costs a delay (the scheduled
-/// drain is the backstop), never the ticket the batch just wrote.
+/// composed), the sink's for that transcript, and, when `contact` is
+/// `Some`, the sink's remembering that address — so the "escalated" answer,
+/// the ticket behind it and the stored contact commit or roll back
+/// together. The kick runs only *after* the commit: a failure there costs a
+/// delay (the scheduled drain is the backstop), never the ticket the batch
+/// just wrote.
 ///
 /// Extracted from [`run_turn`] to keep the turn's ordering readable
 /// as one numbered sequence without the handler tripping the function
@@ -542,9 +577,10 @@ async fn commit_turn(
     db: &dyn Database,
     turn: &store::Turn,
     transcript: Option<&str>,
+    contact: Option<&str>,
     defer: Arc<dyn Defer>,
 ) -> Result<(), Problem> {
-    db.batch_atomic(&turn_batch(state, turn, transcript))
+    db.batch_atomic(&turn_batch(state, turn, transcript, contact))
         .await?;
     if transcript.is_some()
         && let Some(sink) = state.handoff.as_deref()
@@ -554,7 +590,8 @@ async fn commit_turn(
     Ok(())
 }
 
-/// The request body, with `message` trimmed and length-checked.
+/// The request body, with `message` trimmed and length-checked and any
+/// `contact.email` validated.
 fn parse_message(body: &[u8]) -> Result<MessageBody, Problem> {
     let body: MessageBody = serde_json::from_slice(body).map_err(|_| {
         Problem::validation_failed(
@@ -576,7 +613,36 @@ pub(crate) fn validate_message(mut body: MessageBody) -> Result<MessageBody, Pro
         )));
     }
     body.message = trimmed.to_owned();
+    if let Some(contact) = &mut body.contact {
+        contact.email = normalize_contact_email(&contact.email).ok_or_else(|| {
+            Problem::validation_failed("contact.email: not a valid email address")
+        })?;
+    }
     Ok(body)
+}
+
+/// The longest an email address may be (RFC 5321's 254-octet path limit).
+const MAX_EMAIL_CHARS: usize = 254;
+
+/// Trims and validates a contact address, handing back the trimmed form.
+/// Deliberately structural rather than RFC-complete: one `@` splitting a
+/// non-empty local part from a non-empty domain, no whitespace anywhere,
+/// within [`MAX_EMAIL_CHARS`]. `None` when the shape is wrong — the caller
+/// turns that into a 400, never a stored address the notify stage cannot
+/// use.
+fn normalize_contact_email(raw: &str) -> Option<String> {
+    let email = raw.trim();
+    if email.is_empty() || email.chars().count() > MAX_EMAIL_CHARS {
+        return None;
+    }
+    if email.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let (local, domain) = email.split_once('@')?;
+    if local.is_empty() || domain.is_empty() || domain.contains('@') {
+        return None;
+    }
+    Some(email.to_owned())
 }
 
 /// Calls the model, mapping every failure to its problem: no model or

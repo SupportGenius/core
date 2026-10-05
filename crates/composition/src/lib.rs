@@ -447,10 +447,11 @@ impl<M: Module> Module for OnCron<M> {
 ///
 /// Support never names escalation — it hands an escalating turn to whatever
 /// sink the composition wired, and this type, in the one crate that depends
-/// on both, is that sink. [`enqueue`](HandoffSink::enqueue) delegates to
+/// on both, is that sink. [`enqueue`](HandoffSink::enqueue) and
+/// [`remember_contact`](HandoffSink::remember_contact) delegate to
 /// escalation's own intake, so escalation keeps sole ownership of the
-/// ticket schema; [`kick`](HandoffSink::kick) delegates to escalation's own
-/// deferred drain. Neither module learns about the other.
+/// ticket and contact schemas; [`kick`](HandoffSink::kick) delegates to
+/// escalation's own deferred drain. Neither module learns about the other.
 struct EscalationHandoff;
 
 impl HandoffSink for EscalationHandoff {
@@ -483,6 +484,18 @@ impl HandoffSink for EscalationHandoff {
             .intake()
             .handoff(tenant_id, conversation_id, transcript);
         (Some(handoff.ticket_id), handoff.statements)
+    }
+
+    fn remember_contact(
+        &self,
+        _ctx: &ModuleContext,
+        tenant_id: &str,
+        conversation_id: &str,
+        email: &str,
+    ) -> Vec<Statement> {
+        Escalation::new()
+            .intake()
+            .contact(tenant_id, conversation_id, email)
     }
 
     fn kick(&self, ctx: &ModuleContext, defer: Arc<dyn Defer>) {

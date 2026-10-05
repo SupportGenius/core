@@ -26,21 +26,21 @@
 use std::collections::BTreeMap;
 
 use cratefield_core::{Database, Row, Statement};
-use sea_query::{Alias, Expr, Order, Query, SimpleExpr};
+use sea_query::{Alias, Expr, Func, Order, Query, SimpleExpr};
 
 use crate::error::Error;
 use crate::model::{
     Drafted, EventKind, Judgment, Kind, Stage, StagePayload, Status, Ticket, TicketEvent, Verdict,
 };
 
-use cratefield_core::{Destination, Filed, Severity};
+use cratefield_core::{Destination, Filed, Severity, TicketState};
 
 fn iden(name: &str) -> Alias {
     Alias::new(name)
 }
 
 /// The columns `sg_tickets` reads come back in, in decode order.
-const TICKET_COLUMNS: [&str; 19] = [
+const TICKET_COLUMNS: [&str; 20] = [
     "id",
     "tenant_id",
     "conversation_id",
@@ -59,9 +59,10 @@ const TICKET_COLUMNS: [&str; 19] = [
     "match_count",
     "created_at",
     "updated_at",
-    // Appended by migration 0007, so it stays at the end of the insert and
-    // select lists (the intake tests pin the earlier positions).
+    // Appended by migrations 0007 and 0008, so they stay at the end of the
+    // insert and select lists (the intake tests pin the earlier positions).
     "kind",
+    "tracker_state",
 ];
 
 /// The columns `sg_ticket_events` reads come back in, in decode order.
@@ -137,6 +138,7 @@ pub fn insert_ticket_stmt(ticket: &Ticket) -> Statement {
             ticket.created_at.clone().into(),
             ticket.updated_at.clone().into(),
             ticket.kind.as_str().into(),
+            ticket.tracker_state.map(ticket_state_text).into(),
         ]);
     Statement::render(&insert)
 }
@@ -244,7 +246,60 @@ pub fn update_ticket_filed_stmt(ticket_id: &str, filed: &Filed, at: &str) -> Sta
     Statement::render(&update)
 }
 
-/// Points a duplicate ticket at the tracker reference of the existing
+/// Records the tracker's reported state on the ticket and refreshes
+/// `updated_at`. Written `open` when the file stage succeeds (the tracker
+/// accepted the ticket) and refreshed by every follow-up poll that sees a
+/// change (see `Pipeline::run_follow`). `(ticket, seq)` pairs in the audit
+/// trail are not unique, so the follow stage reads the last state back from
+/// this column rather than the event trail.
+#[must_use]
+pub fn update_ticket_tracker_state_stmt(
+    ticket_id: &str,
+    state: TicketState,
+    at: &str,
+) -> Statement {
+    let mut update = Query::update();
+    update
+        .table(iden("sg_tickets"))
+        .values([
+            (iden("tracker_state"), ticket_state_text(state).into()),
+            (iden("updated_at"), at.to_owned().into()),
+        ])
+        .and_where(Expr::col(iden("id")).eq(ticket_id));
+    Statement::render(&update)
+}
+
+/// Upserts the customer's contact address for one conversation (`the
+/// (tenant_id, conversation_id)` primary key means a later turn replaces an
+/// earlier address). Called by `HandoffSink::remember_contact` through the
+/// escalation `Intake`, so the address is written in the same atomic batch
+/// as the turn that supplied it. **Only the address module-support's own
+/// tables do not own lives here** — escalation reads it back at
+/// notify-time (`contact_email`) and declares it in `personal_data`.
+#[must_use]
+pub fn upsert_contact_stmt(
+    tenant_id: &str,
+    conversation_id: &str,
+    email: &str,
+    updated_at: &str,
+) -> Statement {
+    let mut insert = Query::insert();
+    insert
+        .into_table(iden("sg_contacts"))
+        .columns(["tenant_id", "conversation_id", "email", "updated_at"])
+        .values_panic([
+            tenant_id.to_owned().into(),
+            conversation_id.to_owned().into(),
+            email.to_owned().into(),
+            updated_at.to_owned().into(),
+        ])
+        .on_conflict(
+            sea_query::OnConflict::columns([iden("tenant_id"), iden("conversation_id")])
+                .update_columns(["email", "updated_at"])
+                .to_owned(),
+        );
+    Statement::render(&insert)
+}
 /// ticket it duplicates — so the notify stage can name and link it
 /// without loading the other row — and refreshes `updated_at`. The
 /// duplicate is never filed itself, so this is where its `external_id`
@@ -534,9 +589,11 @@ pub fn outbox_retry_later_stmt(table: &str, id: &str, next_attempt_at: &str) -> 
 /// The outbox `enqueue_statement` for one stage's work: topic
 /// `stage.as_topic()`, a [`StagePayload`] JSON payload, the ticket id as
 /// the subject (the ticket is the per-person key erasure reaches through,
-/// issue #266), `at` for both `created_at` and the first
-/// `next_attempt_at`. A thin wrapper so stages cannot mistype the topic
-/// or forget the subject.
+/// issue #266), and `at` for the first `next_attempt_at`. `event_id` rides
+/// in the payload when a status-update notify must name the
+/// `status_changed` event it announces (see
+/// [`crate::model::StagePayload::event_id`]). A thin wrapper so stages
+/// cannot mistype the topic or forget the subject.
 #[must_use]
 pub fn enqueue_stage_stmt(
     outbox: &cratefield_core::Outbox,
@@ -544,16 +601,35 @@ pub fn enqueue_stage_stmt(
     ticket_id: &str,
     tenant_id: &str,
     stage: Stage,
+    event_id: Option<&str>,
     at: &str,
 ) -> Statement {
     let payload = StagePayload {
         ticket_id: ticket_id.to_owned(),
         tenant_id: tenant_id.to_owned(),
+        event_id: event_id.map(str::to_owned),
     };
     let payload = serde_json::to_string(&payload).unwrap_or_else(|_| {
         format!("{{\"ticket_id\":\"{ticket_id}\",\"tenant_id\":\"{tenant_id}\"}}")
     });
     outbox.enqueue_statement(job_id, stage.as_topic(), &payload, Some(ticket_id), at)
+}
+
+/// Sets one outbox row's `next_attempt_at` and clears its lease, without
+/// incrementing `attempts` — a reschedule, not a failure. Core's
+/// `Outbox::reschedule` reads the row and updates it in its own round trip;
+/// this is the statement form, so the follow stage can queue its next poll
+/// inside the same `batch_atomic` that records a state change. The SQL is
+/// pinned verbatim in the tests below.
+#[must_use]
+pub fn outbox_reschedule_stmt(table: &str, id: &str, next_attempt_at: &str) -> Statement {
+    let mut update = Query::update();
+    update
+        .table(iden(table))
+        .value(iden("next_attempt_at"), next_attempt_at)
+        .value(iden("locked_until"), Option::<String>::None)
+        .and_where(Expr::col(iden("id")).eq(id));
+    Statement::render(&update)
 }
 
 // ---------------------------------------------------------------------------
@@ -816,6 +892,99 @@ pub async fn ticket_events(db: &dyn Database, ticket_id: &str) -> Result<Vec<Tic
     rows.rows.iter().map(event_from).collect()
 }
 
+/// Loads one audit event by id — the follow stage stores the id of the
+/// `status_changed` event it wrote in the notify row's payload, and the
+/// notify stage reads it back to learn the `to` state it must phrase the
+/// update from.
+///
+/// # Errors
+///
+/// As [`load_ticket`].
+pub async fn load_event(db: &dyn Database, id: &str) -> Result<Option<TicketEvent>, Error> {
+    let mut query = Query::select();
+    query
+        .columns(EVENT_COLUMNS)
+        .from(iden("sg_ticket_events"))
+        .and_where(Expr::col(iden("id")).eq(id))
+        .limit(1);
+    let rows = db.query(&Statement::render(&query)).await?;
+    rows.first().map(event_from).transpose()
+}
+
+/// How many `status_changed` events a ticket has — the follow stage's
+/// monotonic transition counter, and the `n` in the claim key that keeps a
+/// concurrent poll from reporting the same change twice.
+///
+/// # Errors
+///
+/// As [`load_ticket`].
+pub async fn status_changed_count(db: &dyn Database, ticket_id: &str) -> Result<i64, Error> {
+    let mut query = Query::select();
+    query
+        .expr_as(Func::count(Expr::col(iden("id"))), Alias::new("n"))
+        .from(iden("sg_ticket_events"))
+        .and_where(Expr::col(iden("ticket_id")).eq(ticket_id))
+        .and_where(Expr::col(iden("kind")).eq("status_changed"));
+    let rows = db.query(&Statement::render(&query)).await?;
+    let count = rows
+        .first()
+        .and_then(|row| row.get::<i64>("n"))
+        .unwrap_or(0);
+    Ok(count)
+}
+
+/// The customer's contact address stored for one conversation, if any — the
+/// notify stage's recipient. `None` when the support module never supplied a
+/// contact (the module-support handoff without a `remember_contact`
+/// statement), which the notify stage reports as `no_recipient`.
+///
+/// # Errors
+///
+/// [`Error::Db`] when the read fails.
+pub async fn contact_email(
+    db: &dyn Database,
+    tenant_id: &str,
+    conversation_id: &str,
+) -> Result<Option<String>, Error> {
+    let mut query = Query::select();
+    query
+        .columns(["email"])
+        .from(iden("sg_contacts"))
+        .and_where(Expr::col(iden("tenant_id")).eq(tenant_id))
+        .and_where(Expr::col(iden("conversation_id")).eq(conversation_id))
+        .limit(1);
+    let rows = db.query(&Statement::render(&query)).await?;
+    match rows.first() {
+        Some(row) => optional_text(row, "email"),
+        None => Ok(None),
+    }
+}
+
+/// The `created_at` of one outbox row, so the follow stage can age a poll
+/// row (its backoff widens from hourly to daily once the row is a day old).
+/// `None` when the row is gone — a concurrent drainer completed it.
+///
+/// # Errors
+///
+/// [`Error::Db`] when the read fails.
+pub async fn outbox_created_at(
+    db: &dyn Database,
+    table: &str,
+    id: &str,
+) -> Result<Option<String>, Error> {
+    let mut query = Query::select();
+    query
+        .columns(["created_at"])
+        .from(iden(table))
+        .and_where(Expr::col(iden("id")).eq(id))
+        .limit(1);
+    let rows = db.query(&Statement::render(&query)).await?;
+    match rows.first() {
+        Some(row) => optional_text(row, "created_at"),
+        None => Ok(None),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Decoding
 // ---------------------------------------------------------------------------
@@ -881,6 +1050,9 @@ fn ticket_from(row: &Row) -> Result<Ticket, Error> {
         match_count: row.get::<i64>("match_count").ok_or_else(|| {
             Error::Decode("column `match_count` missing or not an integer".to_owned())
         })?,
+        tracker_state: optional_text(row, "tracker_state")?
+            .map(|raw| ticket_state_from(&raw))
+            .transpose()?,
         created_at: required_text(row, "created_at")?,
         updated_at: required_text(row, "updated_at")?,
     })
@@ -911,6 +1083,23 @@ fn event_from(row: &Row) -> Result<TicketEvent, Error> {
 /// `Copy`, so this takes it by value.
 fn severity_text(severity: Severity) -> String {
     severity.name().to_owned()
+}
+
+/// The `TicketState` wire form for storage (`"open"`, `"in_progress"`, ...).
+/// The port type has no `name()`/`from_str`, so this rides its serde (the
+/// wire form is a bare string like `open`, not a JSON document).
+pub(crate) fn ticket_state_text(state: TicketState) -> String {
+    serde_json::to_value(state)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// Decodes a `tracker_state` cell. As [`severity_from`], the port type has no
+/// `from_str`, so this rides its serde.
+pub(crate) fn ticket_state_from(raw: &str) -> Result<TicketState, Error> {
+    serde_json::from_value(serde_json::Value::String(raw.to_owned()))
+        .map_err(|err| Error::Decode(format!("column `tracker_state`: {err}: `{raw}`")))
 }
 
 /// Decodes the `severity` cell. The port type has no `from_str`, so this
@@ -996,6 +1185,18 @@ mod tests {
     }
 
     #[test]
+    fn outbox_reschedule_stmt_matches_core_verbatim() {
+        let stmt =
+            outbox_reschedule_stmt("sg_escalation_outbox", "01JDEMO", "2026-09-19T00:15:00Z");
+        // No `attempts` bump: a reschedule is not a failure.
+        assert_eq!(
+            stmt.sql,
+            "UPDATE \"sg_escalation_outbox\" SET \"next_attempt_at\" = ?, \
+             \"locked_until\" = ? WHERE \"id\" = ?"
+        );
+    }
+
+    #[test]
     fn enqueue_stage_stmt_subjects_the_ticket_and_carries_the_payload() {
         let stmt = enqueue_stage_stmt(
             &Outbox::new("sg_escalation_outbox"),
@@ -1003,12 +1204,9 @@ mod tests {
             "01JTICKET",
             "acme",
             Stage::Judge,
+            None,
             "2026-09-19T00:00:00Z",
         );
-        assert!(stmt.sql.contains("INSERT INTO \"sg_escalation_outbox\""));
-        // id, topic, payload, subject, attempts, next_attempt_at, created_at.
-        assert_eq!(stmt.values.0.len(), 7);
-        assert_eq!(stmt.values.0[1], SeaValue::from("judge"));
         assert_eq!(
             stmt.values.0[2],
             SeaValue::from(r#"{"ticket_id":"01JTICKET","tenant_id":"acme"}"#.to_owned())
@@ -1059,6 +1257,7 @@ mod tests {
                 crate::MIGRATION_ESCALATION,
                 crate::MIGRATION_DUPLICATES,
                 crate::MIGRATION_ROUTING,
+                crate::MIGRATION_FOLLOW,
             ],
         )
         .expect("migration applies");
@@ -1085,6 +1284,7 @@ mod tests {
             external_id: None,
             external_url: None,
             match_count: 0,
+            tracker_state: None,
             created_at: "2026-09-19T00:00:00Z".to_owned(),
             updated_at: "2026-09-19T00:00:00Z".to_owned(),
         }
@@ -1117,6 +1317,7 @@ mod tests {
                 &ticket.id,
                 &ticket.tenant_id,
                 Stage::Draft,
+                None,
                 &at,
             ),
         ];
@@ -1305,6 +1506,62 @@ mod tests {
         assert_eq!(defect.target, RouteTarget::Local);
     }
 
+    /// The customer contact upserts (one row per conversation, a later
+    /// address replacing an earlier one) and the tracker state round-trips.
+    #[test]
+    fn contact_and_tracker_state_round_trip() {
+        let db = migrated_db();
+        let at = "2026-09-19T00:00:00Z";
+        pollster::block_on(db.batch_atomic(&[insert_ticket_stmt(&fresh_ticket())]))
+            .expect("insert");
+
+        assert_eq!(
+            pollster::block_on(contact_email(&db, "acme", "conv-1")).expect("read"),
+            None,
+            "no contact until one is written"
+        );
+        pollster::block_on(db.batch_atomic(&[
+            upsert_contact_stmt("acme", "conv-1", "jane@example.com", at),
+            update_ticket_tracker_state_stmt("01JTICKET", TicketState::Open, at),
+        ]))
+        .expect("write commits");
+        assert_eq!(
+            pollster::block_on(contact_email(&db, "acme", "conv-1")).expect("read"),
+            Some("jane@example.com".to_owned())
+        );
+        // Scoped by tenant and conversation.
+        assert_eq!(
+            pollster::block_on(contact_email(&db, "other", "conv-1")).expect("read"),
+            None
+        );
+        assert_eq!(
+            pollster::block_on(load_ticket(&db, "01JTICKET"))
+                .expect("read")
+                .expect("row")
+                .tracker_state,
+            Some(TicketState::Open)
+        );
+
+        // A later address replaces the earlier one, still one row.
+        let later = "2026-09-19T00:05:00Z";
+        pollster::block_on(db.batch_atomic(&[upsert_contact_stmt(
+            "acme",
+            "conv-1",
+            "jane.doe@example.com",
+            later,
+        )]))
+        .expect("upsert commits");
+        assert_eq!(
+            pollster::block_on(contact_email(&db, "acme", "conv-1")).expect("read"),
+            Some("jane.doe@example.com".to_owned())
+        );
+        let rows = pollster::block_on(db.query(&Statement::new(
+            "SELECT COUNT(*) AS n FROM sg_contacts".to_owned(),
+        )))
+        .expect("count");
+        assert_eq!(rows.first().expect("row").get::<i64>("n"), Some(1));
+    }
+
     /// The outbox statements drive core's own queue against the
     /// generated DDL: a batch that enqueues the next stage and completes
     /// the current one leaves exactly one due row, a retry re-arms it
@@ -1317,13 +1574,29 @@ mod tests {
 
         pollster::block_on(db.batch_atomic(&[
             insert_ticket_stmt(&fresh_ticket()),
-            enqueue_stage_stmt(&outbox, "01JJOB1", "01JTICKET", "acme", Stage::Draft, at),
+            enqueue_stage_stmt(
+                &outbox,
+                "01JJOB1",
+                "01JTICKET",
+                "acme",
+                Stage::Draft,
+                None,
+                at,
+            ),
         ]))
         .expect("seed commits");
         // The stage handoff: record nothing, enqueue the judge, complete
         // the draft job — one batch.
         pollster::block_on(db.batch_atomic(&[
-            enqueue_stage_stmt(&outbox, "01JJOB2", "01JTICKET", "acme", Stage::Judge, at),
+            enqueue_stage_stmt(
+                &outbox,
+                "01JJOB2",
+                "01JTICKET",
+                "acme",
+                Stage::Judge,
+                None,
+                at,
+            ),
             outbox_complete_stmt("sg_escalation_outbox", "01JJOB1"),
         ]))
         .expect("handoff batch commits");

@@ -1,7 +1,9 @@
 //! The durable stage runner: claims due outbox rows and drives each one
 //! through its stage — draft, judge, file, notify — so that a stage's
 //! effect, its audit row, the next stage's outbox row and the completion of
-//! its own row all commit in **one** [`Database::batch_atomic`].
+//! its own row all commit in **one** [`Database::batch_atomic`]. The
+//! `follow` stage is the one exception to "one row, one run": its row
+//! reschedules itself and polls the tracker until the ticket closes.
 //!
 //! The invariants this module exists to keep (issue #4):
 //!
@@ -49,7 +51,7 @@ use crate::store;
 use cratefield_core::{
     Clock, Completion, Config, Credential, Database, Defer, Destination, Filed, IdGen, Inbox,
     Mailer, Message, ModelTier, Outbox, OutboxRecord, Prompt, SendOutcome, Severity, Statement,
-    TextModel, TicketDraft, Tracker, scrub_text,
+    TextModel, TicketDraft, TicketState, TicketStatus, Tracker, scrub_text,
 };
 use cratefield_module_webhooks::{PublishError, Webhooks};
 use cratefield_secrets::Actor;
@@ -76,6 +78,21 @@ const LEASE_SECS: u64 = 300;
 /// cluster of reports about one defect, short enough that the brief stays
 /// a brief.
 const CANDIDATE_LIMIT: usize = 5;
+
+/// The follow stage's first poll: fifteen minutes after filing, when a
+/// new ticket is most likely to have moved.
+const FOLLOW_FIRST_DELAY: Duration = Duration::from_mins(15);
+
+/// A fresh ticket's follow poll waits this long between attempts, while
+/// the tracker is likely to keep changing on its own.
+const FOLLOW_SHORT_INTERVAL: Duration = Duration::from_hours(1);
+
+/// A ticket older than [`FOLLOW_SHORT_WINDOW`] has usually settled; its
+/// poll slows to a daily check so a stable ticket costs one call a day.
+const FOLLOW_LONG_INTERVAL: Duration = Duration::from_hours(24);
+
+/// How long after filing a ticket's follow poll keeps the short interval.
+const FOLLOW_SHORT_WINDOW: Duration = Duration::from_hours(24);
 
 // ---------------------------------------------------------------------------
 // RetryPolicy
@@ -347,8 +364,25 @@ impl Pipeline {
 
         // 3. Claim `ticket:stage`. First sight proceeds; a held key needs
         //    the ticket's progress to say which of two worlds this is.
-        let key = claim_key(&payload.ticket_id, stage);
-        let claimed = self.inbox.claim(&*self.db, &key, &at).await?;
+        //    The follow stage takes no claim: its row is *meant* to run
+        //    again (it reschedules itself), so a claim keyed `ticket:follow`
+        //    would either block the poll forever or make every poll look
+        //    like a double-drain. A status-update notify is keyed by its
+        //    event id instead, so two different updates never collide on one
+        //    key. In both exempt cases `claimed` is `true` — the
+        //    double-drain guard below must not touch them.
+        let event_id = payload.event_id.as_deref();
+        let claimed = if stage == Stage::Follow {
+            true
+        } else {
+            self.inbox
+                .claim(
+                    &*self.db,
+                    &claim_key_with(&payload.ticket_id, stage, event_id),
+                    &at,
+                )
+                .await?
+        };
 
         // 4. Load the ticket. Both the stage handlers and the
         //    double-drain check below read it; a read failure rides the
@@ -362,6 +396,7 @@ impl Pipeline {
                         stage,
                         &payload.ticket_id,
                         &payload.tenant_id,
+                        event_id,
                         err,
                         &at,
                     )
@@ -369,9 +404,14 @@ impl Pipeline {
             }
         };
         let Some(ticket) = ticket else {
-            // The row names a ticket that does not exist. Terminal — the
-            // audit row still lands (an event survives on its own id) and
-            // the status update is a harmless no-op.
+            // The row names a ticket that does not exist. For follow this
+            // is terminal for the row — there is nothing left to poll, and
+            // a follow row never dead-letters; every other stage records
+            // the terminal miss (an audit row survives on its own id and
+            // the status update is a harmless no-op).
+            if stage == Stage::Follow {
+                return self.complete_row(&record.id).await;
+            }
             let err = Error::Decode(format!("ticket `{}` is missing", payload.ticket_id));
             return self
                 .fail(
@@ -379,6 +419,7 @@ impl Pipeline {
                     stage,
                     &payload.ticket_id,
                     &payload.tenant_id,
+                    event_id,
                     err,
                     &at,
                 )
@@ -395,8 +436,10 @@ impl Pipeline {
         // died *before* its batch committed — its work is nowhere — so
         // this run proceeds on the already-held key exactly as if it had
         // won it. (The claim's remaining job in that case is to keep a
-        // concurrent drainer out until this attempt's batch lands.)
-        if !claimed && stage_already_committed(&ticket, stage) {
+        // concurrent drainer out until this attempt's batch lands.) A
+        // status-update notify is exempt: its key is unique per event, so
+        // a held key cannot mean "already committed".
+        if !claimed && event_id.is_none() && stage_already_committed(&ticket, stage) {
             return self.complete_row(&record.id).await;
         }
 
@@ -405,7 +448,8 @@ impl Pipeline {
             Stage::Draft => self.run_draft(record, &ticket, &at).await,
             Stage::Judge => self.run_judge(record, &ticket, &at).await,
             Stage::File => self.run_file(record, &ticket, &at).await,
-            Stage::Notify => self.run_notify(record, &ticket, &at).await,
+            Stage::Notify => self.run_notify(record, &ticket, event_id, &at).await,
+            Stage::Follow => self.run_follow(record, &ticket, &at).await,
         }
     }
 
@@ -440,6 +484,7 @@ impl Pipeline {
                         Stage::Draft,
                         &ticket.id,
                         &ticket.tenant_id,
+                        None,
                         Error::from(err),
                         at,
                     )
@@ -453,7 +498,15 @@ impl Pipeline {
             Ok(drafted) => drafted,
             Err(err) => {
                 return self
-                    .fail(record, Stage::Draft, &ticket.id, &ticket.tenant_id, err, at)
+                    .fail(
+                        record,
+                        Stage::Draft,
+                        &ticket.id,
+                        &ticket.tenant_id,
+                        None,
+                        err,
+                        at,
+                    )
                     .await;
             }
         };
@@ -501,6 +554,7 @@ impl Pipeline {
                 &ticket.id,
                 &ticket.tenant_id,
                 Stage::Judge,
+                None,
                 at,
             ),
             store::outbox_complete_stmt(OUTBOX_TABLE, &record.id),
@@ -568,6 +622,7 @@ impl Pipeline {
                 &ticket.id,
                 &ticket.tenant_id,
                 Stage::Notify,
+                None,
                 at,
             ),
             store::outbox_complete_stmt(OUTBOX_TABLE, &record.id),
@@ -610,6 +665,7 @@ impl Pipeline {
                         Stage::Judge,
                         &ticket.id,
                         &ticket.tenant_id,
+                        None,
                         Error::from(err),
                         at,
                     )
@@ -620,7 +676,15 @@ impl Pipeline {
             Ok(judgment) => judgment,
             Err(err) => {
                 return self
-                    .fail(record, Stage::Judge, &ticket.id, &ticket.tenant_id, err, at)
+                    .fail(
+                        record,
+                        Stage::Judge,
+                        &ticket.id,
+                        &ticket.tenant_id,
+                        None,
+                        err,
+                        at,
+                    )
                     .await;
             }
         };
@@ -790,6 +854,7 @@ impl Pipeline {
                 &ticket.id,
                 &ticket.tenant_id,
                 Stage::Notify,
+                None,
                 at,
             ),
             store::outbox_complete_stmt(OUTBOX_TABLE, &record.id),
@@ -900,6 +965,7 @@ impl Pipeline {
                 &ticket.id,
                 &ticket.tenant_id,
                 Stage::File,
+                None,
                 at,
             ),
             store::outbox_complete_stmt(OUTBOX_TABLE, &record.id),
@@ -954,6 +1020,7 @@ impl Pipeline {
                 &ticket.id,
                 &ticket.tenant_id,
                 Stage::Notify,
+                None,
                 at,
             ),
             store::outbox_complete_stmt(OUTBOX_TABLE, &record.id),
@@ -1049,6 +1116,9 @@ impl Pipeline {
     ) -> Result<(), Error> {
         match self.file_ticket(ticket).await {
             Ok(outcome) => {
+                // Only a tracker-filed ticket has a tracker state to follow;
+                // built-in tickets change status through their own route.
+                let tracked = matches!(outcome, FileOutcome::Tracker(..));
                 let (filed, kind, url_is_public) = match outcome {
                     FileOutcome::Tracker(filed, kind) => {
                         // A tracker's `Filed::url` is its public issue link
@@ -1085,6 +1155,8 @@ impl Pipeline {
                 if url_is_public {
                     filed_data["url"] = json!(filed.url);
                 }
+                // A tracker-filed ticket is followed (see `follow_stmts`); a
+                // built-in one is not polled, so nothing more is enqueued.
                 let mut batch = vec![
                     store::insert_event_stmt(
                         &self.idgen.ulid(),
@@ -1104,10 +1176,14 @@ impl Pipeline {
                         &ticket.id,
                         &ticket.tenant_id,
                         Stage::Notify,
+                        None,
                         at,
                     ),
-                    store::outbox_complete_stmt(OUTBOX_TABLE, &record.id),
                 ];
+                if tracked {
+                    batch.extend(self.follow_stmts(ticket, at));
+                }
+                batch.push(store::outbox_complete_stmt(OUTBOX_TABLE, &record.id));
                 // The `escalation.filed` fan-out joins the same batch, so a
                 // subscriber is told exactly when the ticket is filed — never
                 // for a file that rolled back, never missing one that landed.
@@ -1130,10 +1206,41 @@ impl Pipeline {
             // both write their reason into a `file_dead_lettered`
             // / `file_retry_scheduled` row.
             Err(err) => {
-                self.fail(record, Stage::File, &ticket.id, &ticket.tenant_id, err, at)
-                    .await
+                self.fail(
+                    record,
+                    Stage::File,
+                    &ticket.id,
+                    &ticket.tenant_id,
+                    None,
+                    err,
+                    at,
+                )
+                .await
             }
         }
+    }
+
+    /// The statements that start following a tracker-filed ticket: its
+    /// baseline `open` state and the follow poll's own row, enqueued and
+    /// pushed out to its first poll time — a quarter of an hour, so a
+    /// brand-new ticket is checked once it has had a chance to move. It
+    /// reschedules itself from there (see `run_follow`).
+    fn follow_stmts(&self, ticket: &Ticket, at: &str) -> [Statement; 3] {
+        let follow_job = self.idgen.ulid();
+        let follow_first_at = rfc3339_after(self.now(), FOLLOW_FIRST_DELAY);
+        [
+            store::update_ticket_tracker_state_stmt(&ticket.id, TicketState::Open, at),
+            store::enqueue_stage_stmt(
+                &self.outbox,
+                &follow_job,
+                &ticket.id,
+                &ticket.tenant_id,
+                Stage::Follow,
+                None,
+                at,
+            ),
+            store::outbox_reschedule_stmt(OUTBOX_TABLE, &follow_job, &follow_first_at),
+        ]
     }
 
     /// The file stage's decision and, for an external route, its one port
@@ -1329,47 +1436,68 @@ impl Pipeline {
     // Stage: notify
 
     /// The customer-facing update, terminal by construction: it enqueues
-    /// nothing, and its batch is the event plus the row's completion.
+    /// nothing, and its batch is the event plus the row's completion. The
+    /// recipient is a database read of the contact `module-support` stored
+    /// in `sg_contacts`, never a logged address: no contact is
+    /// `no_recipient`, no `Mailer` is `no_mailer`, and the address reaches
+    /// the send call and nowhere else.
     ///
-    /// **There is no recipient in v0, and the code says so rather than
-    /// inventing one.** Issue #4's intake signature is
-    /// `(tenant_id, conversation_id, transcript)` — it carries no customer
-    /// address — and the conversation/contact tables belong to
-    /// `module-support` (issue #2), which does not exist yet. So the
-    /// message is composed and *recorded* in the audit trail, and the send
-    /// is skipped with an explicit reason: `no_mailer` when no `Mailer`
-    /// port is wired, `no_recipient` when there is no address to send to
-    /// (always, today — see [`notify_recipient`]). No recipient column was
-    /// invented and no fake address was fabricated; when module-support
-    /// lands, teaching [`notify_recipient`] to find the real address is
-    /// the whole change.
+    /// Two shapes: the ordinary notify (no `event_id`) announces the filing
+    /// or the `NeedsInfo` question; a status-update notify (`event_id` set)
+    /// announces a tracker state change the follow stage found, composed
+    /// from the `status_changed` event's `to` state and keyed by the event
+    /// id, so a redelivery collapses instead of mailing twice.
     async fn run_notify(
         &self,
         record: &OutboxRecord,
         ticket: &Ticket,
+        event_id: Option<&str>,
         at: &str,
     ) -> Result<(), Error> {
-        let (subject, message) = compose_notify_message(ticket);
-        let event = match (&self.mailer, notify_recipient(ticket)) {
+        // The message and its idempotency key depend on which shape this
+        // is. A status update needs the event's `to` state, a database
+        // read; the ordinary notices never do.
+        let (subject, message, idempotency_key) = if let Some(event_id) = event_id {
+            let to = self.status_update_state(event_id).await?;
+            let (subject, message) = compose_status_update_message(ticket, to);
+            (subject, message, format!("escalation:{event_id}"))
+        } else {
+            let (subject, message) = compose_notify_message(ticket);
+            (subject, message, format!("escalation:{}:notify", ticket.id))
+        };
+
+        // The recipient, from the contact `module-support` stored for this
+        // conversation. Absent in a venture that composes escalation alone,
+        // which is exactly the `no_recipient` skip.
+        let recipient =
+            store::contact_email(&*self.db, &ticket.tenant_id, &ticket.conversation_id).await?;
+        let event = match (&self.mailer, recipient) {
             (Some(mailer), Some(to)) => {
                 // The one send call. The notification is plain text; the
-                // same text goes out as both parts.
+                // same text goes out as both parts. The key makes a
+                // redelivered update a no-op at the provider.
                 let outbound = Message::new(
                     to.as_str(),
                     self.notify_from(),
                     subject.as_str(),
                     message.as_str(),
                     message.as_str(),
-                );
+                )
+                .idempotency_key(idempotency_key);
                 match mailer.send(outbound).await {
                     Ok(SendOutcome::Sent { id }) => {
+                        // `to` (the address) is deliberately not recorded.
                         let detail = json!({
-                            "to": to,
                             "subject": subject,
                             "message": message,
                             "provider_id": id,
                         });
-                        self.notify_event(ticket, at, EventKind::Notified, &detail)
+                        self.notify_event(
+                            ticket,
+                            at,
+                            EventKind::Notified,
+                            &with_event_id(detail, event_id),
+                        )
                     }
                     Ok(SendOutcome::NotConfigured) => {
                         let detail = json!({
@@ -1377,7 +1505,12 @@ impl Pipeline {
                             "subject": subject,
                             "message": message,
                         });
-                        self.notify_event(ticket, at, EventKind::NotifySkipped, &detail)
+                        self.notify_event(
+                            ticket,
+                            at,
+                            EventKind::NotifySkipped,
+                            &with_event_id(detail, event_id),
+                        )
                     }
                     Err(err) => {
                         return self
@@ -1386,6 +1519,7 @@ impl Pipeline {
                                 Stage::Notify,
                                 &ticket.id,
                                 &ticket.tenant_id,
+                                event_id,
                                 Error::from(err),
                                 at,
                             )
@@ -1399,7 +1533,12 @@ impl Pipeline {
                     "subject": subject,
                     "message": message,
                 });
-                self.notify_event(ticket, at, EventKind::NotifySkipped, &detail)
+                self.notify_event(
+                    ticket,
+                    at,
+                    EventKind::NotifySkipped,
+                    &with_event_id(detail, event_id),
+                )
             }
             (_, None) => {
                 let detail = json!({
@@ -1407,11 +1546,33 @@ impl Pipeline {
                     "subject": subject,
                     "message": message,
                 });
-                self.notify_event(ticket, at, EventKind::NotifySkipped, &detail)
+                self.notify_event(
+                    ticket,
+                    at,
+                    EventKind::NotifySkipped,
+                    &with_event_id(detail, event_id),
+                )
             }
         };
         self.commit(&[event, store::outbox_complete_stmt(OUTBOX_TABLE, &record.id)])
             .await
+    }
+
+    /// The tracker state a `status_changed` event announced, read back from
+    /// the event's `{"from", "to"}` detail. A missing event or an
+    /// unreadable `to` degrades to [`TicketState::Unknown`], which the
+    /// status-update message handles with its generic wording — the notify
+    /// never fails over a detail it cannot parse.
+    async fn status_update_state(&self, event_id: &str) -> Result<TicketState, Error> {
+        let Some(event) = store::load_event(&*self.db, event_id).await? else {
+            return Ok(TicketState::Unknown);
+        };
+        let to = event
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.get("to"))
+            .and_then(Value::as_str);
+        to.map_or(Ok(TicketState::Unknown), store::ticket_state_from)
     }
 
     fn notify_event(
@@ -1442,19 +1603,204 @@ impl Pipeline {
     }
 
     // ------------------------------------------------------------------
+    // Stage: follow
+
+    /// One tracker poll. Unlike every other stage this one does **not**
+    /// complete on success: it reschedules its own outbox row and runs
+    /// again, so a filed ticket is watched until it closes. It makes exactly
+    /// one `Tracker::status` call per run, under the same destination and
+    /// credential the file stage used, and never dead-letters — a ticket
+    /// that cannot be polled is not a ticket that needs a human.
+    ///
+    /// - `Unknown`, or the same state last recorded: reschedule, write
+    ///   nothing.
+    /// - A new state: one atomic batch writes a `status_changed` audit row,
+    ///   remembers the new state and enqueues the status-update notify, then
+    ///   either reschedules (still moving) or completes the row at `Closed`.
+    /// - Any port or resolution failure: logged (never with the address or
+    ///   the credential) and rescheduled.
+    async fn run_follow(
+        &self,
+        record: &OutboxRecord,
+        ticket: &Ticket,
+        at: &str,
+    ) -> Result<(), Error> {
+        let now = self.now();
+
+        // Nothing was filed, so there is nothing to poll. This cannot
+        // happen for a row the file stage enqueued (it records the external
+        // id first), but a defensive complete beats polling forever.
+        let Some(external_id) = ticket.external_id.clone() else {
+            return self.complete_row(&record.id).await;
+        };
+
+        let status = match self.poll_status(ticket, &external_id).await {
+            Ok(status) => status,
+            Err(err) => {
+                tracing::warn!(
+                    ticket_id = %ticket.id,
+                    attempts = record.attempts,
+                    error = %err,
+                    "escalation: follow-up poll failed; rescheduling"
+                );
+                return self.reschedule_follow(record, now, err.retry_after()).await;
+            }
+        };
+
+        // A state this port cannot name, or the same one last recorded:
+        // no transition to report, no event, no notify. Reschedule.
+        if status.state == TicketState::Unknown || Some(status.state) == ticket.tracker_state {
+            return self.reschedule_follow(record, now, None).await;
+        }
+
+        // A real transition. Guard it with a permanent inbox key in the
+        // *same batch*, numbered by the ticket's own transition count: a
+        // concurrent poll that saw this change computes the same `n`, so
+        // its claim insert conflicts and its whole batch rolls back — no
+        // second `status_changed`, no second mail. The claim rides the
+        // batch rather than preceding it so a crash here leaves no key
+        // behind: a later poll still records the transition.
+        let n = store::status_changed_count(&*self.db, &ticket.id).await?;
+        let from = ticket
+            .tracker_state
+            .map_or_else(|| "unknown".to_owned(), store::ticket_state_text);
+        let detail = json!({ "from": from, "to": store::ticket_state_text(status.state) });
+        let event_id = self.idgen.ulid();
+        let mut batch = vec![
+            self.inbox
+                .claim_statement(&format!("{}:follow:{n}", ticket.id), at),
+            store::insert_event_stmt(
+                &event_id,
+                &ticket.id,
+                stage_seq(Stage::Follow, 0),
+                at,
+                Stage::Follow,
+                EventKind::StatusChanged,
+                &detail,
+            ),
+            store::update_ticket_tracker_state_stmt(&ticket.id, status.state, at),
+            store::enqueue_stage_stmt(
+                &self.outbox,
+                &self.idgen.ulid(),
+                &ticket.id,
+                &ticket.tenant_id,
+                Stage::Notify,
+                Some(&event_id),
+                at,
+            ),
+        ];
+        if status.state == TicketState::Closed {
+            batch.push(store::outbox_complete_stmt(OUTBOX_TABLE, &record.id));
+        } else {
+            let next_at = self.follow_next_at(record, now, None).await?;
+            batch.push(store::outbox_reschedule_stmt(
+                OUTBOX_TABLE,
+                &record.id,
+                &next_at,
+            ));
+        }
+        // A conflicting claim — a concurrent poll won this transition — or
+        // any other batch failure rolls the whole batch back, ours included,
+        // so this run writes nothing and queues the next poll. A real
+        // database outage fails that reschedule too and propagates.
+        if self.commit(&batch).await.is_err() {
+            return self.reschedule_follow(record, now, None).await;
+        }
+        self.defer_next();
+        Ok(())
+    }
+
+    /// The follow stage's one port call: resolve the tenant's destination
+    /// and per-call credential exactly as [`Pipeline::file_ticket`] does,
+    /// then ask the tracker for the ticket's state. The port caps the call
+    /// at 30 s.
+    async fn poll_status(&self, ticket: &Ticket, external_id: &str) -> Result<TicketStatus, Error> {
+        let route = self.resolve_route(&ticket.tenant_id, ticket.kind).await?;
+        let Some(store::Route {
+            target: store::RouteTarget::Tracker(destination),
+            credential_ref,
+            ..
+        }) = route
+        else {
+            return Err(Error::Decode(format!(
+                "tenant `{}` has no tracker route for `{}` tickets",
+                ticket.tenant_id,
+                ticket.kind.as_str()
+            )));
+        };
+        let (destination, credential) = self
+            .resolve_credential(&ticket.tenant_id, destination, &credential_ref)
+            .await?;
+        self.tracker
+            .status(&destination, &credential, external_id)
+            .await
+            .map_err(Error::from)
+    }
+
+    /// Reschedules the follow row (ageing the wait, honouring a tracker's
+    /// `retry_after` when it asks for a later one) and commits it. A poll
+    /// that found nothing to say and a poll that failed both land here.
+    async fn reschedule_follow(
+        &self,
+        record: &OutboxRecord,
+        now: OffsetDateTime,
+        retry_after: Option<Duration>,
+    ) -> Result<(), Error> {
+        let next_at = self.follow_next_at(record, now, retry_after).await?;
+        self.commit(&[store::outbox_reschedule_stmt(
+            OUTBOX_TABLE,
+            &record.id,
+            &next_at,
+        )])
+        .await
+    }
+
+    /// When the next follow poll is due. Within the first day a poll runs
+    /// hourly; after that, daily — a settled ticket should not cost a call
+    /// an hour. A tracker's own `retry_after`, when it names a longer wait,
+    /// wins: no point asking again before it said to.
+    async fn follow_next_at(
+        &self,
+        record: &OutboxRecord,
+        now: OffsetDateTime,
+        retry_after: Option<Duration>,
+    ) -> Result<String, Error> {
+        let created = store::outbox_created_at(&*self.db, OUTBOX_TABLE, &record.id).await?;
+        let age = created
+            .as_deref()
+            .and_then(|raw| OffsetDateTime::parse(raw, &Rfc3339).ok())
+            .map_or(Duration::ZERO, |created| {
+                Duration::try_from(now - created).unwrap_or(Duration::ZERO)
+            });
+        let base = if age < FOLLOW_SHORT_WINDOW {
+            FOLLOW_SHORT_INTERVAL
+        } else {
+            FOLLOW_LONG_INTERVAL
+        };
+        let wait = retry_after.map_or(base, |hint| hint.max(base));
+        Ok(rfc3339_after(now, wait))
+    }
+
+    // ------------------------------------------------------------------
     // Failure handling
 
     /// Records a stage failure. Retryable failures inside the attempt
     /// budget reschedule; everything else — a terminal failure, or a
     /// retryable failure that has spent the [`RetryPolicy`] budget —
     /// dead-letters. Either way: one event row carrying the reason, and
-    /// one batch.
+    /// one batch. `event_id` names the work when it is a status update
+    /// (see [`Pipeline::run_notify`]), so the released claim is the one
+    /// that attempt took, and a terminal failure of one completes the row
+    /// without parking the still-moving ticket; it is `None` for every
+    /// other stage.
+    #[allow(clippy::too_many_arguments)] // one flat call for every failure site; each argument is distinct
     async fn fail(
         &self,
         record: &OutboxRecord,
         stage: Stage,
         ticket_id: &str,
         tenant_id: &str,
+        event_id: Option<&str>,
         err: Error,
         at: &str,
     ) -> Result<(), Error> {
@@ -1490,7 +1836,7 @@ impl Pipeline {
             // would be guarding nothing.
             let batch = [
                 event,
-                store::inbox_release_stmt(INBOX_TABLE, &claim_key(ticket_id, stage)),
+                store::inbox_release_stmt(INBOX_TABLE, &claim_key_with(ticket_id, stage, event_id)),
                 store::outbox_retry_later_stmt(OUTBOX_TABLE, &record.id, &next_at),
             ];
             self.commit(&batch).await
@@ -1509,44 +1855,50 @@ impl Pipeline {
                 dead_letter_kind(stage),
                 &detail,
             );
-            // Terminal: the ticket parks for a human (a no-op when the
-            // row is already gone) and the outbox row completes so it
-            // stops. Never `retry_later` a terminal failure.
-            let mut batch = vec![
-                event,
-                store::update_ticket_status_stmt(ticket_id, Status::DeadLetter, at),
-                store::outbox_complete_stmt(OUTBOX_TABLE, &record.id),
-            ];
-            let reason = err.to_string();
-            let payload = json!({
-                "ticket_id": ticket_id,
-                "tenant_id": tenant_id,
-                "stage": stage.as_topic(),
-                "reason": reason,
-            });
-            // The file stage has its own dead-letter event; every
-            // dead-letter — this one included — also parks the ticket for a
-            // human, so it publishes `needs_human` too.
-            if stage == Stage::File {
+            // Terminal. A status update (`event_id` set) is about a ticket
+            // that is already filed and still moving: its failure stops at
+            // the audit row and the row's completion, and never parks the
+            // ticket. Anything else dead-letters — the ticket parks for a
+            // human (a no-op when the row is already gone) and the outbox
+            // row completes so it stops. Never `retry_later` a terminal
+            // failure.
+            let mut batch = vec![event, store::outbox_complete_stmt(OUTBOX_TABLE, &record.id)];
+            if event_id.is_none() {
+                batch.push(store::update_ticket_status_stmt(
+                    ticket_id,
+                    Status::DeadLetter,
+                    at,
+                ));
+                let payload = json!({
+                    "ticket_id": ticket_id,
+                    "tenant_id": tenant_id,
+                    "stage": stage.as_topic(),
+                    "reason": err.to_string(),
+                });
+                // The file stage has its own dead-letter event; every
+                // dead-letter — this one included — also parks the ticket
+                // for a human, so it publishes `needs_human` too.
+                if stage == Stage::File {
+                    batch.extend(
+                        self.webhook_stmts(
+                            tenant_id,
+                            webhook_events::ESCALATION_DEAD_LETTERED,
+                            &payload,
+                            at,
+                        )
+                        .await?,
+                    );
+                }
                 batch.extend(
                     self.webhook_stmts(
                         tenant_id,
-                        webhook_events::ESCALATION_DEAD_LETTERED,
+                        webhook_events::ESCALATION_NEEDS_HUMAN,
                         &payload,
                         at,
                     )
                     .await?,
                 );
             }
-            batch.extend(
-                self.webhook_stmts(
-                    tenant_id,
-                    webhook_events::ESCALATION_NEEDS_HUMAN,
-                    &payload,
-                    at,
-                )
-                .await?,
-            );
             self.commit(&batch).await
         }
     }
@@ -1697,6 +2049,19 @@ fn claim_key(ticket_id: &str, stage: Stage) -> String {
     format!("{ticket_id}:{}", stage.as_topic())
 }
 
+/// The claim key for a stage, widened with an event id when one names the
+/// work. A status-update notify (`stage` = `notify`, `event_id` = the
+/// `status_changed` event it announces) must not share the one
+/// `ticket:notify` key with the filing notice, so its key carries the
+/// event id: `ticket:notify:<event_id>`. With no event id this is exactly
+/// [`claim_key`].
+fn claim_key_with(ticket_id: &str, stage: Stage, event_id: Option<&str>) -> String {
+    match event_id {
+        Some(event_id) => format!("{}:{event_id}", claim_key(ticket_id, stage)),
+        None => claim_key(ticket_id, stage),
+    }
+}
+
 /// Whether a ticket's recorded progress shows `stage` already committed.
 /// A stage commits by moving the ticket to a later stage or to a terminal
 /// status (its commit batch always does one of the two), so progress is
@@ -1753,6 +2118,7 @@ fn failure_kind(stage: Stage) -> EventKind {
         Stage::Judge => EventKind::JudgeFailed,
         Stage::File => EventKind::FileFailed,
         Stage::Notify => EventKind::NotifyFailed,
+        Stage::Follow => EventKind::FollowFailed,
     }
 }
 
@@ -1941,15 +2307,47 @@ pub(crate) fn compose_notify_message(ticket: &Ticket) -> (String, String) {
     }
 }
 
-/// The notify recipient, when one exists. **It does not, in v0** — issue
-/// #4's intake carries no customer address and `module-support` (issue #2)
-/// owns the contact tables that would — so this is `None` and the notify
-/// stage records its message instead of sending it. The signature is the
-/// seam: when module-support lands, this is the one function that changes.
-#[allow(clippy::unnecessary_wraps)] // deliberately a seam: always None today, Option when module-support lands
+/// The status-update notify's message, phrased from the state a
+/// `status_changed` event announced: the ticket title and, in plain words,
+/// what the new state means for the customer. The `Unknown` state — a
+/// detail that would not parse, or a state this port cannot name — still
+/// says something honest rather than nothing.
 #[must_use]
-pub(crate) fn notify_recipient(_ticket: &Ticket) -> Option<String> {
-    None
+pub(crate) fn compose_status_update_message(ticket: &Ticket, to: TicketState) -> (String, String) {
+    use std::fmt::Write as _;
+
+    let title = ticket.title.as_deref().unwrap_or("your report");
+    let subject = format!("Update on your report: {title}");
+    let state = match to {
+        TicketState::Open => "is open with our engineering team",
+        TicketState::InProgress => "is being worked on by our engineering team",
+        TicketState::Resolved => "has been fixed and is ready for you to check",
+        TicketState::Closed => "has been closed",
+        TicketState::Unknown => "has an update from our engineering team",
+    };
+    let mut message = format!("Your report \"{title}\" {state}.");
+    if let Some(url) = &ticket.external_url {
+        let _ = write!(message, "\n\nTracker link: {url}");
+    }
+    if to == TicketState::Closed {
+        message.push_str(
+            "\n\nThanks for your patience. If the problem comes back, report it again and we \
+             will take another look.",
+        );
+    }
+    (subject, message)
+}
+
+/// Merges an event id into a notify event's `detail`, when there is one.
+/// The ordinary notices carry no id, so their `detail` is unchanged; a
+/// status update records the `status_changed` event it announces, which is
+/// how the idempotency key and the audit trail line up.
+#[must_use]
+fn with_event_id(mut detail: Value, event_id: Option<&str>) -> Value {
+    if let (Value::Object(map), Some(event_id)) = (&mut detail, event_id) {
+        map.insert("event_id".to_owned(), json!(event_id));
+    }
+    detail
 }
 
 /// The draft prompt's standing instruction. The drafter first classifies
@@ -2332,6 +2730,7 @@ mod tests {
             external_id: Some("acme/api#7".to_owned()),
             external_url: Some("https://github.test/acme/api/7".to_owned()),
             match_count: 0,
+            tracker_state: None,
             created_at: "2026-09-19T00:00:00Z".to_owned(),
             updated_at: "2026-09-19T00:00:00Z".to_owned(),
         }
@@ -2434,18 +2833,46 @@ mod tests {
         assert_eq!(retry_kind(Stage::Draft), EventKind::DraftFailed);
         assert_eq!(retry_kind(Stage::Judge), EventKind::JudgeFailed);
         assert_eq!(retry_kind(Stage::Notify), EventKind::NotifyFailed);
+        assert_eq!(retry_kind(Stage::Follow), EventKind::FollowFailed);
 
         assert_eq!(dead_letter_kind(Stage::File), EventKind::FileDeadLettered);
         assert_eq!(dead_letter_kind(Stage::Draft), EventKind::DraftFailed);
         assert_eq!(dead_letter_kind(Stage::Judge), EventKind::JudgeFailed);
         assert_eq!(dead_letter_kind(Stage::Notify), EventKind::NotifyFailed);
+        assert_eq!(dead_letter_kind(Stage::Follow), EventKind::FollowFailed);
     }
 
-    /// Pins the v0 answer: there is no recipient, by construction, until
-    /// module-support exists to supply one.
+    /// Pins the status-update wording: a plain-language sentence per state,
+    /// the tracker link when there is one, and a closing note only at
+    /// `Closed`.
     #[test]
-    fn v0_has_no_notify_recipient() {
-        assert_eq!(notify_recipient(&notify_ticket(Status::Filed)), None);
+    fn the_status_update_message_names_the_new_state_in_words() {
+        let ticket = notify_ticket(Status::Filed);
+
+        let (subject, message) = compose_status_update_message(&ticket, TicketState::Resolved);
+        assert!(subject.contains("Checkout 500s"));
+        assert!(message.contains("has been fixed"));
+        assert!(message.contains("https://github.test/acme/api/7"));
+
+        let (_, closed) = compose_status_update_message(&ticket, TicketState::Closed);
+        assert!(closed.contains("has been closed"));
+        assert!(closed.contains("report it again"));
+
+        // An unknown state still says something honest.
+        let (_, unknown) = compose_status_update_message(&ticket, TicketState::Unknown);
+        assert!(unknown.contains("an update from our engineering team"));
+    }
+
+    #[test]
+    fn status_update_claim_keys_carry_the_event_id() {
+        assert_eq!(
+            claim_key_with("01JT", Stage::Notify, Some("01JEVENT")),
+            "01JT:notify:01JEVENT"
+        );
+        assert_eq!(
+            claim_key_with("01JT", Stage::Notify, None),
+            claim_key("01JT", Stage::Notify)
+        );
     }
 
     #[test]
