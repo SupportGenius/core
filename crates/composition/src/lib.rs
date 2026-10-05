@@ -64,20 +64,24 @@
 use std::sync::Arc;
 
 use cratefield_core::{
-    BoxFuture, Completion, ConfigError, Credential, Database, DbError, Defer, Destination, Filed,
-    HarnessBuilder, Module, ModuleContext, Port, Prompt, Statement, TextModel, TextModelError,
-    TicketDraft, TicketStatus, Tracker, TrackerError, Venture,
+    BoxFuture, Completion, Config, ConfigError, Credential, Database, DbError, Defer, Destination,
+    Filed, HarnessBuilder, HttpClient, Module, ModuleContext, Port, Prompt, Statement, TextModel,
+    TextModelError, TicketDraft, TicketStatus, Tracker, TrackerError, Venture,
 };
 use cratefield_mail_templates::MailTheme;
 use cratefield_module_waitlist::Waitlist;
-use module_escalation::{Escalation, TenantDirectory};
+use module_escalation::{Escalation, OwnerRouter, TenantDirectory};
 
 /// The escalation module's boot-time refusal for its development file
 /// KMS outside `ENV=development` (see the module's docs), re-exported so
 /// the native binary checks it through this crate like the cron gates.
 pub use module_escalation::local_kms_refusal;
 use module_support::analytics::{TicketCounts, TicketStats};
-use module_support::{HandoffSink, Support, TicketView};
+use module_support::{
+    HandoffSink, PublicAnswer, PublicCitation, PublicKnowledge, Support, TicketView,
+};
+
+use adapter_livingbrain::LivingBrain;
 
 /// The venture name, kebab-case.
 pub const NAME: &str = "supportgenius";
@@ -234,23 +238,28 @@ pub fn support() -> OnCron<Support> {
 fn compose_support(support: Support) -> OnCron<Support> {
     OnCron::new(
         support
-            .with_handoff(Arc::new(EscalationHandoff))
+            .with_handoff(Arc::new(EscalationHandoff {
+                escalation: escalation(),
+            }))
             // Escalation's own routes ride in support's OpenAPI document
             // (issue #34): support serves `GET /v1/support/openapi.json`,
             // and this crate is the one place that knows escalation's
             // surface to give it.
             .with_api_surface("escalation", Escalation::new().surface())
-            .with_ticket_stats(Arc::new(EscalationTicketStats)),
+            .with_ticket_stats(Arc::new(EscalationTicketStats))
+            .with_knowledge(Arc::new(LivingBrainAdapter)),
         SUPPORT_CRONS,
     )
 }
 
-/// The `escalation` module as this venture composes it. A thin wrapper
-/// today; it exists so the module list is written once as functions, and a
-/// test can build the same set the composition registers.
+/// The `escalation` module as this venture composes it: the owner lookup the
+/// file stage asks is wired here, so a routed ticket is labeled the same way
+/// whether a handoff kicked the drain or cron did.
 #[must_use]
 pub fn escalation() -> Escalation {
-    Escalation::new().with_tenant_directory(Arc::new(SupportTenants))
+    Escalation::new()
+        .with_tenant_directory(Arc::new(SupportTenants))
+        .with_router(Arc::new(LivingBrainAdapter))
 }
 
 /// Adapts `module-support`'s tenant table to escalation's
@@ -456,7 +465,13 @@ impl<M: Module> Module for OnCron<M> {
 /// escalation's own intake, so escalation keeps sole ownership of the
 /// ticket and contact schemas; [`kick`](HandoffSink::kick) delegates to
 /// escalation's own deferred drain. Neither module learns about the other.
-struct EscalationHandoff;
+///
+/// It holds the [`Escalation`] module it kicks rather than calling a free
+/// function, so the immediate drain a handoff triggers builds the same
+/// pipeline the cron drain does — including the wired [`OwnerRouter`].
+struct EscalationHandoff {
+    escalation: Escalation,
+}
 
 impl HandoffSink for EscalationHandoff {
     fn enqueue(
@@ -503,7 +518,7 @@ impl HandoffSink for EscalationHandoff {
     }
 
     fn kick(&self, ctx: &ModuleContext, defer: Arc<dyn Defer>) {
-        Escalation::kick(ctx, defer);
+        self.escalation.kick(ctx, defer);
     }
 
     /// The tenant-scoped ticket lookup for the MCP `get_ticket` tool
@@ -531,6 +546,53 @@ impl HandoffSink for EscalationHandoff {
                 conversation_id: ticket.conversation_id,
             })
         })
+    }
+}
+
+/// The Living Brain adapted to both module seams (issue #64): support's
+/// [`PublicKnowledge`] (the answer path) and escalation's [`OwnerRouter`].
+/// Both resolve the service from config and the HTTP port from the context
+/// **at call time**, so one adapter serves a deployment with a Living Brain
+/// and one without — disconnected, it answers `None` and the turn or filing
+/// stays on the module's own path. One struct, two ports; each module
+/// declares its own and neither learns of the other.
+struct LivingBrainAdapter;
+
+#[async_trait::async_trait]
+impl PublicKnowledge for LivingBrainAdapter {
+    async fn answer(
+        &self,
+        ctx: &ModuleContext,
+        _tenant_id: &str,
+        question: &str,
+    ) -> Option<PublicAnswer> {
+        let brain = LivingBrain::from_config(&*ctx.config)?;
+        let http = ctx.ports.http.as_deref()?;
+        let answer = brain.answer_public(http, question).await?;
+        Some(PublicAnswer {
+            answer: answer.answer,
+            citations: answer
+                .citations
+                .into_iter()
+                .map(|citation| PublicCitation {
+                    title: citation.title,
+                    url: citation.url,
+                })
+                .collect(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl OwnerRouter for LivingBrainAdapter {
+    async fn route(
+        &self,
+        config: &dyn Config,
+        http: Option<&dyn HttpClient>,
+        _tenant_id: &str,
+        topic: &str,
+    ) -> Option<String> {
+        LivingBrain::from_config(config)?.route(http?, topic).await
     }
 }
 

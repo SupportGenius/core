@@ -29,6 +29,7 @@ use crate::chunk::{Chunker, tokenize};
 use crate::connectors::{self, ConnectorConfig, Kind};
 use crate::handoff::HandoffSink;
 use crate::human;
+use crate::knowledge::PublicKnowledge;
 use crate::messages;
 use crate::store::{self, ApiKeyRow, ChunkRow, ConnectorRow, STATUS_ACTIVE, SourceRow, TenantRow};
 use crate::uploads;
@@ -112,6 +113,10 @@ pub(crate) struct ModuleState {
     /// `Support::new()` with nothing composed: the turn still marks
     /// `needs_escalation`, and no ticket is filed.
     pub handoff: Option<Arc<dyn HandoffSink>>,
+    /// The customer-safe answer source a turn asks before retrieval. `None`
+    /// is `Support::new()` with nothing composed: every turn retrieves,
+    /// asks the model and decides.
+    pub knowledge: Option<Arc<dyn PublicKnowledge>>,
     /// The module-owned limiter the widget's per-visitor buckets run on
     /// (`crate::widget`), wired by the composition so a deployment can
     /// bound one anonymous browser separately from the tenant's own
@@ -134,6 +139,7 @@ pub(crate) fn router(
     ctx: Arc<ModuleContext>,
     text_model: Option<Arc<dyn TextModel>>,
     handoff: Option<Arc<dyn HandoffSink>>,
+    knowledge: Option<Arc<dyn PublicKnowledge>>,
     visitor_rate_limiter: Option<Arc<dyn RateLimiter>>,
     api_surfaces: Vec<(String, Surface)>,
 ) -> axum::Router {
@@ -144,6 +150,7 @@ pub(crate) fn router(
         ctx,
         text_model,
         handoff,
+        knowledge,
         visitor_rate_limiter,
         openapi: document,
     });

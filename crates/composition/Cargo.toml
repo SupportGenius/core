@@ -23,6 +23,10 @@ module-support = { path = "../module-support" }
 # on the other: only the composition, which already owns the module list,
 # knows both.
 module-escalation = { path = "../module-escalation" }
+# The Living Brain client both module ports adapt to (issue #64). The one
+# vendor-aware crate: the modules see only their own traits, and this is
+# where those traits meet the service's wire contract.
+adapter-livingbrain = { path = "../adapter-livingbrain" }
 # `UnconfiguredTextModel`/`UnconfiguredTracker` implement the async ports
 # the escalation module requires; the attribute must match the one on the
 # traits in `cratefield-core`.

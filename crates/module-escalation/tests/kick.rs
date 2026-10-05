@@ -1,6 +1,7 @@
-//! `Escalation::kick`: the entry point `module-support` calls after it
-//! commits a handoff's statements in its own batch, so the staged ticket
-//! is driven to a filed state *now* rather than at the next cron tick.
+//! `Escalation::kick`: the entry point the composition's handoff sink
+//! calls after `module-support` commits a handoff's statements in its own
+//! batch, so the staged ticket is driven to a filed state *now* rather
+//! than at the next cron tick.
 //!
 //! The whole point is that this needs no `Module::scheduled` call and no
 //! cron: the kick hands the pipeline to the `Defer` port, and draining the
@@ -56,7 +57,7 @@ async fn kick_defers_a_drain_that_files_the_staged_handoff() {
     );
 
     let ctx = context(&fixture, Arc::clone(&defer));
-    Escalation::kick(&ctx, defer);
+    Escalation::new().kick(&ctx, defer);
 
     // The kick queued its run on the defer port and did nothing else; the
     // drain is what files. Draining runs the queued stage and every stage

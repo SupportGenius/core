@@ -458,10 +458,19 @@ pub(crate) fn transcript_json(messages: &[store::WidgetMessage]) -> Vec<Value> {
                 "role": message.role,
                 "body": message.body,
                 "outcome": message.outcome,
+                // One shape or the other, as the row carried it: the
+                // widget renders a `{title, url}` citation as a link and a
+                // `{chunk_id, quote}` one as a quote.
                 "citations": message
                     .citations
                     .iter()
-                    .map(|(chunk_id, quote)| json!({ "chunk_id": chunk_id, "quote": quote }))
+                    .map(|citation| {
+                        if citation.url.is_empty() {
+                            json!({ "chunk_id": citation.chunk_id, "quote": citation.quote })
+                        } else {
+                            json!({ "title": citation.title, "url": citation.url })
+                        }
+                    })
                     .collect::<Vec<Value>>(),
                 "created_at": message.created_at,
             })

@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 
 use cratefield_core::{
     Clock, Completion, Database, Defer, IdGen, Json, ModelTier, ModuleContext, Problem, ProblemDef,
-    Prompt, Scope, Statement, TextModel, TextModelError, require_admin,
+    Prompt, Scope, Statement, TextModel, TextModelError, require_admin, scrub_text,
 };
 use cratefield_i18n::{Args, Catalog, FluentCatalog, localize};
 
@@ -29,6 +29,7 @@ use crate::answer::{self, DEFAULT_ANSWER_THRESHOLD, ModelReply, Outcome};
 use crate::handlers::{
     ModuleState, Retrieved, authenticate, guard_rate_limit, required_port, retrieve,
 };
+use crate::knowledge::PublicAnswer;
 use crate::store::{self, ConversationRow};
 
 /// How many chunks a turn retrieves and shows the model. Six passages of
@@ -449,19 +450,22 @@ pub(crate) async fn run_turn(
     let (conversation, counts) =
         resolve_conversation(db, tenant_id, conversation_id, &scope.request_id).await?;
 
-    // A person holding the conversation answers the next customer turn,
-    // not the bot (issue #35): store the message and return before
-    // retrieval and the model. A closed conversation takes no turn at all.
-    if let Some(conversation) = &conversation {
-        if conversation.state == store::STATE_HUMAN {
-            return store_held_message(state, tenant_id, conversation, message, lang, &counts)
-                .await;
-        }
-        if conversation.state == store::STATE_CLOSED {
-            return Err(Problem::new(&CONVERSATION_CLOSED)
-                .instance(&scope.request_id)
-                .into());
-        }
+    // Before the model: a conversation a person holds or has closed
+    // (issue #35), then the customer-safe knowledge source (issue #64).
+    if let Some(reply) = pre_model_turn(
+        state,
+        scope,
+        db,
+        tenant_id,
+        message,
+        conversation.as_ref(),
+        &counts,
+        lang,
+        contact,
+    )
+    .await?
+    {
+        return Ok(reply);
     }
 
     // 3–6. Retrieve, resolve the threshold, ask the model with the
@@ -662,6 +666,156 @@ async fn store_held_message(
         citations: Vec::new(),
         confidence: 0.0,
         needs_escalation: conversation.needs_escalation,
+    })
+}
+
+/// The turns that end before retrieval and the model, or `None` for an
+/// ordinary turn.
+///
+/// A person holding the conversation answers the next customer turn, not
+/// the bot (issue #35): the message is stored and the turn returns. A
+/// closed conversation takes no turn at all.
+///
+/// The customer-safe knowledge source (issue #64), when one is composed: an
+/// answer it stands behind *is* the turn — retrieval, the threshold and the
+/// model are never asked, and its citations are the ones a customer may
+/// see. The question is scrubbed before it leaves the venture. An answer it
+/// will not stand behind — internal text, no citation — or a source that
+/// fails, falls through to the model unchanged.
+#[allow(clippy::too_many_arguments)]
+async fn pre_model_turn(
+    state: &ModuleState,
+    scope: &Scope,
+    db: &dyn Database,
+    tenant_id: &str,
+    message: &str,
+    conversation: Option<&ConversationRow>,
+    counts: &store::ConversationCounts,
+    lang: Option<&str>,
+    contact: Option<&str>,
+) -> Result<Option<TurnReply>, TurnFailure> {
+    if let Some(conversation) = conversation {
+        if conversation.state == store::STATE_HUMAN {
+            return store_held_message(state, tenant_id, conversation, message, lang, counts)
+                .await
+                .map(Some);
+        }
+        if conversation.state == store::STATE_CLOSED {
+            return Err(Problem::new(&CONVERSATION_CLOSED)
+                .instance(&scope.request_id)
+                .into());
+        }
+    }
+    let Some(knowledge) = state.knowledge.as_deref() else {
+        return Ok(None);
+    };
+    let Some(answer) = knowledge
+        .answer(&state.ctx, tenant_id, &scrub_text(message))
+        .await
+    else {
+        return Ok(None);
+    };
+    let clock: &dyn Clock = required_port(state.ctx.ports.clock.as_deref(), "Clock")?;
+    let id_gen: &dyn IdGen = required_port(state.ctx.ports.id_gen.as_deref(), "IdGen")?;
+    knowledge_turn(
+        state,
+        scope,
+        db,
+        clock,
+        id_gen,
+        tenant_id,
+        message,
+        conversation,
+        counts,
+        lang,
+        contact,
+        answer,
+    )
+    .await
+    .map(Some)
+}
+
+/// The customer-safe turn (issue #64): a composed [`PublicKnowledge`] stood
+/// behind an answer, so the answer *is* the turn. No retrieval, no
+/// threshold, no model — the citations are the ones the visitor may see, at
+/// the source's own certainty. The write is the same [`commit_turn`] a
+/// model turn goes through; nothing here escalates.
+#[allow(clippy::too_many_arguments)]
+async fn knowledge_turn(
+    state: &ModuleState,
+    scope: &Scope,
+    db: &dyn Database,
+    clock: &dyn Clock,
+    id_gen: &dyn IdGen,
+    tenant_id: &str,
+    message: &str,
+    conversation: Option<&ConversationRow>,
+    counts: &store::ConversationCounts,
+    lang: Option<&str>,
+    contact: Option<&str>,
+    answer: PublicAnswer,
+) -> Result<TurnReply, TurnFailure> {
+    let shown = answer.answer;
+    let citations: Vec<Value> = answer
+        .citations
+        .iter()
+        .map(|citation| json!({ "title": citation.title, "url": citation.url }))
+        .collect();
+    let conversation_id =
+        conversation.map_or_else(|| id_gen.ulid(), |conversation| conversation.id.clone());
+    let user_message_id = id_gen.ulid();
+    let assistant_message_id = id_gen.ulid();
+    let turn = store::Turn {
+        conversation_id: conversation_id.clone(),
+        tenant_id: tenant_id.to_owned(),
+        conversation_existed: conversation.is_some(),
+        escalates: false,
+        now: store::iso_now(clock),
+        user_seq: counts.messages,
+        user_message_id,
+        user_message: message.to_owned(),
+        assistant_message_id: assistant_message_id.clone(),
+        assistant_body: shown.clone(),
+        // No model was asked, so the record's model answer is what the
+        // visitor was shown — the two differ only on a model turn.
+        model_answer: shown.clone(),
+        outcome: Outcome::Answered.as_str().to_owned(),
+        // The source grounded the answer itself: certain, with no model
+        // number behind it.
+        confidence_pct: 100,
+        citations_json: serde_json::to_string(&citations).unwrap_or_else(|_| "[]".to_owned()),
+        lang: lang.map(str::to_owned),
+        // No retrieval ran: the knowledge source answered on its own.
+        retrieved_chunks: 0,
+    };
+    // The same takeover re-check the model path makes (issue #35): a
+    // person who took the conversation meanwhile answers it, not the source.
+    if let Some(conversation) = conversation
+        && let Some(current) = taken_over(db, tenant_id, conversation).await?
+    {
+        return store_held_message(state, tenant_id, &current, message, lang, counts).await;
+    }
+    commit_turn(
+        state,
+        &state.ctx,
+        db,
+        &turn,
+        None,
+        contact,
+        scope.defer.clone(),
+    )
+    .await?;
+
+    Ok(TurnReply {
+        conversation_id,
+        message_id: assistant_message_id,
+        outcome: Outcome::Answered.as_str(),
+        answer: shown,
+        citations,
+        confidence: answer::pct_confidence_f64(100),
+        // An answered turn never escalates; an already-escalated
+        // conversation stays escalated, as on the model path.
+        needs_escalation: conversation.is_some_and(|conversation| conversation.needs_escalation),
     })
 }
 

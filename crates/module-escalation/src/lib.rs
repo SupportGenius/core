@@ -19,6 +19,7 @@
 
 mod destinations;
 mod pipeline;
+mod router;
 mod secrets;
 mod tenants;
 mod tickets;
@@ -32,6 +33,7 @@ pub mod store;
 pub use error::Error;
 pub use intake::{Handoff, Intake};
 pub use pipeline::{Pipeline, RetryPolicy};
+pub use router::OwnerRouter;
 pub use secrets::local_kms_refusal;
 pub use tenants::TenantDirectory;
 
@@ -144,16 +146,24 @@ use cratefield_module_webhooks::Webhooks;
 /// The destination routes additionally need a [`TenantDirectory`]
 /// ([`Escalation::with_tenant_directory`]) to refuse suspended tenants;
 /// without one they refuse every tenant (fail closed).
+///
+/// The file stage additionally consults an [`OwnerRouter`]
+/// ([`Escalation::with_router`]) to enrich a filing with the topic's owner;
+/// without one every ticket files exactly where it would have.
 #[derive(Clone, Default)]
 pub struct Escalation {
     /// Who may use the destination routes; `None` refuses everyone.
     tenants: Option<Arc<dyn TenantDirectory>>,
+    /// Who owns a topic, asked by the file stage; `None` files with the
+    /// tenant's configured destination alone.
+    router: Option<Arc<dyn OwnerRouter>>,
 }
 
 impl std::fmt::Debug for Escalation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Escalation")
             .field("tenant_directory", &self.tenants.is_some())
+            .field("router", &self.router.is_some())
             .finish()
     }
 }
@@ -162,13 +172,17 @@ impl Escalation {
     /// The module's name as the harness mounts it (`/v1/escalation`).
     pub const NAME: &'static str = "escalation";
 
-    /// Builds the module. It carries no state: the pipeline's ports are
-    /// resolved per drain from the runtime's
-    /// [`Ports`](cratefield_core::Ports), so one instance can serve any
-    /// number of harnesses.
+    /// Builds the module. The pipeline's ports are resolved per drain from
+    /// the runtime's [`Ports`](cratefield_core::Ports), so one instance can
+    /// serve any number of harnesses; only the module-local seams
+    /// ([`Escalation::with_tenant_directory`], [`Escalation::with_router`])
+    /// are set by hand.
     #[must_use]
     pub fn new() -> Self {
-        Self { tenants: None }
+        Self {
+            tenants: None,
+            router: None,
+        }
     }
 
     /// The directory the destination routes check tenant status against
@@ -177,6 +191,16 @@ impl Escalation {
     #[must_use]
     pub fn with_tenant_directory(mut self, tenants: Arc<dyn TenantDirectory>) -> Self {
         self.tenants = Some(tenants);
+        self
+    }
+
+    /// The owner lookup the file stage asks before it drafts a ticket's
+    /// labels (see [`OwnerRouter`]). `None` — the default — files with the
+    /// tenant's configured destination alone, exactly as before the port
+    /// existed.
+    #[must_use]
+    pub fn with_router(mut self, router: Arc<dyn OwnerRouter>) -> Self {
+        self.router = Some(router);
         self
     }
 
@@ -217,7 +241,8 @@ impl Module for Escalation {
     /// waiting for the next cron tick; `Signer` verifies the tenant API
     /// key the destination routes are guarded by, and is optional because
     /// a composition that never exposes them (a pure cron drainer) needs
-    /// no signer.
+    /// no signer; `HttpClient` carries the [`OwnerRouter`]'s lookup, and
+    /// is optional because a deployment with no router never makes one.
     fn optional(&self) -> &'static [Port] {
         &[
             Port::Mailer,
@@ -225,6 +250,7 @@ impl Module for Escalation {
             Port::IdGen,
             Port::Defer,
             Port::Signer,
+            Port::HttpClient,
         ]
     }
 
@@ -555,7 +581,7 @@ impl Module for Escalation {
         _cron: &'a str,
     ) -> BoxFuture<'a, Result<(), AnyError>> {
         Box::pin(async move {
-            let Some(pipeline) = Self::pipeline(ctx, ctx.ports.defer.clone()) else {
+            let Some(pipeline) = self.pipeline(ctx, ctx.ports.defer.clone()) else {
                 // Whatever is missing, there is nothing to drain: no
                 // database is no outbox, and the two ports `build()`
                 // refuses to compose without are ones a hand-rolled
@@ -588,16 +614,21 @@ impl Escalation {
     /// A failure here is only a delay — the row is already durable and
     /// [`Module::scheduled`] is the backstop — so nothing is returned.
     ///
+    /// It is a method, not a free function, because the kick must build the
+    /// same pipeline a scheduled drain does — including this instance's
+    /// module-local seams (the [`OwnerRouter`]) — and those live on the
+    /// module. The composition's handoff sink holds the instance it kicks.
+    ///
     /// `defer` is the caller's own port (the request's, when support calls
     /// it), so the work rides the runtime's background execution rather
     /// than the caller's response.
-    pub fn kick(ctx: &ModuleContext, defer: Arc<dyn Defer>) {
+    pub fn kick(&self, ctx: &ModuleContext, defer: Arc<dyn Defer>) {
         // The pipeline's finished stages re-drain through `defer` (see
         // [`Pipeline::defer_next`]); `wake` is the same port for this first
         // kick, so the staged run and everything it enqueues behind it all
         // land on the caller's background execution.
         let wake = Arc::clone(&defer);
-        let Some(pipeline) = Self::pipeline(ctx, Some(defer)) else {
+        let Some(pipeline) = self.pipeline(ctx, Some(defer)) else {
             // Missing ports mean the row cannot be driven now; the
             // scheduled drain will find it if the composition ever gains
             // them. Nothing to report and nothing to do.
@@ -617,8 +648,9 @@ impl Escalation {
     ///
     /// Shared by [`Module::scheduled`] and [`Escalation::kick`] so the two
     /// entry points cannot drift: a change to how the pipeline is
-    /// configured lands in both.
-    fn pipeline(ctx: &ModuleContext, defer: Option<Arc<dyn Defer>>) -> Option<Pipeline> {
+    /// configured lands in both, including the owner lookup and the HTTP
+    /// port it calls through.
+    fn pipeline(&self, ctx: &ModuleContext, defer: Option<Arc<dyn Defer>>) -> Option<Pipeline> {
         let db = ctx.ports.db.clone()?;
         let model = ctx.ports.text_model.clone()?;
         let tracker = ctx.ports.tracker.clone()?;
@@ -662,7 +694,12 @@ impl Escalation {
             // webhook tables, and the fan-out is skipped rather than
             // allowed to break every filing (see [`Pipeline::webhook_stmts`]).
             // Shared by `scheduled` and `kick`, so both publish alike.
-            .with_webhooks(Webhooks::new()),
+            .with_webhooks(Webhooks::new())
+            // The owner lookup, asked by the file stage, and the HTTP port
+            // it calls through. Both are the same resolution the module
+            // itself carries, so a kick and a cron drain route alike.
+            .with_router(self.router.clone())
+            .with_http(ctx.ports.http.clone()),
         )
     }
 }

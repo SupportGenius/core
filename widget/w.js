@@ -169,11 +169,19 @@
     var text = message.body != null ? message.body : message.answer; // stored vs live reply
     var bubble = el('div', 'msg assistant', text == null ? '' : String(text));
     var citations = Array.isArray(message.citations) ? message.citations : [];
-    if (citations.length) { // "Sources": retrieved quotes only, never raw chunk text
+    if (citations.length) { // "Sources": retrieved quotes, or brain pages as links — never raw chunk text
       bubble.appendChild(el('div', 'sources-label', 'Sources'));
       var ul = el('ul', 'sources');
       for (var i = 0; i < citations.length; i++) {
-        ul.appendChild(el('li', null, truncate(String((citations[i] && citations[i].quote) || ''), QUOTE_MAX)));
+        var c = citations[i] || {};
+        if (c.url) { // a Living Brain citation: a link labelled with its title
+          var li = el('li');
+          var a = el('a', null, truncate(String(c.title || c.url), QUOTE_MAX));
+          if (/^https?:\/\//.test(c.url)) { a.href = c.url; a.target = '_blank'; a.rel = 'noopener noreferrer'; }
+          li.appendChild(a); ul.appendChild(li);
+        } else {
+          ul.appendChild(el('li', null, truncate(String(c.quote || ''), QUOTE_MAX)));
+        }
       }
       bubble.appendChild(ul);
     }

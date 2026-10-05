@@ -1,0 +1,25 @@
+[package]
+name = "adapter-livingbrain"
+description = "SupportGenius's Living Brain adapter: the one crate that knows the external service's wire contract"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The `Config` and `HttpClient` ports and the `HttpPolicy` bounds the
+# calls carry. Pure `http` types over bytes, so this adapter runs unchanged
+# on Workers and natively — no tokio, no reqwest, wasm-safe.
+cratefield-core = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# A discarded answer is worth a log line: the caller falls back silently
+# by design, so the reason has to live somewhere.
+tracing = { workspace = true }
+
+[lints]
+workspace = true
