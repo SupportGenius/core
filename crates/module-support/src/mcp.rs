@@ -82,7 +82,7 @@ pub(crate) async fn post_mcp(
 ) -> Response {
     let ctx = &state.ctx;
     let tenant_id = match handlers::authenticate(ctx, &headers).await {
-        Ok(tenant_id) => tenant_id,
+        Ok(principal) => principal.tenant_id,
         Err(problem) => return problem.into_response(),
     };
     if let Some(rate_limited) = handlers::guard_rate_limit(ctx, &tenant_id).await {
@@ -308,7 +308,8 @@ async fn escalate(
                 let transcript = conversation_transcript(db, tenant_id, id).await?;
                 let escalated =
                     store::escalate_conversation_stmt(tenant_id, id, &store::iso_now(clock));
-                (id.to_owned(), transcript, Some(escalated))
+                let waiting = store::wait_for_human_stmt(tenant_id, id);
+                (id.to_owned(), transcript, vec![escalated, waiting])
             }
             (None, Some(transcript)) => {
                 let id_gen = handlers::required_port(ctx.ports.id_gen.as_deref(), "IdGen")
@@ -322,7 +323,7 @@ async fn escalate(
                 // exists only to carry this handoff.
                 let opened =
                     store::open_conversation_stmt(tenant_id, &id, true, &store::iso_now(clock));
-                (id, transcript.to_owned(), Some(opened))
+                (id, transcript.to_owned(), vec![opened])
             }
             _ => {
                 return Err(
@@ -332,7 +333,7 @@ async fn escalate(
         };
 
     let (ticket_id, statements) = sink.handoff(ctx, tenant_id, &conversation_id, &transcript);
-    let mut batch: Vec<Statement> = conversation.into_iter().collect();
+    let mut batch: Vec<Statement> = conversation;
     batch.extend(statements);
     db.batch_atomic(&batch)
         .await

@@ -245,7 +245,7 @@ pub(crate) async fn create_upload(
     body: Bytes,
 ) -> Result<Response, Problem> {
     let ctx = &state.ctx;
-    let tenant_id = authenticate(ctx, &headers).await?;
+    let tenant_id = authenticate(ctx, &headers).await?.tenant_id;
     if let Some(rate_limited) = guard_rate_limit(ctx, &tenant_id).await {
         return Ok(rate_limited);
     }
@@ -355,7 +355,7 @@ pub(crate) async fn put_part(
     body: Bytes,
 ) -> Result<Response, Problem> {
     let ctx = &state.ctx;
-    let tenant_id = authenticate(ctx, &headers).await?;
+    let tenant_id = authenticate(ctx, &headers).await?.tenant_id;
     if let Some(rate_limited) = guard_rate_limit(ctx, &tenant_id).await {
         return Ok(rate_limited);
     }
@@ -461,7 +461,7 @@ pub(crate) async fn complete_upload(
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
     let ctx = &state.ctx;
-    let tenant_id = authenticate(ctx, &headers).await?;
+    let tenant_id = authenticate(ctx, &headers).await?.tenant_id;
     if let Some(rate_limited) = guard_rate_limit(ctx, &tenant_id).await {
         return Ok(rate_limited);
     }
@@ -570,7 +570,7 @@ pub(crate) async fn get_upload(
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
     let ctx = &state.ctx;
-    let tenant_id = authenticate(ctx, &headers).await?;
+    let tenant_id = authenticate(ctx, &headers).await?.tenant_id;
     if let Some(rate_limited) = guard_rate_limit(ctx, &tenant_id).await {
         return Ok(rate_limited);
     }

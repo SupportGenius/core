@@ -83,6 +83,7 @@ mod connectors;
 mod extract;
 mod handlers;
 mod handoff;
+mod human;
 /// MCP over Streamable HTTP (issue #34). Public so an MCP client test can
 /// name the tool argument types and compare their derived schemas with
 /// what `tools/list` serves.
@@ -95,6 +96,7 @@ mod widget;
 
 pub use answer::DEFAULT_ANSWER_THRESHOLD;
 pub use chunk::tokenize;
+pub use handlers::{MAX_BOOST_CANDIDATES, REVIEWED_BOOST};
 pub use handoff::{HandoffSink, TicketView};
 pub use messages::MessageBody;
 // The tokenizer and BM25 ranker now live in the shared `lexical` crate
@@ -230,6 +232,16 @@ const MIGRATION_WIDGET_SETTINGS: SqlMigration = SqlMigration::new(
     "0008",
     "widget_settings",
     include_str!("../migrations/sqlite/0008_widget_settings.sql"),
+);
+
+/// Human-in-the-loop (issue #35, support side): per-staff API keys, the
+/// conversation `state`/`assignee` columns and their index, the `author`
+/// of a staff message, and the `reviewed` provenance on a source an agent
+/// wrote.
+const MIGRATION_HUMAN_HANDOFF: SqlMigration = SqlMigration::new(
+    "0009",
+    "human_handoff",
+    include_str!("../migrations/sqlite/0009_human_handoff.sql"),
 );
 
 /// The support module: tenant provisioning behind the harness admin
@@ -432,10 +444,12 @@ impl Module for Support {
     /// which takes the tenant's whole index with it in the order the
     /// lifecycle chooses, not the order an erasure request runs.
     ///
-    /// **`sg_api_keys` is `none`.** It holds a key id, a label and
-    /// timestamps. The secret itself and its MAC live only in the minted
-    /// response, shown once; the row names a company's credential, not a
-    /// person.
+    /// **`sg_api_keys` is `none`.** It holds a key id, a label, an
+    /// optional staff id (issue #35 — a caller-chosen handle for the
+    /// support agent a key belongs to, not a real-world identity this
+    /// module can resolve) and timestamps. The secret itself and its MAC
+    /// live only in the minted response, shown once; the row names a
+    /// company's credential, not a person.
     ///
     /// **The index tables are `unreachable`, and that is the honest
     /// answer.** `sg_sources`, `sg_chunks` and `sg_postings` hold the
@@ -471,7 +485,7 @@ impl Module for Support {
     }
 
     fn migrations(&self) -> Migrations {
-        const MIGRATIONS: [SqlMigration; 8] = [
+        const MIGRATIONS: [SqlMigration; 9] = [
             MIGRATION_INIT,
             MIGRATION_CONVERSATIONS,
             MIGRATION_SOURCE_MANAGEMENT,
@@ -480,6 +494,7 @@ impl Module for Support {
             MIGRATION_CONNECTORS,
             MIGRATION_SEARCH_STATS,
             MIGRATION_WIDGET_SETTINGS,
+            MIGRATION_HUMAN_HANDOFF,
         ];
         // Refuses a gap, a duplicate or an out-of-order id at compile
         // time.

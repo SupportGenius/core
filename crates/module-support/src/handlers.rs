@@ -12,7 +12,7 @@ use bytes::Bytes;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use cratefield_core::{
@@ -27,6 +27,7 @@ use crate::bm25;
 use crate::chunk::{Chunker, tokenize};
 use crate::connectors::{self, ConnectorConfig, Kind};
 use crate::handoff::HandoffSink;
+use crate::human;
 use crate::messages;
 use crate::store::{self, ApiKeyRow, ChunkRow, ConnectorRow, STATUS_ACTIVE, SourceRow, TenantRow};
 use crate::uploads;
@@ -170,6 +171,16 @@ pub(crate) fn router(
         .route("/connectors", post(create_connector))
         .route("/search", get(search))
         .route("/messages", post(messages::post_message))
+        .route("/inbox", get(human::inbox))
+        .route(
+            "/conversations/{conversation_id}/takeover",
+            post(human::takeover),
+        )
+        .route("/conversations/{conversation_id}/reply", post(human::reply))
+        .route(
+            "/conversations/{conversation_id}/handback",
+            post(human::handback),
+        )
         .route("/keys", get(list_keys).post(create_key))
         .route("/keys/{kid}", delete(delete_key))
         .route("/widget/messages", post(widget::post_widget_message))
@@ -296,6 +307,37 @@ pub(crate) fn surface() -> Surface {
                 .input::<messages::MessageBody>()
                 .outcome(Outcome::Json),
         )
+        // Human in the loop (issue #35): staff-key routes.
+        .action(
+            Action::get("list-inbox", "/inbox")
+                .audience(Audience::Public)
+                .policy(key)
+                .outcome(Outcome::Json),
+        )
+        .action(
+            Action::post(
+                "takeover-conversation",
+                "/conversations/{conversation_id}/takeover",
+            )
+            .policy(key)
+            .outcome(Outcome::Json),
+        )
+        .action(
+            Action::post(
+                "reply-conversation",
+                "/conversations/{conversation_id}/reply",
+            )
+            .policy(key)
+            .outcome(Outcome::Json),
+        )
+        .action(
+            Action::post(
+                "handback-conversation",
+                "/conversations/{conversation_id}/handback",
+            )
+            .policy(key)
+            .outcome(Outcome::Json),
+        )
         .action(
             Action::get("list-keys", "/keys")
                 .audience(Audience::Public)
@@ -344,8 +386,17 @@ pub(crate) fn required_port<'a, T: ?Sized>(
     port.ok_or_else(|| Problem::internal().with_detail(format!("required port {name} is missing")))
 }
 
+/// Who a verified API key authenticates as: the tenant every query is
+/// scoped to, and — when the key carries one — the staff member it belongs
+/// to. Customer and integration keys have no `staff_id`, which is what
+/// keeps the staff routes (`crate::human`) closed to them.
+pub(crate) struct Principal {
+    pub tenant_id: String,
+    pub staff_id: Option<String>,
+}
+
 /// Verifies the `Authorization` bearer as a tenant API key and returns
-/// the tenant id every downstream query must filter on. Revoked kids come
+/// the principal every downstream query scopes on. Revoked kids come
 /// from module config (`SUPPORT_REVOKED_KIDS`, parsed by
 /// [`tenancy::parse_revoked_kids`]); the tenant row must exist and be
 /// active; and the verified key's own id must have a row in `sg_api_keys`
@@ -355,7 +406,7 @@ pub(crate) fn required_port<'a, T: ?Sized>(
 pub(crate) async fn authenticate(
     ctx: &ModuleContext,
     headers: &HeaderMap,
-) -> Result<String, Problem> {
+) -> Result<Principal, Problem> {
     let unauthorized = || Problem::new(&UNAUTHORIZED);
     let Some(signer) = ctx.ports.signer.as_deref() else {
         return Err(unauthorized());
@@ -384,9 +435,14 @@ pub(crate) async fn authenticate(
             // The signature is valid, but the key only authenticates while
             // its own row exists: a key id never recorded, or one whose row
             // the tenant deleted via `DELETE /keys/{kid}`, is refused the
-            // same 401 as junk.
+            // same 401 as junk. The row also carries the key's `staff_id`,
+            // if it has one — that, not the signature, is what the staff
+            // routes read.
             match store::find_api_key(db, &tenant.id, &tenant_key.key_id).await {
-                Ok(Some(_)) => Ok(tenant.id),
+                Ok(Some(key)) => Ok(Principal {
+                    tenant_id: tenant.id,
+                    staff_id: key.staff_id,
+                }),
                 Ok(None) => Err(unauthorized()),
                 Err(err) => Err(err.into()),
             }
@@ -458,7 +514,7 @@ enum Authed<'a> {
 /// nearly all of them need next.
 async fn authorize<'a>(ctx: &'a ModuleContext, headers: &HeaderMap) -> Authed<'a> {
     let tenant_id = match authenticate(ctx, headers).await {
-        Ok(tenant_id) => tenant_id,
+        Ok(principal) => principal.tenant_id,
         Err(problem) => return Authed::Done(problem.into_response()),
     };
     if let Some(rate_limited) = guard_rate_limit(ctx, &tenant_id).await {
@@ -539,6 +595,8 @@ async fn create_tenant(
             tenant_id: tenant.id.clone(),
             kid: minted.key_id.clone(),
             label: store::FIRST_KEY_LABEL.to_owned(),
+            // The provisioning key is the tenant's own, not a staff key.
+            staff_id: None,
             created_at,
         },
     )
@@ -564,22 +622,28 @@ async fn create_tenant(
 // every read shows only the key's own id, its label and its timestamp.
 // ---------------------------------------------------------------------
 
-/// The optional body of `POST /keys`: `{"label": "…"}`. An absent body is
-/// valid and means the default label.
+/// The optional body of `POST /keys`: `{"label": "…", "staff_id": "…"}`.
+/// An absent body is valid: it means the default label and a key that is
+/// not a staff key.
 #[derive(Deserialize, Default)]
 struct CreateKeyBody {
     label: Option<String>,
+    /// Names the staff member this key belongs to (issue #35). Present,
+    /// the key may use the staff routes; absent, it is an ordinary
+    /// customer or integration key.
+    staff_id: Option<String>,
 }
 
-/// The label a `POST /keys` request asked for: absent (or an empty body)
-/// is [`store::DEFAULT_KEY_LABEL`], otherwise the label is trimmed and
-/// held to the same byte ceiling a tenant name gets. The guards have
-/// already run, so a malformed body is a real 400 here, not a leak.
-fn parse_label(scope: &Scope, body: &Bytes) -> Result<String, Problem> {
+/// The label and staff id a `POST /keys` request asked for: an absent (or
+/// empty) body is [`store::DEFAULT_KEY_LABEL`] and no staff id, otherwise
+/// each present value is trimmed and held to the same byte ceiling a
+/// tenant name gets. The guards have already run, so a malformed body is a
+/// real 400 here, not a leak.
+fn parse_key_body(scope: &Scope, body: &Bytes) -> Result<(String, Option<String>), Problem> {
     let bad = || {
         Problem::validation_failed(format!(
-            "body: expected a JSON object with an optional string \"label\", \
-             1..={MAX_NAME_BYTES} bytes"
+            "body: expected a JSON object with an optional string \"label\" and an optional \
+             string \"staff_id\", each 1..={MAX_NAME_BYTES} bytes"
         ))
         .instance(&scope.request_id)
     };
@@ -588,23 +652,30 @@ fn parse_label(scope: &Scope, body: &Bytes) -> Result<String, Problem> {
     } else {
         serde_json::from_slice(body).map_err(|_| bad())?
     };
-    match parsed.label {
-        None => Ok(store::DEFAULT_KEY_LABEL.to_owned()),
-        Some(label) => {
-            let trimmed = label.trim();
-            if trimmed.is_empty() || trimmed.len() > MAX_NAME_BYTES {
-                return Err(bad());
+    // A value is trimmed and length-checked the same way whether it is a
+    // label or a staff id; `None` when the field was absent.
+    let checked = |value: Option<String>| -> Result<Option<String>, Problem> {
+        match value {
+            None => Ok(None),
+            Some(value) => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() || trimmed.len() > MAX_NAME_BYTES {
+                    return Err(bad());
+                }
+                Ok(Some(trimmed.to_owned()))
             }
-            Ok(trimmed.to_owned())
         }
-    }
+    };
+    let label = checked(parsed.label)?.unwrap_or_else(|| store::DEFAULT_KEY_LABEL.to_owned());
+    let staff_id = checked(parsed.staff_id)?;
+    Ok((label, staff_id))
 }
 
 /// `GET /keys` — the tenant's own API keys, oldest first, each shown as
-/// `{kid, label, created_at}` where `kid` is the key's own id (the one
-/// `DELETE /keys/{kid}` takes). Nothing secret is stored, so there is
-/// nothing secret to show: the key material and its MAC live only in the
-/// mint response.
+/// `{kid, label, staff_id, created_at}` where `kid` is the key's own id
+/// (the one `DELETE /keys/{kid}` takes). Nothing secret is stored, so
+/// there is nothing secret to show: the key material and its MAC live only
+/// in the mint response.
 async fn list_keys(
     State(state): State<Arc<ModuleState>>,
     headers: HeaderMap,
@@ -620,6 +691,7 @@ async fn list_keys(
             json!({
                 "kid": key.kid,
                 "label": key.label,
+                "staff_id": key.staff_id,
                 "created_at": key.created_at,
             })
         })
@@ -645,7 +717,7 @@ async fn create_key(
         Authed::Ready(auth) => auth,
         Authed::Done(done) => return Ok(done),
     };
-    let label = parse_label(&scope, &body)?;
+    let (label, staff_id) = parse_key_body(&scope, &body)?;
     let clock: &dyn Clock = required_port(auth.ctx.ports.clock.as_deref(), "Clock")?;
     let id_gen: &dyn IdGen = required_port(auth.ctx.ports.id_gen.as_deref(), "IdGen")?;
     let signer: &dyn Signer = required_port(auth.ctx.ports.signer.as_deref(), "Signer")?;
@@ -660,6 +732,7 @@ async fn create_key(
             tenant_id: auth.tenant_id.clone(),
             kid: minted.key_id.clone(),
             label: label.clone(),
+            staff_id: staff_id.clone(),
             created_at: created_at.clone(),
         },
     )
@@ -670,6 +743,7 @@ async fn create_key(
         Json(json!({
             "kid": minted.key_id,
             "label": label,
+            "staff_id": staff_id,
             "created_at": created_at,
             "api_key": minted.key,
         })),
@@ -1094,7 +1168,7 @@ async fn create_connector(
     let ctx = &state.ctx;
     // Guards before body parsing, as everywhere above: a 4xx from an
     // extractor would tell an unauthenticated caller the route's shape.
-    let tenant_id = authenticate(ctx, &headers).await?;
+    let tenant_id = authenticate(ctx, &headers).await?.tenant_id;
     if let Some(rate_limited) = guard_rate_limit(ctx, &tenant_id).await {
         return Ok(rate_limited);
     }
@@ -1297,7 +1371,10 @@ struct ListQuery {
     after: Option<String>,
 }
 
-/// One source as the source-management routes show it.
+/// One source as the source-management routes show it. `reviewed` and its
+/// provenance (issue #35) name a support agent's saved correction; a
+/// source indexed the ordinary way is `reviewed: false` with null
+/// provenance.
 fn source_json(item: &store::SourceSummary) -> Value {
     json!({
         "id": item.id,
@@ -1307,6 +1384,9 @@ fn source_json(item: &store::SourceSummary) -> Value {
         "bytes": item.byte_len,
         "chunk_count": item.chunk_count,
         "updated_at": item.updated_at,
+        "reviewed": item.reviewed,
+        "reviewed_by": item.reviewed_by,
+        "reviewed_conversation_id": item.reviewed_conversation_id,
     })
 }
 
@@ -1453,16 +1533,13 @@ async fn put_source(
             .instance(&scope.request_id));
     }
 
-    let (source, chunk_count) = upsert_source(auth.db, clock, &target, parsed).await?;
-    let summary = store::SourceSummary {
-        id: source.id,
-        title: source.title,
-        url: source.url,
-        external_id: source.external_id,
-        byte_len: source.byte_len,
-        updated_at: source.updated_at,
-        chunk_count: i64::try_from(chunk_count).unwrap_or(i64::MAX),
-    };
+    upsert_source(auth.db, clock, &target, parsed).await?;
+    // Read the row back rather than assemble it: a `PUT` replaces content
+    // and metadata but leaves a source's `reviewed` provenance untouched,
+    // so only the stored row knows what still stands.
+    let summary = store::find_source_summary(auth.db, &auth.tenant_id, &source_id)
+        .await?
+        .ok_or_else(Problem::internal)?;
     Ok(Json(source_json(&summary)).into_response())
 }
 
@@ -1508,7 +1585,7 @@ async fn search(
     headers: HeaderMap,
 ) -> Result<Response, Problem> {
     let ctx = &state.ctx;
-    let tenant_id = authenticate(ctx, &headers).await?;
+    let tenant_id = authenticate(ctx, &headers).await?.tenant_id;
     if let Some(rate_limited) = guard_rate_limit(ctx, &tenant_id).await {
         return Ok(rate_limited);
     }
@@ -1588,6 +1665,13 @@ fn query_terms(query: &str) -> Vec<String> {
 /// ranked id whose chunk row is gone (a source deleted or replaced by a
 /// concurrent request between the postings fetch and the row read) is
 /// skipped rather than failing the request.
+///
+/// The ranker's top `k` is taken *after* a reviewed-source boost (issue
+/// #35): [`retrieve`] keeps every candidate whose boosted score could
+/// still reach the top `k`, multiplies the score of chunks whose source
+/// was saved by a support agent, and re-sorts — so what a tenant finds by
+/// searching is still exactly what an answer can cite, with a correction
+/// preferred over an equally scored answer it replaces.
 pub(crate) async fn retrieve(
     db: &dyn Database,
     tenant_id: &str,
@@ -1636,7 +1720,11 @@ pub(crate) async fn retrieve(
     }
 
     let mut ranked = bm25::rank(&kept, &postings, &dfs, &corpus, &bm25::Params::default());
-    ranked.truncate(k);
+    // Cut to the boosted candidates before reading their rows: a chunk can
+    // only reach the top `k` once boosted if its score, times
+    // [`REVIEWED_BOOST`], still clears the `k`-th unboosted score, so
+    // nothing below that cutoff needs its row read.
+    ranked.truncate(boost_candidates(&ranked, k));
 
     let top: Vec<String> = ranked
         .iter()
@@ -1648,6 +1736,17 @@ pub(crate) async fn retrieve(
         .map(|chunk| (chunk.id.clone(), chunk))
         .collect();
 
+    // The same `chunks_by_id` read carries each hit's source `reviewed`
+    // flag, so the boost costs no extra query. A ranked id whose row is
+    // gone needs no entry: it is dropped from the result below.
+    let reviewed: HashSet<String> = by_id
+        .values()
+        .filter(|chunk| chunk.reviewed)
+        .map(|chunk| chunk.id.clone())
+        .collect();
+    boost_reviewed(&mut ranked, &reviewed);
+    ranked.truncate(k);
+
     Ok(ranked
         .into_iter()
         .filter_map(|scored| {
@@ -1658,6 +1757,57 @@ pub(crate) async fn retrieve(
             })
         })
         .collect())
+}
+
+/// How much a chunk from a reviewed source outranks an equally scored one
+/// (issue #35): a support agent's saved correction was written to be the
+/// answer, so it wins a close call — but a clearly better ordinary chunk
+/// still beats it.
+pub const REVIEWED_BOOST: f64 = 1.5;
+
+/// Retrieval over-fetches this many candidates at most for the reviewed
+/// boost (issue #35): every ranked chunk whose boosted score could still
+/// reach the top `k` is read as one `chunks_by_id` batch, and this caps
+/// that read so a corpus of near-equal scores cannot make it unbounded.
+/// Larger than any `k` the routes ask for, so the cutoff — not this — is
+/// what usually decides the batch size.
+pub const MAX_BOOST_CANDIDATES: usize = 64;
+
+/// How many of the ranked chunks the reviewed boost must consider: the
+/// prefix whose score, multiplied by [`REVIEWED_BOOST`], could still clear
+/// the `k`-th unboosted score — an exact cutoff, not a fixed multiple of
+/// `k`, so a reviewed chunk in a tight score band is never dropped just
+/// because it sat past a fixed window. Capped at [`MAX_BOOST_CANDIDATES`].
+/// Pure, so the cutoff is unit-testable.
+fn boost_candidates(ranked: &[bm25::Scored], k: usize) -> usize {
+    if k == 0 {
+        return 0;
+    }
+    match ranked.get(k - 1) {
+        Some(cutoff) => {
+            let reach = cutoff.score / REVIEWED_BOOST;
+            ranked
+                .iter()
+                .take_while(|scored| scored.score >= reach)
+                .count()
+                .min(MAX_BOOST_CANDIDATES)
+        }
+        // Fewer than `k` chunks ranked: every one is a candidate.
+        None => ranked.len().min(MAX_BOOST_CANDIDATES),
+    }
+}
+
+/// Multiplies every ranked chunk whose source is reviewed by
+/// [`REVIEWED_BOOST`], then re-orders best first. Pure — no database — so
+/// the rule is unit-testable directly. The sort is stable, so equal scores
+/// keep the ranker's `chunk_id` order.
+pub(crate) fn boost_reviewed(ranked: &mut [bm25::Scored], reviewed: &HashSet<String>) {
+    for scored in ranked.iter_mut() {
+        if reviewed.contains(&scored.chunk_id) {
+            scored.score *= REVIEWED_BOOST;
+        }
+    }
+    ranked.sort_by(|a, b| b.score.total_cmp(&a.score));
 }
 
 #[cfg(test)]
@@ -1724,5 +1874,86 @@ mod query_terms_tests {
         }
         expected.truncate(store::MAX_QUERY_TERMS);
         assert_eq!(terms, expected);
+    }
+
+    fn scored(items: &[(&str, f64)]) -> Vec<bm25::Scored> {
+        items
+            .iter()
+            .map(|(chunk_id, score)| bm25::Scored {
+                chunk_id: (*chunk_id).to_owned(),
+                score: *score,
+            })
+            .collect()
+    }
+
+    fn order(ranked: &[bm25::Scored]) -> Vec<&str> {
+        ranked.iter().map(|s| s.chunk_id.as_str()).collect()
+    }
+
+    #[test]
+    fn the_reviewed_boost_wins_a_close_call_but_not_a_clear_win() {
+        let reviewed: HashSet<String> = ["b".to_owned()].into_iter().collect();
+
+        // 9.0 * 1.5 = 13.5 climbs past 10.0.
+        let mut close = scored(&[("a", 10.0), ("b", 9.0)]);
+        boost_reviewed(&mut close, &reviewed);
+        assert_eq!(order(&close), ["b", "a"]);
+
+        // 5.0 * 1.5 = 7.5 still trails a clearly better 10.0.
+        let mut clear = scored(&[("a", 10.0), ("b", 5.0)]);
+        boost_reviewed(&mut clear, &reviewed);
+        assert_eq!(order(&clear), ["a", "b"]);
+    }
+
+    #[test]
+    fn an_unreviewed_shortlist_keeps_its_scores_and_order() {
+        let mut ranked = scored(&[("a", 2.0), ("b", 1.0)]);
+        boost_reviewed(&mut ranked, &HashSet::new());
+        assert_eq!(order(&ranked), ["a", "b"]);
+        assert_eq!(ranked[0].score.to_bits(), 2.0_f64.to_bits());
+        assert_eq!(ranked[1].score.to_bits(), 1.0_f64.to_bits());
+    }
+
+    #[test]
+    fn a_reviewed_chunk_past_a_fixed_window_still_reaches_the_top() {
+        // Twenty chunks in a tight score band; the last is reviewed and k
+        // is 4, so a fixed 4k window would have thrown it away. The exact
+        // cutoff keeps every candidate whose boosted score could clear the
+        // k-th unboosted score, so the boost can lift it into the top k.
+        let mut ranked: Vec<bm25::Scored> = (0..20)
+            .map(|i| bm25::Scored {
+                chunk_id: format!("c{i}"),
+                score: 10.0 - f64::from(i) * 0.01,
+            })
+            .collect();
+        let reviewed: HashSet<String> = ["c19".to_owned()].into_iter().collect();
+        let k = 4;
+        assert!(
+            !order(&ranked)[..k].contains(&"c19"),
+            "the fixture must rank the reviewed chunk below the cut"
+        );
+
+        let candidates = boost_candidates(&ranked, k);
+        assert!(
+            candidates > k * 4,
+            "the exact cutoff must reach past a fixed 4k window"
+        );
+        ranked.truncate(candidates);
+        boost_reviewed(&mut ranked, &reviewed);
+        ranked.truncate(k);
+        assert!(order(&ranked).contains(&"c19"), "{:?}", order(&ranked));
+    }
+
+    #[test]
+    fn the_candidate_cutoff_is_capped() {
+        // A flat corpus of near-equal scores would otherwise name the whole
+        // index as candidates; the cap bounds the row read.
+        let ranked: Vec<bm25::Scored> = (0..MAX_BOOST_CANDIDATES + 50)
+            .map(|i| bm25::Scored {
+                chunk_id: format!("c{i}"),
+                score: 1.0,
+            })
+            .collect();
+        assert_eq!(boost_candidates(&ranked, 1), MAX_BOOST_CANDIDATES);
     }
 }

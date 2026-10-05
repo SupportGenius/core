@@ -15,6 +15,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use cratefield_core::{Database, DbError, MapConfig, Module, Rows, Statement};
 use cratefield_testing::{Dialect, TestHarness};
+use module_support::MAX_BOOST_CANDIDATES;
 use module_support::Support;
 use module_support::bm25;
 use module_support::chunk::Chunk;
@@ -361,7 +362,12 @@ async fn a_truncated_fetch_scores_exactly_what_the_full_index_scores() {
         let (queries, rows, sql) = take_window(&stats);
         assert_no_aggregates(&sql);
         let terms = n(kept.len());
-        let budget = AUTH_ROWS + 1 + terms + terms * n(MAX_POSTINGS_PER_TERM) + n(results.len());
+        // The chunk-row read is the reviewed boost's candidates (#35):
+        // retrieve keeps every ranked chunk whose boosted score could still
+        // reach the top `k`, reads their rows, boosts, then cuts to `k`.
+        // The cutoff can name more than `k`, so the bound is the cap.
+        let budget =
+            AUTH_ROWS + 1 + terms + terms * n(MAX_POSTINGS_PER_TERM) + n(MAX_BOOST_CANDIDATES);
         assert!(
             rows <= budget,
             "{rows} rows read must fit the {budget} budget"
@@ -409,8 +415,11 @@ async fn a_query_reads_a_fixed_budget_of_rows_whatever_the_corpus_size() {
         let old_worst = chunks.len() * 2 + 10;
         let all_mid: Vec<String> = (0..MAX_QUERY_TERMS).map(|m| format!("m{m:02}")).collect();
         let worst = format!("q={}", all_mid.join("+"));
-        let worst_budget =
-            AUTH_ROWS + 1 + n(MAX_QUERY_TERMS) + n(MAX_QUERY_TERMS * MAX_POSTINGS_PER_TERM) + 10;
+        let worst_budget = AUTH_ROWS
+            + 1
+            + n(MAX_QUERY_TERMS)
+            + n(MAX_QUERY_TERMS * MAX_POSTINGS_PER_TERM)
+            + n(MAX_BOOST_CANDIDATES);
 
         for (query, want, budget, old, label) in [
             ("q=the", 0, AUTH_ROWS + 2, old_stopword, "q=the"),

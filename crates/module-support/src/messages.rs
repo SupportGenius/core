@@ -236,6 +236,29 @@ const TEXT_MODEL_BAD_ANSWER: ProblemDef = ProblemDef {
                   nothing was written.",
 };
 
+/// 409: the conversation was closed (`POST /conversations/{id}/handback`
+/// with `{"close": true}`, issue #35). A customer turn into a closed
+/// conversation is refused rather than silently reopening it — the
+/// visitor starts a new one.
+const CONVERSATION_CLOSED: ProblemDef = ProblemDef {
+    slug: "conversation-closed",
+    status: StatusCode::CONFLICT,
+    title: "Conversation is closed",
+    description: "This conversation was closed; no further customer turn is accepted. Start a \
+                  new conversation to ask again.",
+};
+
+/// How many of a conversation's prior turns ride along in the prompt. Each
+/// is a coalesced turn — see [`alternating_turns`] — so this bounds the
+/// model's context, not the stored transcript.
+const HISTORY_TURNS: usize = 10;
+
+/// How many stored messages the prompt-history read fetches before
+/// coalescing. The SQL bound ([`store::recent_conversation_messages`]) is
+/// larger than [`HISTORY_TURNS`] because coalescing can shrink adjacent
+/// messages into one turn.
+const HISTORY_READ: usize = 20;
+
 /// The system prompt: what the model may ground on, what it must cite,
 /// which language it must answer in, and the shape it must answer in.
 const SYSTEM_PROMPT: &str = "You answer customer-support questions using only the retrieved \
@@ -355,7 +378,7 @@ pub(crate) async fn post_message(
     let ctx = &state.ctx;
     // Auth before the body, as every other route here: an extractor 4xx
     // would tell an unauthenticated caller the route exists.
-    let tenant_id = authenticate(ctx, &headers).await?;
+    let tenant_id = authenticate(ctx, &headers).await?.tenant_id;
     if let Some(rate_limited) = guard_rate_limit(ctx, &tenant_id).await {
         return Ok(rate_limited);
     }
@@ -418,33 +441,42 @@ pub(crate) async fn run_turn(
     let clock: &dyn Clock = required_port(ctx.ports.clock.as_deref(), "Clock")?;
     let id_gen: &dyn IdGen = required_port(ctx.ports.id_gen.as_deref(), "IdGen")?;
     let db: &dyn Database = required_port(ctx.ports.db.as_deref(), "Db")?;
+    // The language is only ever read; borrow it once for the calls below.
+    let lang = lang.as_deref();
 
     // 1–2. The conversation this turn belongs to (or none) and its counts
     //      — both reads, taken before any write.
     let (conversation, counts) =
         resolve_conversation(db, tenant_id, conversation_id, &scope.request_id).await?;
 
-    // 3. Retrieve — the same BM25 path `GET /search` uses.
-    let chunks = retrieve(db, tenant_id, message, TOP_K).await?;
+    // A person holding the conversation answers the next customer turn,
+    // not the bot (issue #35): store the message and return before
+    // retrieval and the model. A closed conversation takes no turn at all.
+    if let Some(conversation) = &conversation {
+        if conversation.state == store::STATE_HUMAN {
+            return store_held_message(state, tenant_id, conversation, message, lang, &counts)
+                .await;
+        }
+        if conversation.state == store::STATE_CLOSED {
+            return Err(Problem::new(&CONVERSATION_CLOSED)
+                .instance(&scope.request_id)
+                .into());
+        }
+    }
 
-    // 4. The tenant's threshold, else the documented default.
-    let threshold = store::tenant_threshold_pct(db, tenant_id)
-        .await?
-        .map_or(DEFAULT_ANSWER_THRESHOLD, answer::pct_confidence);
-
-    // 5. Ask the model. Nothing has been written yet, which is what makes
-    //    every failure here consume nothing.
-    let prompt = build_prompt(&chunks, message, lang.as_deref());
-    let completion = ask(state.text_model.as_deref(), &prompt, scope).await?;
-
-    // 6. Parse. A reply that is not the schema is a bad gateway, and
-    //    still nothing written.
-    let mut reply = answer::parse_reply(&completion)
-        .map_err(|_| Problem::new(&TEXT_MODEL_BAD_ANSWER).instance(&scope.request_id))?;
-    // The threshold compares at the stored grain (whole percent), so the
-    // decision and the row it writes can never disagree.
-    let confidence_pct = answer::confidence_pct(reply.confidence);
-    reply.confidence = answer::pct_confidence(confidence_pct);
+    // 3–6. Retrieve, resolve the threshold, ask the model with the
+    //      conversation's prior turns, and parse — nothing written, so
+    //      every failure here consumes nothing.
+    let (chunks, threshold, reply, confidence_pct) = model_turn(
+        state,
+        scope,
+        db,
+        tenant_id,
+        message,
+        lang,
+        conversation.as_ref(),
+    )
+    .await?;
 
     // 7. Decide.
     let retrieved_ids: Vec<&str> = chunks.iter().map(|hit| hit.chunk.id.as_str()).collect();
@@ -474,8 +506,8 @@ pub(crate) async fn run_turn(
         // module would not stand behind. The model's own words still go to
         // `model_answer` below — what the user saw and what the model said
         // deliberately differ on a downgraded turn.
-        Outcome::Clarify => (clarify_message(lang.as_deref()), Vec::new()),
-        Outcome::Handoff => (handoff_message(lang.as_deref()), Vec::new()),
+        Outcome::Clarify => (clarify_message(lang), Vec::new()),
+        Outcome::Handoff => (handoff_message(lang), Vec::new()),
     };
     let turn = store::Turn {
         conversation_id: conversation_id.clone(),
@@ -492,8 +524,19 @@ pub(crate) async fn run_turn(
         outcome: decision.outcome.as_str().to_owned(),
         confidence_pct,
         citations_json: citations_json(&reply),
-        lang: lang.clone(),
+        lang: lang.map(str::to_owned),
     };
+    // A takeover can land between step 1's read and this write (issue
+    // #35). Re-read the state once, last before the bot answers: if a
+    // person now holds the conversation — or it was closed meanwhile —
+    // store the customer's message the held way and write no bot answer,
+    // which would otherwise land in a conversation a human now owns.
+    if let Some(conversation) = &conversation
+        && let Some(current) = taken_over(db, tenant_id, conversation).await?
+    {
+        return store_held_message(state, tenant_id, &current, message, lang, &counts).await;
+    }
+
     // 9–10. One atomic write for the whole turn, then the kick. See
     //       [`commit_turn`] for why the two are ordered this way.
     let transcript = escalates.then(|| handoff_transcript(message, &shown));
@@ -521,6 +564,99 @@ pub(crate) async fn run_turn(
         // The stored percentage, divided in f64 so 90 reads back as 0.9.
         confidence: answer::pct_confidence_f64(confidence_pct),
         needs_escalation,
+    })
+}
+
+/// Steps 3–6 of a turn: retrieve for the question on the same BM25 path
+/// `GET /search` uses, resolve the tenant's threshold (else the documented
+/// default), ask the model, and parse the reply, quantizing its confidence
+/// to the stored grain so the decision and the row it writes can never
+/// disagree. The conversation's prior turns ride along as history — an
+/// agent's `staff` replies included, so a conversation handed back to the
+/// bot is answered in context. Nothing is written here, which is what
+/// makes every failure consume nothing.
+async fn model_turn(
+    state: &ModuleState,
+    scope: &Scope,
+    db: &dyn Database,
+    tenant_id: &str,
+    message: &str,
+    lang: Option<&str>,
+    conversation: Option<&ConversationRow>,
+) -> Result<(Vec<Retrieved>, f32, ModelReply, i64), TurnFailure> {
+    let chunks = retrieve(db, tenant_id, message, TOP_K).await?;
+    let threshold = store::tenant_threshold_pct(db, tenant_id)
+        .await?
+        .map_or(DEFAULT_ANSWER_THRESHOLD, answer::pct_confidence);
+    let history = match conversation {
+        Some(c) => store::recent_conversation_messages(db, tenant_id, &c.id, HISTORY_READ).await?,
+        None => Vec::new(),
+    };
+    let prompt = build_prompt(&chunks, message, lang, &history);
+    let completion = ask(state.text_model.as_deref(), &prompt, scope).await?;
+    // A reply that is not the schema is a bad gateway, and still nothing
+    // written.
+    let mut reply = answer::parse_reply(&completion)
+        .map_err(|_| Problem::new(&TEXT_MODEL_BAD_ANSWER).instance(&scope.request_id))?;
+    let confidence_pct = answer::confidence_pct(reply.confidence);
+    reply.confidence = answer::pct_confidence(confidence_pct);
+    Ok((chunks, threshold, reply, confidence_pct))
+}
+
+/// Re-reads a conversation's state just before the bot's write: a takeover
+/// can land between the turn's opening read and here (issue #35), and a
+/// person who now holds it must answer, not the bot. Returns the fresh row
+/// when the state is now `human` — or `closed`, which takes the same held
+/// path (the message is kept, no answer invented) rather than the `409` a
+/// turn opening on an already-closed conversation gets.
+async fn taken_over(
+    db: &dyn Database,
+    tenant_id: &str,
+    conversation: &ConversationRow,
+) -> Result<Option<ConversationRow>, TurnFailure> {
+    let current = store::find_conversation(db, tenant_id, &conversation.id).await?;
+    Ok(current.filter(|current| {
+        current.state == store::STATE_HUMAN || current.state == store::STATE_CLOSED
+    }))
+}
+
+/// A customer turn on a conversation a person holds (issue #35): store the
+/// message and answer `human` — no retrieval, no model call, no answer.
+/// The bot must not spend a model call, or write an answer, on a
+/// conversation a support agent is working; the agent answers it.
+async fn store_held_message(
+    state: &ModuleState,
+    tenant_id: &str,
+    conversation: &ConversationRow,
+    message: &str,
+    lang: Option<&str>,
+    counts: &store::ConversationCounts,
+) -> Result<TurnReply, TurnFailure> {
+    let ctx = &state.ctx;
+    let clock: &dyn Clock = required_port(ctx.ports.clock.as_deref(), "Clock")?;
+    let id_gen: &dyn IdGen = required_port(ctx.ports.id_gen.as_deref(), "IdGen")?;
+    let db: &dyn Database = required_port(ctx.ports.db.as_deref(), "Db")?;
+    let message_id = id_gen.ulid();
+    db.batch_atomic(&store::customer_message_statements(
+        &store::CustomerMessage {
+            id: message_id.clone(),
+            conversation_id: conversation.id.clone(),
+            tenant_id: tenant_id.to_owned(),
+            seq: counts.messages,
+            body: message.to_owned(),
+            lang: lang.map(str::to_owned),
+            created_at: store::iso_now(clock),
+        },
+    ))
+    .await?;
+    Ok(TurnReply {
+        conversation_id: conversation.id.clone(),
+        message_id,
+        outcome: answer::OUTCOME_HUMAN,
+        answer: String::new(),
+        citations: Vec::new(),
+        confidence: 0.0,
+        needs_escalation: conversation.needs_escalation,
     })
 }
 
@@ -677,12 +813,22 @@ async fn ask(
     }
 }
 
-/// The model request: every retrieved chunk as `[chunk_id] body`, so each
-/// citation can be checked against exactly what the model was shown, and
-/// the hand-written reply schema. A turn with a known language adds the
-/// one-line `respond_in: <lang>` the system prompt names, so the model
-/// answers in the language the question was asked in.
-fn build_prompt(chunks: &[Retrieved], question: &str, lang: Option<&str>) -> Prompt {
+/// The model request: the conversation's recent turns, then every
+/// retrieved chunk as `[chunk_id] body` — so each citation can be checked
+/// against exactly what the model was shown — and the hand-written reply
+/// schema. A turn with a known language adds the one-line
+/// `respond_in: <lang>` the system prompt names, so the model answers in
+/// the language the question was asked in.
+///
+/// The prior turns are the strictly alternating sequence
+/// [`alternating_turns`] builds, with this turn's question (and its
+/// retrieved context) as the final user turn.
+fn build_prompt(
+    chunks: &[Retrieved],
+    question: &str,
+    lang: Option<&str>,
+    history: &[store::WidgetMessage],
+) -> Prompt {
     let mut context = String::new();
     for hit in chunks {
         // Writing into a `String` cannot fail.
@@ -692,14 +838,74 @@ fn build_prompt(chunks: &[Retrieved], question: &str, lang: Option<&str>) -> Pro
         context.push_str("(nothing was retrieved for this question)\n");
     }
     let respond_in = lang.map_or_else(String::new, |lang| format!("respond_in: {lang}\n"));
-    Prompt::new(ModelTier::Fast)
-        .system(SYSTEM_PROMPT)
-        .user(format!(
-            "Question:\n{question}\n{respond_in}\nRetrieved context — cite only these chunk \
-             ids:\n{context}"
-        ))
+    let final_turn = format!(
+        "Question:\n{question}\n{respond_in}\nRetrieved context — cite only these chunk \
+         ids:\n{context}"
+    );
+
+    let mut prompt = Prompt::new(ModelTier::Fast).system(SYSTEM_PROMPT);
+    for (is_user, body) in alternating_turns(history, &final_turn) {
+        prompt = if is_user {
+            prompt.user(body)
+        } else {
+            prompt.assistant(body)
+        };
+    }
+    prompt
         .json_schema(answer::reply_schema())
         .max_tokens(MAX_OUTPUT_TOKENS)
+}
+
+/// The conversation's prior messages as strictly alternating model turns,
+/// `(is_user, body)`, opening on the user side and ending with
+/// `final_turn`.
+///
+/// Anthropic — and the production adapter, which passes these turns 1:1 —
+/// rejects a history that is not strictly alternating or does not begin
+/// with a `user` turn, and does so with a `400` on every retry, wedging
+/// the conversation. Two shapes break that and are fixed here: a `staff`
+/// message is the assistant side, so a bot reply followed by an agent's
+/// reply is two assistant turns in a row; and a customer message stored
+/// while a person held the conversation has no reply after it, so two user
+/// turns can abut. Adjacent same-side messages therefore coalesce into one
+/// turn (bodies joined by a blank line, the `Support agent:` prefix kept),
+/// only the last [`HISTORY_TURNS`] survive, a leading assistant turn is
+/// dropped, and `final_turn` either opens a new user turn or folds into a
+/// trailing one.
+fn alternating_turns(history: &[store::WidgetMessage], final_turn: &str) -> Vec<(bool, String)> {
+    let mut turns: Vec<(bool, String)> = Vec::new();
+    for message in history {
+        match message.role.as_str() {
+            store::ROLE_USER => push_turn(&mut turns, true, message.body.clone()),
+            store::ROLE_STAFF => {
+                push_turn(
+                    &mut turns,
+                    false,
+                    format!("Support agent: {}", message.body),
+                );
+            }
+            _ => push_turn(&mut turns, false, message.body.clone()),
+        }
+    }
+    let recent = turns.len().saturating_sub(HISTORY_TURNS);
+    let mut turns = turns.split_off(recent);
+    while matches!(turns.first(), Some((false, _))) {
+        turns.remove(0);
+    }
+    push_turn(&mut turns, true, final_turn.to_owned());
+    turns
+}
+
+/// Appends `body` to the last turn when it is on the same side, and starts
+/// a new turn otherwise, keeping [`alternating_turns`]'s sequence strict.
+fn push_turn(turns: &mut Vec<(bool, String)>, is_user: bool, body: String) {
+    match turns.last_mut() {
+        Some((last_is_user, last_body)) if *last_is_user == is_user => {
+            last_body.push_str("\n\n");
+            last_body.push_str(&body);
+        }
+        _ => turns.push((is_user, body)),
+    }
 }
 
 /// The model's raw citations, stored whatever the outcome.
@@ -817,7 +1023,10 @@ pub(crate) async fn put_settings(
 
 #[cfg(test)]
 mod tests {
-    use super::{clarify_message, handoff_message, turn_language};
+    use super::{build_prompt, clarify_message, handoff_message, turn_language};
+    use cratefield_core::{Prompt, Role};
+
+    use crate::store;
 
     /// The wording these messages have always had. The English catalog
     /// must render exactly this: the routes' long-standing texts, not a
@@ -873,5 +1082,64 @@ mod tests {
         );
         assert_eq!(turn_language(ambiguous, None), None);
         assert_eq!(turn_language(ambiguous, Some("not a language")), None);
+    }
+
+    /// A stored message, in the shape the transcript read returns.
+    fn message(role: &str, body: &str) -> store::WidgetMessage {
+        store::WidgetMessage {
+            id: "m".to_owned(),
+            role: role.to_owned(),
+            body: body.to_owned(),
+            outcome: None,
+            citations: Vec::new(),
+            created_at: "t".to_owned(),
+        }
+    }
+
+    fn roles(prompt: &Prompt) -> Vec<Role> {
+        prompt.messages.iter().map(|turn| turn.role).collect()
+    }
+
+    #[test]
+    fn the_prompt_history_is_strictly_alternating() {
+        // A window ending `user, assistant, staff`: the bot's answer and the
+        // agent's reply are the same side, so they must coalesce into one
+        // assistant turn, and the current question follows as a user turn.
+        let answered_then_staff = [
+            message(store::ROLE_USER, "how do I reset?"),
+            message(store::ROLE_ASSISTANT, "From the settings page."),
+            message(store::ROLE_STAFF, "Open Settings, then Security."),
+        ];
+        let prompt = build_prompt(&[], "still stuck", None, &answered_then_staff);
+        assert_eq!(roles(&prompt), [Role::User, Role::Assistant, Role::User]);
+        assert!(
+            prompt.messages[1]
+                .content
+                .contains("Support agent: Open Settings, then Security."),
+            "the staff reply stays attributed: {}",
+            prompt.messages[1].content
+        );
+
+        // A window ending `user, user` — a customer message stored while a
+        // person held the conversation — must not leave two user turns
+        // abutting: it coalesces with the current question.
+        let held_between = [
+            message(store::ROLE_USER, "first question"),
+            message(store::ROLE_USER, "held while a person worked"),
+        ];
+        let prompt = build_prompt(&[], "now answer this", None, &held_between);
+        assert_eq!(roles(&prompt), [Role::User]);
+        assert!(prompt.messages[0].content.contains("first question"));
+        assert!(prompt.messages[0].content.contains("now answer this"));
+    }
+
+    #[test]
+    fn the_prompt_history_opens_on_a_user_turn() {
+        // The window opened on the bot's reply (the earlier user turn fell
+        // outside it): Anthropic needs a `user` first, so the leading
+        // assistant turn is dropped.
+        let starts_on_assistant = [message(store::ROLE_ASSISTANT, "earlier answer")];
+        let prompt = build_prompt(&[], "and now?", None, &starts_on_assistant);
+        assert_eq!(roles(&prompt), [Role::User]);
     }
 }
