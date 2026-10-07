@@ -1,4 +1,4 @@
-/*! SupportGenius widget v1.0.0 | https://supportgeni.us */
+/*! SupportGenius widget v1.1.0 | https://supportgeni.us */
 // Dependency-free support chat in one classic script (ES2017, no build step): a Shadow
 // DOM panel that talks to the SupportGenius API on this script's own origin using
 // CORS-"simple" requests only. Its only global is the init flag.
@@ -21,6 +21,8 @@
   var POLL_MAX_MS = 60000;  // error back-off ceiling
   var TURNSTILE_SRC = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
   var MSG_VERIFY = 'Verification is unavailable right now, please try again later.';
+  // The venture's "built with" list, on the same origin as the script itself.
+  var BUILT_WITH_PATH = '/v1/support/built-with';
 
   // The API lives on the origin the script was served from (dev and production alike).
   var base = new URL(script.src).origin;
@@ -66,7 +68,8 @@
     conv: null,    // {id, token} - token is the server's conversation_token
     visitor: null, // opaque signed string, replaced on every reply
     pollDelay: POLL_BASE_MS, pollTimer: 0, pollBusy: false,
-    typingEl: null, turnstileState: 'idle', turnstileWidget: null
+    typingEl: null, turnstileState: 'idle', turnstileWidget: null,
+    builtWith: false // the footer has been fetched and rendered once
   };
   var refs = {};           // shadow-DOM element references
   var turnstileQueue = []; // callbacks waiting on the turnstile script
@@ -87,6 +90,13 @@
     .captcha{flex:none;padding:10px 14px;background:#fff;border-top:1px solid #e3e6ec}.captcha-note{margin-bottom:8px;font-size:12px;color:#6b7280}
     .composer{flex:none;display:flex;gap:8px;padding:10px;background:#fff;border-top:1px solid #e3e6ec}
     .input{flex:1;resize:none;max-height:120px;padding:8px 10px;font:inherit;border:1px solid #d4d9e2;border-radius:10px}.input:focus{outline:2px solid #2563eb;outline-offset:-1px}.send{flex:none;padding:0 14px;font-weight:600;border:0;border-radius:10px;background:#2563eb;color:#fff}.send:hover:not(:disabled){background:#1d4ed8}.send:disabled{opacity:.5;cursor:default}
+    .foot{flex:none;padding:6px 12px;background:#fff;border-top:1px solid #e3e6ec;font-size:11px;line-height:1.5;color:#6b7280}
+    .foot-row{margin:0}
+    .foot-row + .foot-row{margin-top:2px}
+    .foot-item{white-space:nowrap}
+    .foot-item + .foot-item::before{content:"·";margin:0 4px;color:#9aa3b2}
+    .foot-status{color:#9aa3b2}
+    .foot a{color:#6b7280;text-decoration:underline}.foot a:hover{color:#2563eb}
   `;
 
   // --- DOM helpers (createElement / textContent only - never innerHTML) ----------
@@ -130,10 +140,15 @@
     input.placeholder = 'Type a message…'; input.setAttribute('aria-label', 'Your message');
     var send = button('send', 'Send', 'Send message');
 
+    // Small print: the venture's "built with" list. Empty and hidden until
+    // the fetch below succeeds — the chat is fully usable without it.
+    var foot = el('div', 'foot');
+    foot.hidden = true;
+
     var panel = el('div', 'panel');
     panel.setAttribute('role', 'dialog'); panel.setAttribute('aria-label', title);
     panel.hidden = true;
-    add(panel, head, banner, list, captchaBox, add(el('div', 'composer'), input, send));
+    add(panel, head, banner, list, captchaBox, add(el('div', 'composer'), input, send), foot);
     add(root, style, launcher, panel);
     document.body.appendChild(host);
 
@@ -149,14 +164,76 @@
     });
 
     refs = { launcher: launcher, panel: panel, banner: banner, list: list,
-      captchaBox: captchaBox, captchaSlot: captchaSlot, input: input, send: send };
+      captchaBox: captchaBox, captchaSlot: captchaSlot, input: input, send: send,
+      foot: foot };
   }
 
   function setOpen(open) {
     state.open = open;
     refs.panel.hidden = !open;
     refs.launcher.setAttribute('aria-label', open ? 'Close support chat' : 'Open support chat');
-    if (open) { refs.input.focus(); if (state.conv) fetchConversation(false); } // refresh lifecycle now
+    if (open) { refs.input.focus(); if (state.conv) fetchConversation(false); loadBuiltWith(); } // refresh lifecycle now
+  }
+
+  // --- Small print: the venture's "built with" list -----------------------------------
+  // `GET /built-with` on this script's own origin, served from the API the widget
+  // already talks to. Nothing is fetched from the Factory Zero registry at runtime:
+  // the server baked the list in at build time, so this is a static document.
+  //
+  // Every failure path here is silent on purpose, console included. The footer is
+  // attribution, not function — a deployment without it, a 404, a network error or a
+  // body in an unexpected shape must leave the chat exactly as usable as it was
+  // before. This file logs under its own '[SupportGenius]' prefix only where the
+  // chat itself cannot work (bad inclusion, a secret key, an unreachable or
+  // rejecting API); a footer that never arrives is none of those, so nothing is
+  // written to the console and nothing is ever shown to the visitor.
+  async function loadBuiltWith() {
+    if (state.builtWith) return; // fetched once per page, however often the panel opens
+    var res = await request('GET', BUILT_WITH_PATH);
+    var data = res.status === 200 ? res.data : null;
+    if (!data || !Array.isArray(data.uses)) return; // nothing to say: render no footer
+    var items = [];
+    for (var i = 0; i < data.uses.length; i++) {
+      var use = data.uses[i] || {};
+      var name = typeof use.name === 'string' ? use.name.trim() : '';
+      if (name) items.push({ name: name, url: use.url, status: use.status === 'live' ? 'live' : 'planned' });
+    }
+    if (!items.length) return;
+    state.builtWith = true;
+    renderBuiltWith(items, data);
+  }
+
+  function renderBuiltWith(items, data) {
+    // Row one: every product, live first, each name a link with its status
+    // spelled out. Row two: one flat run of text, `status: name` for every item
+    // in that same order, then the subprocessors link if the payload carried one
+    // — a plain-text restatement of row one, not a separate live/planned grouping.
+    // The status is never carried by colour alone, so it survives a monochrome
+    // display and a screen reader alike.
+    var names = el('p', 'foot-row');
+    var words = el('p', 'foot-row');
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      var line = el('span', 'foot-item');
+      var a = el('a', null, item.name);
+      if (/^https?:\/\//.test(item.url || '')) { a.href = item.url; a.target = '_blank'; a.rel = 'noopener noreferrer'; }
+      line.appendChild(a);
+      line.appendChild(el('span', 'foot-status', ' (' + item.status + ')'));
+      names.appendChild(line);
+    }
+    var split = [];
+    for (var j = 0; j < items.length; j++) {
+      split.push(items[j].status + ': ' + items[j].name);
+    }
+    words.appendChild(el('span', null, split.join(' · ')));
+    if (typeof data.subprocessors === 'string' && data.subprocessors) {
+      var sub = el('a', null, 'Subprocessors');
+      sub.href = data.subprocessors; sub.target = '_blank'; sub.rel = 'noopener noreferrer';
+      words.appendChild(document.createTextNode(' · '));
+      words.appendChild(sub);
+    }
+    add(refs.foot, names, words);
+    refs.foot.hidden = false;
   }
 
   // --- Transcript rendering ---------------------------------------------------------

@@ -68,6 +68,7 @@ use cratefield_runtime_native::{
     EnvConfig, Native, OutboundOptions, ReqwestClient, TokioClock, install_tracing, serve,
 };
 use supportgenius_composition as composition;
+use supportgenius_composition::built_with::{self, Kind, StackEntry, Status};
 
 #[cfg(feature = "postgres")]
 use cratefield_adapter_postgres::Postgres;
@@ -102,8 +103,16 @@ impl BootDb {
 
 #[tokio::main]
 async fn main() {
+    // Scanned for equality, not read off `argv[1]`, exactly like
+    // `--check-ready` below: no argument-parsing framework ships with this
+    // binary, and the two flags must answer before any config, database or
+    // tracing setup so `supportgenius about` works in a bare shell.
     if std::env::args().any(|arg| arg == "--check-ready") {
         check_ready().await;
+        return;
+    }
+    if std::env::args().any(|arg| arg == "about" || arg == "--about") {
+        print!("{}", about_text(built_with::stack()));
         return;
     }
     install_tracing();
@@ -645,4 +654,267 @@ fn loopback(addr: std::net::SocketAddr) -> std::net::SocketAddr {
         ip => ip,
     };
     std::net::SocketAddr::new(ip, addr.port())
+}
+
+/// The venture's "built with" list (issue #66), as plain text on stdout.
+///
+/// Every entry is printed with the role it plays, a link to the product
+/// and its status in words, so nothing that is only planned can be read
+/// as live. The entries themselves come from the vendored Factory Zero
+/// registry entry (FZ-008) compiled into
+/// `supportgenius_composition::built_with`: **nothing is fetched at
+/// runtime**, so the answer is the same offline, in CI and in a distroless
+/// container, and it cannot go stale mid-request.
+///
+/// `entries` is the parameter rather than a call to `built_with::stack()`
+/// inside the function so the rendering is testable on its own; the
+/// command passes the registry's own order (live first, then planned),
+/// which this function preserves — it never re-sorts.
+fn about_text(entries: &[StackEntry]) -> String {
+    use std::fmt::Write as _;
+
+    // Column widths are the widest value in the list, so the columns line
+    // up whatever the registry holds. Padding is plain `format_args!`
+    // formatting on purpose: no table crate for a fixed list of a dozen
+    // rows.
+    let role_width = entries.iter().map(|e| e.phrase.len()).max().unwrap_or(0);
+    let name_width = entries.iter().map(|e| e.name.len()).max().unwrap_or(0);
+    // Notes are indented under the name column, two spaces past the role,
+    // and wrapped so the whole block stays inside an 80-column terminal.
+    let note_indent = " ".repeat(2 + role_width + 2);
+    let note_width = 80_usize.saturating_sub(note_indent.len()).max(20);
+
+    let mut out = String::with_capacity(1024);
+    let _ = writeln!(out, "{} — built with", built_with::VENTURE_NAME);
+    let _ = writeln!(out);
+    for entry in entries {
+        // The chip is the whole answer to "which of these process my
+        // data": it marks the third-party rows here, so the subprocessors
+        // section below can be a link rather than a second copy of them.
+        let chip = if entry.kind == Kind::ThirdParty {
+            "  · subprocessor"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            "  {:<role$}  {:<name$}  {:<7}  {url}{chip}",
+            entry.phrase,
+            entry.name,
+            status_word(entry.status),
+            url = entry.url,
+            role = role_width,
+            name = name_width,
+        );
+        let note = entry.note.trim();
+        if !note.is_empty() {
+            for line in wrap(note, note_width) {
+                let _ = writeln!(out, "{note_indent}{line}");
+            }
+        }
+    }
+
+    let _ = writeln!(out);
+    // Every entry is already a row above, third parties included, so this
+    // section points at the published list rather than reprinting those
+    // rows — reprinting them put Cloudflare and Polar on the screen twice
+    // each, which read as two products rather than one used two ways.
+    let _ = writeln!(out, "Subprocessors: {}", built_with::SUBPROCESSORS_URL);
+    let _ = writeln!(
+        out,
+        "\nListed in the Factory Zero registry: {}",
+        built_with::SOURCE
+    );
+    out
+}
+
+/// Greedy word wrap to `width`, on character count — a note is prose, and
+/// an unbroken registry URL inside one is better left long than hyphenated.
+/// Returns at least one line for a non-empty input.
+fn wrap(text: &str, width: usize) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let rest = &text[start..];
+        let end = match rest.char_indices().nth(width) {
+            // Break at the last whitespace inside the window. With none
+            // there — a word longer than the window, usually a URL — run
+            // to the end of that word instead of cutting it: a split URL
+            // is a broken link, and an over-wide line beats a lost
+            // character.
+            Some((cut, _)) => rest[..cut].rfind(char::is_whitespace).unwrap_or_else(|| {
+                rest[cut..]
+                    .find(char::is_whitespace)
+                    .map_or(rest.len(), |offset| cut + offset)
+            }),
+            None => rest.len(),
+        };
+        let (line, next) = if end == 0 {
+            (rest, rest.len())
+        } else {
+            (&rest[..end], end)
+        };
+        lines.push(line.trim_end());
+        start += next + usize::from(next < rest.len());
+    }
+    lines.retain(|line| !line.is_empty());
+    lines
+}
+
+/// The status as the issue words it: `live` or `planned`. Matched here
+/// rather than through a `Display` impl so this file depends on nothing
+/// but the enum's own variants, and so a planned entry can never be
+/// printed as anything but `planned`.
+fn status_word(status: Status) -> &'static str {
+    match status {
+        Status::Live => "live",
+        Status::Planned => "planned",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No name is printed twice. The table already carries every entry,
+    /// third parties included, so the subprocessors section must add the
+    /// link and nothing else — a second copy of those rows put Cloudflare
+    /// and Polar on the screen twice each.
+    #[test]
+    fn no_entry_name_is_printed_twice() {
+        let text = about_text(built_with::stack());
+        // Notes name sibling products ("via the Cratefield Payments port"),
+        // so counting the raw name over the whole output would count prose
+        // rather than rows. Take the notes back out: what is left is the
+        // table and the links, where a name may appear exactly once.
+        let notes = built_with::stack()
+            .iter()
+            .map(|entry| entry.note)
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        for entry in built_with::stack() {
+            let outside_notes =
+                text.matches(entry.name).count() - notes.matches(entry.name).count();
+            assert_eq!(
+                outside_notes, 1,
+                "{} is printed {} times outside the notes",
+                entry.name, outside_notes
+            );
+        }
+    }
+
+    /// The command's own promise: every product named, its role and link
+    /// present, and Cloudflare live while Cratefield is still planned —
+    /// the two statuses must not be swapped, and the subprocessors list
+    /// must still be offered.
+    #[test]
+    fn about_lists_every_entry_with_its_own_status() {
+        let text = about_text(built_with::stack());
+
+        for entry in built_with::stack() {
+            assert!(text.contains(entry.name), "missing {}", entry.name);
+            assert!(text.contains(entry.phrase), "missing {}", entry.phrase);
+            assert!(text.contains(entry.url), "missing {}", entry.url);
+        }
+        assert!(text.contains(built_with::SUBPROCESSORS_URL));
+        assert!(text.contains(built_with::SOURCE));
+
+        let cloudflare = built_with::stack()
+            .iter()
+            .find(|e| e.name == "Cloudflare")
+            .expect("Cloudflare is in the registry");
+        assert_eq!(status_word(cloudflare.status), "live");
+        let cratefield = built_with::stack()
+            .iter()
+            .find(|e| e.name == "Cratefield")
+            .expect("Cratefield is in the registry");
+        assert_eq!(status_word(cratefield.status), "planned");
+    }
+
+    /// Wrapping breaks on whitespace and never loses or duplicates a
+    /// word: the notes are the only prose on the command's output, and a
+    /// dropped word there would be a quiet lie about what a product does.
+    #[test]
+    fn wrapping_keeps_every_word_and_respects_the_width() {
+        let text = "The ticketing and routing core is being written on the Cratefield harness.";
+        let lines = wrap(text, 40);
+        assert!(lines.len() > 1, "the note should not fit on one line");
+        for line in &lines {
+            assert!(line.len() <= 40, "{line:?} is too wide");
+        }
+        assert_eq!(
+            lines.join(" ").split_whitespace().collect::<Vec<_>>(),
+            text.split_whitespace().collect::<Vec<_>>()
+        );
+        // A word longer than the width is kept whole rather than cut.
+        assert_eq!(wrap("short", 40), vec!["short"]);
+        assert_eq!(
+            wrap("https://example.com/a/very/long/path", 10),
+            vec!["https://example.com/a/very/long/path"]
+        );
+    }
+
+    /// The renderer is a function of its argument: entries handed in are
+    /// what comes out, in the order given. A registry row with no note
+    /// prints no dangling indented line.
+    #[test]
+    fn about_text_renders_the_entries_it_is_given() {
+        let entries = [
+            StackEntry {
+                id: "example-live",
+                name: "Example Live",
+                kind: Kind::ThirdParty,
+                url: "https://example.com/live",
+                role: "hosting",
+                phrase: "Hosted on",
+                status: Status::Live,
+                note: "Serves the site.",
+            },
+            StackEntry {
+                id: "example-planned",
+                name: "Example Planned",
+                kind: Kind::FactoryZero,
+                url: "https://example.com/planned",
+                role: "framework",
+                phrase: "Built with",
+                status: Status::Planned,
+                note: "",
+            },
+        ];
+
+        let text = about_text(&entries);
+        let row = |name: &str| {
+            text.lines()
+                .find(|line| line.contains(name))
+                .unwrap_or_else(|| panic!("no row for {name}"))
+                .to_owned()
+        };
+        // The row carries the phrase, the name, the status in words and
+        // the link; the status word is what the columns are padded to, so
+        // match on it rather than on the exact run of spaces.
+        let live = row("Example Live");
+        assert!(live.starts_with("  Hosted on"), "{live:?}");
+        assert!(live.contains("live"), "{live:?}");
+        assert!(live.contains("https://example.com/live"), "{live:?}");
+        let planned = row("Example Planned");
+        assert!(planned.starts_with("  Built with"), "{planned:?}");
+        assert!(planned.contains("planned"), "{planned:?}");
+        assert!(
+            planned.contains("https://example.com/planned"),
+            "{planned:?}"
+        );
+        // A planned entry must never carry the word live, and vice versa.
+        assert!(!planned.contains("live"), "{planned:?}");
+        assert!(!live.contains("planned"), "{live:?}");
+        assert!(text.contains("Serves the site."));
+        // The role slug is the registry's, the phrase is what a reader
+        // is shown; printing the slug would leak the wire vocabulary.
+        assert!(!text.contains("hosting"), "the slug is not the column");
+        // Order preserved: live first because that is the order given.
+        assert!(
+            text.find("Example Live").unwrap() < text.find("Example Planned").unwrap(),
+            "entries must not be re-sorted"
+        );
+    }
 }

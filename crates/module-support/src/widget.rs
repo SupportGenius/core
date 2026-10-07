@@ -505,6 +505,46 @@ pub(crate) async fn serve_w_js() -> Response {
     response
 }
 
+/// `GET /v1/support/built-with` — the venture's "built with" list as the
+/// one compact JSON line the widget's small print renders (issue #66).
+///
+/// Served from the API origin on purpose, and with wildcard CORS for the
+/// same reason [`serve_w_js`] has it: the payload is a venture-level,
+/// tenant-independent attribution document that changes only when the
+/// venture's stack does, and the page embedding the widget is by
+/// definition an origin this tenant never allowlisted. Nothing here is
+/// fetched at runtime — the composition bakes
+/// `built_with::summary_json()` in at build time — so a cold Worker slice,
+/// an offline box and CI all answer identically and it cannot go stale
+/// mid-request.
+///
+/// The bytes are stored as the composition rendered them and served
+/// verbatim. Re-serializing would reorder the keys, and the payload's key
+/// order is part of its contract (the widget and the dashboard both parse
+/// it), so this module passes the string along rather than taking it
+/// apart.
+///
+/// A `Support` built without the list answers `404` and the widget shows
+/// no footer: attribution is never something worth failing a request over.
+pub(crate) async fn serve_built_with(
+    scope: Scope,
+    State(state): State<Arc<ModuleState>>,
+) -> Result<Response, Problem> {
+    let Some(summary) = state.built_with.clone() else {
+        return Err(Problem::not_found().instance(&scope.request_id));
+    };
+    let mut response = (
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        summary,
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+    Ok(response)
+}
+
 /// `POST /v1/support/admin/tenants/{tenant_id}/publishable-keys` — mint a
 /// second-class key for the web widget, guarded by the harness admin
 /// token exactly like `POST /admin/tenants`. The tenant must exist and be

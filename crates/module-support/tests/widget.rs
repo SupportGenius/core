@@ -878,3 +878,126 @@ async fn widget_origins_column(kit: &TestHarness, tenant_id: &str) -> Option<Opt
     // for a value; the column exists past the migration, so the outer `None` cannot.
     Some(row.get::<Option<String>>("v").unwrap_or_default())
 }
+
+// ----- the "built with" small print (issue #66) ---------------------------------------
+
+/// The payload the composition bakes in and this module serves: the shape
+/// `built_with::summary_json()` emits, small enough to inline. Real entries,
+/// live first then planned, so the widget's ordering assertion has teeth.
+const BUILT_WITH: &str = r#"{"venture":"SupportGenius","source":"https://factory0.ventures/stack.json","registry":"https://factory0.ventures/ventures/supportgenius/","subprocessors":"https://factory0.ventures/ventures/supportgenius/","uses":[{"name":"Cloudflare","phrase":"Hosted on","url":"https://www.cloudflare.com","status":"live","note":"The site."},{"name":"Cratefield","phrase":"Built with","url":"https://cratefield.com/","status":"planned","note":"Not deployed."},{"name":"Polar","phrase":"Payments by","url":"https://polar.sh","status":"planned","note":"Nothing on sale yet."}]}"#;
+
+/// A kit whose `Support` carries the venture's stack, the way the composition
+/// wires it. Everything else about the module is the ordinary default.
+fn built_with_kit(dialect: Dialect) -> TestHarness {
+    TestHarness::with_database_and_ports(
+        vec![Box::new(Support::new().with_built_with(BUILT_WITH))],
+        dialect,
+        |ports| {
+            ports.config = Arc::new(MapConfig::from_pairs([("ADMIN_TOKEN", ADMIN_TOKEN)]));
+            ports.captcha = Some(Arc::new(FakeCaptcha::allow_all()));
+        },
+    )
+}
+
+/// The route the widget's small print reads: `200`, JSON, the composition's
+/// bytes unchanged, readable from any page like the script itself.
+#[pollster::test]
+async fn the_built_with_list_is_served_as_the_composition_rendered_it() {
+    for dialect in Dialect::available() {
+        let kit = built_with_kit(dialect);
+        let (status, headers, bytes) = get_bytes(&kit.router, "/v1/support/built-with").await;
+        assert_eq!(status, SC::OK);
+        #[rustfmt::skip]
+        let value = |name: &HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
+        assert_eq!(
+            value(&header::CONTENT_TYPE),
+            Some("application/json; charset=utf-8")
+        );
+        // Wildcard, not the tenant allowlist: the same venture-wide document
+        // answers for every embedding page, and the widget never presents a key here.
+        assert_eq!(value(&header::ACCESS_CONTROL_ALLOW_ORIGIN), Some("*"));
+
+        // Verbatim. The payload's key order is part of its contract, so
+        // re-serializing here would be a silent change to it.
+        assert_eq!(String::from_utf8(bytes).expect("utf-8"), BUILT_WITH);
+    }
+
+    // And it is the shape the widget parses: a `uses` array, each entry
+    // carrying a name, a link and a status in words.
+    let body: Value = serde_json::from_str(BUILT_WITH).expect("valid JSON");
+    assert_eq!(
+        body.as_object()
+            .expect("an object")
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["venture", "source", "registry", "subprocessors", "uses"]
+    );
+    let uses = body["uses"].as_array().expect("a uses array");
+    #[rustfmt::skip]
+    assert!(uses.iter().any(|row| row["name"] == "Cloudflare" && row["status"] == "live"));
+    #[rustfmt::skip]
+    assert!(uses.iter().any(|row| row["name"] == "Cratefield" && row["status"] == "planned"));
+    assert_eq!(
+        body["subprocessors"],
+        "https://factory0.ventures/ventures/supportgenius/"
+    );
+}
+
+/// A `Support` composed without the list answers `404` rather than an empty
+/// section: the widget then renders no footer, and the chat is untouched.
+#[pollster::test]
+async fn without_the_list_the_route_is_a_404_not_an_empty_one() {
+    for kit in kits() {
+        let reply = send_raw(
+            &kit.router,
+            Method::GET,
+            "/v1/support/built-with",
+            Some(PAGE),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(reply.status, SC::NOT_FOUND, "{}", reply.body);
+        assert!(reply.body["type"].is_string(), "a problem, not a payload");
+    }
+}
+
+/// The script renders the small print with the same discipline as the rest of
+/// it: `createElement` and `textContent` only, never `innerHTML`. This is the
+/// widget's only string-into-DOM path, so the rule is asserted on the served
+/// bytes rather than left to review — the header comment at `w.js` states it.
+#[pollster::test]
+async fn the_script_never_builds_markup_from_a_string() {
+    // Stripped of comments first: the file's own header names `innerHTML` to
+    // forbid it, so a plain substring search would match the rule, not a breach.
+    let script: String = include_str!("../../../widget/w.js")
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(at) => &line[..at],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    for banned in [
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.write",
+    ] {
+        assert!(!script.contains(banned), "w.js must not use {banned}");
+    }
+    // The footer it renders is the promise, so it is pinned here rather than
+    // left to a manual look: the endpoint it reads, the two rows it builds,
+    // and the wording that carries live-vs-planned without relying on colour.
+    for expected in [
+        "/v1/support/built-with",
+        "loadBuiltWith",
+        "'foot-row'",
+        "'foot-item'",
+        "'foot-status'",
+        "item.status + ')'",
+        "Subprocessors",
+    ] {
+        assert!(script.contains(expected), "the small print lost {expected}");
+    }
+}

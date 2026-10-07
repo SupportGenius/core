@@ -41,6 +41,12 @@ works in production and against `wrangler dev`.
 - The transcript is restored on page load and polled every 10 s while the panel
   is open (paused when the tab is hidden, backed off to at most 60 s on errors).
 - Captchas use Cloudflare Turnstile, loaded on demand only when the server asks.
+- The panel's small print is the venture's "built with" list, fetched once when
+  the panel is first opened from `GET /v1/support/built-with` on the API origin
+  (no key, no `Origin` allowlist — it is the same venture-wide document for every
+  embedding page). Each entry is a link with its status spelled out — `(live)` or
+  `(planned)` — so nothing planned reads as live. If that request fails for any
+  reason the footer simply does not appear; the chat is unaffected.
 
 ## Versioning and SRI
 
@@ -48,6 +54,20 @@ The version lives in the banner comment on line 1 of `w.js` (`v1.0.0`). Any
 change to the file is a version bump, and each published version gets a fresh
 integrity hash in `widget/w.js.sri`. Update your `integrity` attribute whenever
 you adopt a new version; a stale hash makes the browser refuse the script.
+
+Regenerate the hash after **every** edit to `w.js` — bump the version in the
+banner comment first, then recompute over the final bytes:
+
+```sh
+printf 'sha384-%s' \
+  "$(openssl dgst -sha384 -binary widget/w.js | openssl base64 -A)" \
+  > widget/w.js.sri
+```
+
+`w.js.sri` holds the hash alone, with no trailing newline. The drift test
+`the_script_is_served_with_its_integrity_pin_intact`
+(`crates/module-support/tests/widget.rs`) recomputes the digest the way a
+browser does and fails if the two disagree, so run it before pushing.
 
 ## Trying it locally
 

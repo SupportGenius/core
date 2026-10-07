@@ -31,6 +31,13 @@ adapter-livingbrain = { path = "../adapter-livingbrain" }
 # the escalation module requires; the attribute must match the one on the
 # traits in `cratefield-core`.
 async-trait = { workspace = true }
+# The vendored Factory Zero stack registry entry (`src/built-with.json`),
+# parsed at runtime by `built_with` so the About/Settings section renders
+# without a fetch and the mail footer's Owlpost line can be decided from
+# the registry rather than hardcoded. No `preserve_order`: `built_with`
+# assembles its payload key order itself, so it does not depend on which
+# map this build resolved.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # The composition's acceptance tests drive a real harness over the
@@ -45,7 +52,9 @@ bytes = { workspace = true }
 # `ServiceExt::oneshot` drives the router without a network; pinned to
 # the same line cratefield-testing builds against so one tower compiles.
 tower = { version = "0.5.3", features = ["util"] }
-serde_json = { workspace = true }
+# `serde_json` is a runtime dependency above (the vendored stack entry),
+# so the acceptance tests that build request bodies with `json!` get it
+# from there rather than declaring it twice.
 # `tests/mail.rs` snapshots both waitlist mails rendered in the venture's
 # theme; the same 1.x line the upstream waitlist snapshots its own with.
 insta = "1.48.0"
