@@ -129,6 +129,11 @@ pub(crate) struct ModuleState {
     /// modules' surfaces the composition injected (`Support::with_api_
     /// surface`) — a document read is not a place to rebuild a schema.
     pub openapi: Value,
+    /// The venture's "built with" list, served verbatim at
+    /// `GET /built-with` (issue #66). `None` is `Support::new()` with
+    /// nothing composed: the route answers `404` and the widget renders
+    /// no footer.
+    pub built_with: Option<String>,
 }
 
 /// Builds the module's router. `api_surfaces` are other modules' surfaces
@@ -142,6 +147,7 @@ pub(crate) fn router(
     knowledge: Option<Arc<dyn PublicKnowledge>>,
     visitor_rate_limiter: Option<Arc<dyn RateLimiter>>,
     api_surfaces: Vec<(String, Surface)>,
+    built_with: Option<String>,
 ) -> axum::Router {
     let mut modules = vec![(crate::MODULE_NAME.to_owned(), surface())];
     modules.extend(api_surfaces);
@@ -153,6 +159,7 @@ pub(crate) fn router(
         knowledge,
         visitor_rate_limiter,
         openapi: document,
+        built_with,
     });
     axum::Router::new()
         .route("/admin/tenants", post(create_tenant))
@@ -200,6 +207,7 @@ pub(crate) fn router(
             get(widget::get_widget_conversation),
         )
         .route("/w.js", get(widget::serve_w_js))
+        .route("/built-with", get(widget::serve_built_with))
         .route("/mcp", post(crate::mcp::post_mcp))
         .route("/openapi.json", get(openapi))
         .with_state(state)
@@ -394,6 +402,11 @@ pub(crate) fn surface() -> Surface {
             .outcome(Outcome::Json),
         )
         .action(Action::get("w-js", "/w.js").audience(Audience::Public))
+        .action(
+            Action::get("built-with", "/built-with")
+                .audience(Audience::Public)
+                .outcome(Outcome::Json),
+        )
         .action(
             Action::post("mcp", "/mcp")
                 .policy(key)

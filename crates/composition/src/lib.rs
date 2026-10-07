@@ -50,6 +50,15 @@
 //! native boot offers, and fail loudly if a module starts hard-requiring
 //! a Redis port.
 //!
+//! # The built-with stack
+//!
+//! [`built_with`] is the venture's "built with" list: the Factory Zero
+//! registry entry for FZ-008, vendored as `src/built-with.json` so the
+//! About/Settings section renders offline. It is the third thing this
+//! crate holds next to the identity and the module list, and for the
+//! same reason: the Worker and the binary must show the reader the same
+//! stack, so both read [`built_with::stack`].
+//!
 //! # The cron schedule
 //!
 //! [`CRONS`] is the venture's schedule in one place: the five-minute
@@ -60,6 +69,8 @@
 //! a module whose work is **not** safe to run on any cron is wrapped in
 //! [`OnCron`] (the waitlist purge is: it must run daily, not 288 times a
 //! day).
+
+pub mod built_with;
 
 use std::sync::Arc;
 
@@ -246,6 +257,12 @@ fn compose_support(support: Support) -> OnCron<Support> {
             // and this crate is the one place that knows escalation's
             // surface to give it.
             .with_api_surface("escalation", Escalation::new().surface())
+            // The venture's "built with" list (issue #66), baked in at
+            // build time and served by support at
+            // `GET /v1/support/built-with` for the widget's small print.
+            // Injected rather than read here because the arrow is
+            // composition -> module-support and must stay that way.
+            .with_built_with(built_with::summary_json())
             .with_ticket_stats(Arc::new(EscalationTicketStats))
             .with_knowledge(Arc::new(LivingBrainAdapter)),
         SUPPORT_CRONS,

@@ -312,6 +312,14 @@ pub struct Support {
     /// module-support cannot depend on module-escalation; the document
     /// then spans `/v1/support` and `/v1/escalation`.
     api_surfaces: Vec<(String, cratefield_core::Surface)>,
+    /// The venture's "built with" list, served verbatim at
+    /// `GET /built-with` for the widget's small print (issue #66). The
+    /// composition injects the JSON because the list belongs to the
+    /// venture, not to this module — and the composition is the crate
+    /// that depends on this one, so the arrow never reverses. `None` is
+    /// the unwired module: the route answers `404` and the widget's
+    /// footer simply does not render.
+    built_with: Option<String>,
 }
 
 impl Support {
@@ -327,6 +335,7 @@ impl Support {
             knowledge: None,
             visitor_rate_limiter: None,
             api_surfaces: Vec::new(),
+            built_with: None,
         }
     }
 
@@ -342,6 +351,25 @@ impl Support {
         surface: cratefield_core::Surface,
     ) -> Self {
         self.api_surfaces.push((module.into(), surface));
+        self
+    }
+
+    /// The venture's "built with" list, as the one compact JSON line the
+    /// widget's small print reads from `GET /v1/support/built-with`
+    /// (issue #66). The composition calls this with
+    /// `supportgenius_composition::built_with::summary_json()`.
+    ///
+    /// **The JSON, not a trait, because the payload is inert.** Every
+    /// other seam on this struct is a port the composition adapts
+    /// (`HandoffSink`, `TicketStats`, `PublicKnowledge`); this one is
+    /// data the venture already rendered to a string, and re-parsing it
+    /// here would only be a second place for the two to disagree. It is
+    /// `Option` for the same reason the ports are: a `Support` built
+    /// without one serves no attribution at all rather than an empty
+    /// section.
+    #[must_use]
+    pub fn with_built_with(mut self, summary: impl Into<String>) -> Self {
+        self.built_with = Some(summary.into());
         self
     }
 
@@ -627,6 +655,7 @@ impl Module for Support {
             self.knowledge.clone(),
             visitor_rate_limiter,
             self.api_surfaces.clone(),
+            self.built_with.clone(),
         )
     }
 

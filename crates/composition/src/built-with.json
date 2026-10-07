@@ -1,0 +1,59 @@
+{
+  "id": "FZ-008",
+  "name": "SupportGenius",
+  "site": "https://supportgeni.us/",
+  "page": "https://factory0.ventures/ventures/supportgenius/",
+  "uses": [
+    {
+      "id": "FZ-004",
+      "name": "Cratefield",
+      "kind": "factory-zero",
+      "url": "https://cratefield.com/",
+      "role": "framework",
+      "phrase": "Built with",
+      "status": "planned",
+      "note": "The ticketing and routing core is being written on the Cratefield harness; it is not deployed."
+    },
+    {
+      "id": "polar",
+      "name": "Polar",
+      "kind": "third-party",
+      "url": "https://polar.sh",
+      "role": "payments",
+      "phrase": "Payments by",
+      "status": "planned",
+      "note": "Paid plans through Polar as Merchant of Record, via the Cratefield Payments port. Nothing is on sale yet."
+    },
+    {
+      "id": "FZ-009",
+      "name": "promptdecode",
+      "kind": "factory-zero",
+      "url": "https://promptdeco.de/",
+      "role": "security-screening",
+      "phrase": "Screened by",
+      "status": "planned",
+      "note": "Free text in bug reports is screened for hidden instructions before a model drafts the ticket."
+    },
+    {
+      "id": "FZ-012",
+      "name": "Keep Shipping",
+      "kind": "factory-zero",
+      "url": "https://keepshipping.run/",
+      "role": "deploys",
+      "phrase": "Deploys by",
+      "status": "planned",
+      "note": "Every venture site and Worker deployed from the Keep Shipping console."
+    },
+    {
+      "id": "cloudflare",
+      "name": "Cloudflare",
+      "kind": "third-party",
+      "url": "https://www.cloudflare.com",
+      "role": "hosting",
+      "phrase": "Hosted on",
+      "status": "live",
+      "note": "The site."
+    }
+  ],
+  "source": "https://factory0.ventures/stack.json"
+}
