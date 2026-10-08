@@ -30,7 +30,7 @@ part of the capability has landed; **planned** = an open issue, no code.
 | Analytics: deflection and escalation metrics | `planned` | planned | issue #36 |
 | Living Brain as a knowledge source | `planned` | planned | issue #64 |
 | Pricing tiers, quotas and billing hooks | `planned` | planned | issue #20 |
-| Observability: events, metrics, alerts | (implied) | planned | issue #39 |
+| Observability: events, metrics, alerts | (implied) | in progress | issue #39, PR open, [docs/OPERATIONS.md](OPERATIONS.md) |
 | Branded status email | (implied) | planned | issue #68 |
 
 ## Gaps: site claims with no issue here

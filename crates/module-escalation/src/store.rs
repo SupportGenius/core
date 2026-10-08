@@ -29,6 +29,7 @@ use cratefield_core::{Database, Row, Statement};
 use sea_query::{Alias, Expr, Func, Order, Query, SimpleExpr};
 
 use crate::error::Error;
+use crate::intake::OUTBOX_TABLE;
 use crate::model::{
     Drafted, EventKind, Judgment, Kind, Stage, StagePayload, Status, Ticket, TicketEvent, Verdict,
 };
@@ -1099,6 +1100,160 @@ pub async fn ticket_counts_for_day(db: &dyn Database, day: &str) -> Result<Vec<D
         }
     }
     Ok(counts)
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline health (issue #39)
+// ---------------------------------------------------------------------------
+
+/// The queue depth of one stage, as `GET /admin/health` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageDepth {
+    /// The outbox topic, which is the stage's name (`draft`, `judge`, ...).
+    pub topic: String,
+    /// Rows queued for the topic, leased or not. A `follow` row reschedules
+    /// itself, so its depth is expected to be non-zero for as long as any
+    /// filed ticket is still open.
+    pub depth: i64,
+    /// Rows due now — what the next sweep will pick up.
+    pub due: i64,
+    /// The oldest due row's `next_attempt_at`, as stored. `None` when
+    /// nothing is due, the common case for a healthy pipeline.
+    pub oldest_due_at: Option<String>,
+}
+
+/// Counts, per topic, what is queued and what is due.
+///
+/// One grouped query rather than one per stage: the route answers all five
+/// on every call, and five round trips to learn one shape is the wrong cost
+/// for an endpoint an operator polls.
+///
+/// The due predicate is the one core's `Outbox::claim_due` claims with, so
+/// `due` is exactly the set of rows the next sweep will take with no second
+/// definition of "ready" drifting in beside core's. Both aggregates are
+/// portable SQL (ADR 0004); `MIN` skips the `NULL`s `ELSE NULL` leaves, so
+/// the oldest timestamp is the oldest *due* one.
+///
+/// # Errors
+///
+/// The database's error when the read fails, or a decode error when a
+/// group-by row's columns are not what this query selects.
+pub async fn stage_depths(
+    db: &dyn Database,
+    now: &str,
+    topics: &[&str],
+) -> Result<Vec<StageDepth>, Error> {
+    let due = Expr::col(iden("next_attempt_at")).lte(now).and(
+        Expr::col(iden("locked_until"))
+            .is_null()
+            .or(Expr::col(iden("locked_until")).lt(now)),
+    );
+    let mut query = Query::select();
+    query
+        .expr_as(Expr::col(iden("topic")), Alias::new("topic"))
+        .expr_as(Func::count(Expr::cust("*")), Alias::new("depth"))
+        .expr_as(
+            Func::sum(Expr::case(due.clone(), 1).finally(0)),
+            Alias::new("due"),
+        )
+        .expr_as(
+            Func::min(
+                Expr::case(due.clone(), Expr::col(iden("next_attempt_at")))
+                    .finally(Expr::cust("NULL")),
+            ),
+            Alias::new("oldest_due_at"),
+        )
+        .from(iden(OUTBOX_TABLE))
+        .and_where(Expr::col(iden("topic")).is_in(topics.iter().copied()))
+        .group_by_col(iden("topic"));
+
+    let rows = db.query(&Statement::render(&query)).await?;
+    let mut depths: Vec<StageDepth> = Vec::new();
+    for row in &rows.rows {
+        depths.push(StageDepth {
+            topic: required_text(row, "topic")?,
+            // `Row::get` answers `None` for a missing column as well as
+            // for a NULL, and a NULL aggregate is 0 — the trade
+            // `status_changed_count` makes one function up.
+            depth: row.get::<i64>("depth").unwrap_or(0),
+            due: row.get::<i64>("due").unwrap_or(0),
+            oldest_due_at: optional_text(row, "oldest_due_at")?,
+        });
+    }
+    Ok(depths)
+}
+
+/// How many tickets dead-lettered since `cutoff` (RFC 3339), across every
+/// stage.
+///
+/// The definition is the ticket's own `status = 'dead_letter'` and its
+/// `updated_at`, not the `sg_ticket_events` detail column: every dead-letter
+/// path writes the status, so this counts each ticket once without reaching
+/// into JSON, which the portable SQL subset cannot do (ADR 0004). The caveat
+/// is that a ticket dead-lettered and later written to again drops out of
+/// the window; `sg_ticket_events` is append-only and would not have that
+/// flaw, but counting it means parsing `detail` JSON over the whole audit
+/// trail to answer a question about one day.
+///
+/// # Errors
+///
+/// The database's error when the read fails, or a decode error when `n` is
+/// not an integer.
+pub async fn dead_letters_since(db: &dyn Database, cutoff: &str) -> Result<i64, Error> {
+    let mut query = Query::select();
+    query
+        .expr_as(Func::count(Expr::col(iden("id"))), Alias::new("n"))
+        .from(iden("sg_tickets"))
+        .and_where(Expr::col(iden("status")).eq(Status::DeadLetter.as_str()))
+        .and_where(Expr::col(iden("updated_at")).gte(cutoff));
+    let rows = db.query(&Statement::render(&query)).await?;
+    let count = rows
+        .first()
+        .and_then(|row| row.get::<i64>("n"))
+        .unwrap_or(0);
+    Ok(count)
+}
+
+/// When the last drain finished cleanly, RFC 3339, or `None` if it never
+/// has.
+///
+/// # Errors
+///
+/// The database's error when the read fails, or a decode error when
+/// `last_ok_at` is not text.
+pub async fn last_drain_ok_at(db: &dyn Database) -> Result<Option<String>, Error> {
+    let mut query = Query::select();
+    query
+        .expr(Expr::col(iden("last_ok_at")))
+        .from(iden("sg_escalation_drain"))
+        .and_where(Expr::col(iden("id")).eq(1))
+        .limit(1);
+    let rows = db.query(&Statement::render(&query)).await?;
+    rows.first()
+        .map(|row| required_text(row, "last_ok_at"))
+        .transpose()
+}
+
+/// The upsert that stamps the drain, for the pipeline's own batch. A
+/// constant `id` and `ON CONFLICT … DO UPDATE`, so repeated drains leave
+/// one row holding the newest stamp rather than a history.
+///
+/// # Errors
+///
+/// None; the statement is only built.
+#[must_use]
+pub fn record_drain_stmt(last_ok_at: &str) -> Statement {
+    let mut insert = Query::insert();
+    insert
+        .into_table(iden("sg_escalation_drain"))
+        .columns(["id", "last_ok_at"])
+        .values_panic([1i32.into(), last_ok_at.to_owned().into()])
+        .on_conflict(
+            sea_query::OnConflict::column(iden("id"))
+                .update_column(iden("last_ok_at"))
+                .to_owned(),
+        );
+    Statement::render(&insert)
 }
 
 // ---------------------------------------------------------------------------

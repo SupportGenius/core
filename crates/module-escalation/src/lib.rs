@@ -18,6 +18,8 @@
 #![forbid(unsafe_code)]
 
 mod destinations;
+mod health;
+mod observe;
 mod pipeline;
 mod router;
 mod secrets;
@@ -84,6 +86,15 @@ pub const MIGRATION_FOLLOW: SqlMigration = SqlMigration::new(
     "0008",
     "follow",
     include_str!("../migrations/sqlite/0008_follow.sql"),
+);
+
+/// Observability (issue #39): the one-row `sg_escalation_drain` table that
+/// records when `Pipeline::drain` last completed without error, which is
+/// what `GET /v1/escalation/admin/health` reports as `last_drain_ok_at`.
+pub const MIGRATION_DRAIN: SqlMigration = SqlMigration::new(
+    "0009",
+    "observability",
+    include_str!("../migrations/sqlite/0009_observability.sql"),
 );
 
 /// One `cratefield-secrets` migration under this module's own id,
@@ -272,6 +283,7 @@ impl Module for Escalation {
             "harness_secret_keys",
             "harness_secrets",
             "harness_secret_audit",
+            "sg_escalation_drain",
         ]
     }
 
@@ -405,6 +417,11 @@ impl Module for Escalation {
                  store, name, version, actor (a tenant id or `admin`). It holds no secret \
                  value by construction.",
             ),
+            PersonalDataSet::none(
+                "sg_escalation_drain",
+                "When the escalation queue was last drained successfully — a single timestamp, \
+                 about the system rather than about you.",
+            ),
         ];
         SETS
     }
@@ -421,7 +438,7 @@ impl Module for Escalation {
     /// are already collected and locked by sha256 (see [`MIGRATION_FOLLOW`]).
     /// The postgres set must be complete: `select_set` applies it wholesale.
     fn migrations(&self) -> Migrations {
-        const SQLITE: [SqlMigration; 8] = [
+        const SQLITE: [SqlMigration; 9] = [
             MIGRATION_ESCALATION,
             MIGRATION_DUPLICATES,
             sub_migration(
@@ -450,11 +467,12 @@ impl Module for Escalation {
             ),
             MIGRATION_ROUTING,
             MIGRATION_FOLLOW,
+            MIGRATION_DRAIN,
         ];
         // The array is the apply order; this refuses a gap, a duplicate
         // or an entry out of order at build time.
         const _: () = cratefield_core::assert_migration_set(&SQLITE);
-        const POSTGRES: [SqlMigration; 8] = [
+        const POSTGRES: [SqlMigration; 9] = [
             MIGRATION_ESCALATION,
             MIGRATION_DUPLICATES,
             sub_migration(
@@ -483,6 +501,7 @@ impl Module for Escalation {
             ),
             MIGRATION_ROUTING,
             MIGRATION_FOLLOW,
+            MIGRATION_DRAIN,
         ];
         const _: () = cratefield_core::assert_migration_set(&POSTGRES);
         Migrations {
@@ -531,29 +550,34 @@ impl Module for Escalation {
         errors.into_result()
     }
 
-    /// The module's HTTP surface: the destination routes (issue #23) and
-    /// the built-in ticketing routes (issue #24, part 2), mounted under
+    /// The module's HTTP surface: the destination routes (issue #23), the
+    /// built-in ticketing routes (issue #24, part 2) and the pipeline
+    /// health route (issue #39), mounted under
     /// the same `/v1/escalation` prefix. Auth runs before the body is
     /// parsed: the tenant mounts check the `sg_…` API key, the destination
-    /// admin mount the harness admin token, and only then does a handler
-    /// read its payload — a `Json<T>` extractor would answer a malformed
-    /// body to an unauthenticated caller. The KMS the credential store is
-    /// built over is resolved from config once, here. Both surfaces share
-    /// the tenant directory, so a suspended tenant is refused identically
-    /// on either.
+    /// and health admin mounts the harness admin token, and only then does a
+    /// handler read its payload — a `Json<T>` extractor would answer a
+    /// malformed body to an unauthenticated caller. The KMS the credential
+    /// store is built over is resolved from config once, here. Both tenant
+    /// surfaces share the tenant directory, so a suspended tenant is refused
+    /// identically on either.
     fn router(&self, ctx: ModuleContext) -> axum::Router {
         let ctx = Arc::new(ctx);
         let kms = secrets::kms_from_config(&*ctx.config);
         destinations::router(Arc::clone(&ctx), kms, self.tenants.clone())
-            .merge(tickets::router(ctx, self.tenants.clone()))
+            .merge(tickets::router(Arc::clone(&ctx), self.tenants.clone()))
+            .merge(health::router(ctx))
     }
 
-    /// The destination routes, declared (ADR 0010). The composition also
+    /// The destination routes plus the pipeline health route, declared
+    /// (ADR 0010). The composition also
     /// injects this surface into `module-support`'s `OpenAPI` document
     /// (issue #34), so one document describes both `/v1/support/*` and
     /// `/v1/escalation/*`.
     fn surface(&self) -> cratefield_core::Surface {
-        destinations::surface()
+        let mut surface = destinations::surface();
+        surface.actions.extend(health::surface().actions);
+        surface
     }
 
     /// The drain: build a [`Pipeline`] from whatever ports the runtime
@@ -727,13 +751,13 @@ mod tests {
         // cron drainer does not.
         assert!(module.optional().contains(&Port::Signer));
         let tables = module.tables();
-        assert_eq!(tables.len(), 11);
+        assert_eq!(tables.len(), 12);
         let sg: Vec<&str> = tables
             .iter()
             .copied()
             .filter(|table| table.starts_with("sg_"))
             .collect();
-        assert_eq!(sg.len(), 8, "the module owns eight sg_ tables");
+        assert_eq!(sg.len(), 9, "the module owns nine sg_ tables");
         let harness: Vec<&str> = tables
             .iter()
             .copied()
@@ -762,7 +786,7 @@ mod tests {
     #[test]
     fn the_migration_set_is_the_module_files_then_the_embedded_secrets_schema() {
         let migrations = module().migrations();
-        assert_eq!(migrations.sqlite.len(), 8);
+        assert_eq!(migrations.sqlite.len(), 9);
         assert_eq!(
             migrations
                 .sqlite
@@ -770,7 +794,7 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008"
+                "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009"
             ]
         );
         assert!(migrations.sqlite[0].sql.contains("CREATE TABLE"));
@@ -785,14 +809,18 @@ mod tests {
         // The follow migration is appended after the secrets schema and
         // carries the module's own portable bytes.
         assert!(migrations.sqlite[7].sql.contains("sg_contacts"));
+        // The observability migration is appended last and carries the
+        // module's own portable bytes.
+        assert!(migrations.sqlite[8].sql.contains("sg_escalation_drain"));
         // The postgres set is complete (select_set applies it wholesale),
-        // carrying the same portable module files for 0001-0002, 0007 and
-        // 0008 and the secrets crate's own postgres bytes thereafter.
-        assert_eq!(migrations.postgres.len(), 8);
+        // carrying the same portable module files for 0001-0002, 0007-0009
+        // and the secrets crate's own postgres bytes thereafter.
+        assert_eq!(migrations.postgres.len(), 9);
         assert_eq!(migrations.postgres[0].sql, migrations.sqlite[0].sql);
         assert_eq!(migrations.postgres[1].sql, migrations.sqlite[1].sql);
         assert_eq!(migrations.postgres[6].sql, migrations.sqlite[6].sql);
         assert_eq!(migrations.postgres[7].sql, migrations.sqlite[7].sql);
+        assert_eq!(migrations.postgres[8].sql, migrations.sqlite[8].sql);
         assert_eq!(
             migrations.postgres[2].sql,
             cratefield_secrets::POSTGRES_MIGRATIONS[0].sql
