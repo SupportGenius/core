@@ -25,11 +25,12 @@ use cratefield_core::{
 };
 use cratefield_i18n::{Args, Catalog, FluentCatalog, localize};
 
-use crate::answer::{self, DEFAULT_ANSWER_THRESHOLD, ModelReply, Outcome};
+use crate::answer::{self, DEFAULT_ANSWER_THRESHOLD, Decision, ModelReply, Outcome};
 use crate::handlers::{
     ModuleState, Retrieved, authenticate, guard_rate_limit, required_port, retrieve,
 };
 use crate::knowledge::PublicAnswer;
+use crate::quota::{self, Admission};
 use crate::store::{self, ConversationRow};
 
 /// How many chunks a turn retrieves and shows the model. Six passages of
@@ -106,20 +107,23 @@ pub(crate) fn handoff_transcript(message: &str, reply: &str) -> String {
     format!("Customer: {message}\n\nSupport: {reply}")
 }
 
-/// The turn's one atomic batch: its own statements, then — when this turn
-/// escalates and a [`HandoffSink`](crate::HandoffSink) is composed — the
-/// sink's statements for `transcript`, and, whenever the request carried a
-/// `contact` and a sink is composed, the sink's statements remembering that
-/// address. Appending here is what makes the answer, the ticket and the
-/// stored contact all-or-nothing. `Support::new()` composes no sink, so
-/// this is just the turn and a handoff only marks `needs_escalation`.
+/// The turn's one atomic batch: its own statements, then the quota
+/// meter's (issue #20) — the conversation this turn opened, whose guarded
+/// increment is what stops a concurrent turn that took the last slot
+/// from overspending — then, when this turn escalates and a
+/// [`HandoffSink`](crate::HandoffSink) is composed, the sink's statements
+/// for `transcript` and for any `contact` the request carried. Model
+/// tokens are *not* here: they are recorded the moment the model answers,
+/// because they are owed whether or not this batch commits.
 fn turn_batch(
     state: &ModuleState,
     turn: &store::Turn,
     transcript: Option<&str>,
     contact: Option<&str>,
+    admission: &Admission,
 ) -> Vec<Statement> {
     let mut statements = store::turn_statements(turn);
+    statements.extend(admission.statements(&turn.tenant_id));
     let Some(sink) = state.handoff.as_deref() else {
         return statements;
     };
@@ -468,10 +472,9 @@ pub(crate) async fn run_turn(
         return Ok(reply);
     }
 
-    // 3–6. Retrieve, resolve the threshold, ask the model with the
-    //      conversation's prior turns, and parse — nothing written, so
-    //      every failure here consumes nothing.
-    let (chunks, threshold, reply, confidence_pct) = model_turn(
+    // 3–6. Admit to the tenant's quotas, retrieve, ask the model and parse —
+    //      nothing written, so every failure here consumes nothing.
+    let admitted = model_turn(
         state,
         scope,
         db,
@@ -483,8 +486,7 @@ pub(crate) async fn run_turn(
     .await?;
 
     // 7. Decide.
-    let retrieved_ids: Vec<&str> = chunks.iter().map(|hit| hit.chunk.id.as_str()).collect();
-    let decision = answer::decide(&reply, &retrieved_ids, threshold, counts.clarifies);
+    let decision = admitted.decide(counts.clarifies);
 
     // 8. Write the turn — conversation (create or update) plus both
     //    messages — in one `batch_atomic`.
@@ -497,19 +499,17 @@ pub(crate) async fn run_turn(
     let assistant_message_id = id_gen.ulid();
     // A handoff escalates; once escalated, a conversation stays escalated
     // — an answered follow-up does not un-escalate the ticket behind it.
-    // Only an escalating turn writes the flag (`store::Turn::escalates`),
-    // so this response value is what the stored flag is at least.
+    // Only an escalating turn writes the flag (`store::Turn::escalates`).
     let escalates = decision.outcome == Outcome::Handoff;
     let needs_escalation = escalates
         || conversation
             .as_ref()
             .is_some_and(|conversation: &ConversationRow| conversation.needs_escalation);
     let (shown, shown_citations) = match decision.outcome {
-        Outcome::Answered => (reply.answer.clone(), decision.citations.clone()),
+        Outcome::Answered => (admitted.reply.answer.clone(), decision.citations.clone()),
         // A canned message and no citations: never publish an answer the
         // module would not stand behind. The model's own words still go to
-        // `model_answer` below — what the user saw and what the model said
-        // deliberately differ on a downgraded turn.
+        // `model_answer` below — the two differ on a downgraded turn.
         Outcome::Clarify => (clarify_message(lang), Vec::new()),
         Outcome::Handoff => (handoff_message(lang), Vec::new()),
     };
@@ -524,16 +524,16 @@ pub(crate) async fn run_turn(
         user_message: message.to_owned(),
         assistant_message_id: assistant_message_id.clone(),
         assistant_body: shown.clone(),
-        model_answer: reply.answer.clone(),
+        model_answer: admitted.reply.answer.clone(),
         outcome: decision.outcome.as_str().to_owned(),
-        confidence_pct,
-        citations_json: citations_json(&reply),
+        confidence_pct: admitted.confidence_pct,
+        citations_json: citations_json(&admitted.reply),
         lang: lang.map(str::to_owned),
         // How many chunks retrieval put in front of the model — the
         // assistant row's `retrieved_chunks`, which the gap rollup reads
         // to tell "nothing to answer from" from "retrieved, but would not
         // answer".
-        retrieved_chunks: i64::try_from(chunks.len()).unwrap_or(i64::MAX),
+        retrieved_chunks: i64::try_from(admitted.chunks.len()).unwrap_or(i64::MAX),
     };
     // A takeover can land between step 1's read and this write (issue
     // #35). Re-read the state once, last before the bot answers: if a
@@ -553,10 +553,12 @@ pub(crate) async fn run_turn(
         state,
         ctx,
         db,
+        scope,
         &turn,
         transcript.as_deref(),
         contact,
         scope.defer.clone(),
+        &admitted.admission,
     )
     .await?;
 
@@ -571,19 +573,50 @@ pub(crate) async fn run_turn(
         answer: shown,
         citations,
         // The stored percentage, divided in f64 so 90 reads back as 0.9.
-        confidence: answer::pct_confidence_f64(confidence_pct),
+        confidence: answer::pct_confidence_f64(admitted.confidence_pct),
         needs_escalation,
     })
 }
 
-/// Steps 3–6 of a turn: retrieve for the question on the same BM25 path
-/// `GET /search` uses, resolve the tenant's threshold (else the documented
-/// default), ask the model, and parse the reply, quantizing its confidence
-/// to the stored grain so the decision and the row it writes can never
-/// disagree. The conversation's prior turns ride along as history — an
-/// agent's `staff` replies included, so a conversation handed back to the
-/// bot is answered in context. Nothing is written here, which is what
-/// makes every failure consume nothing.
+/// What one model turn produced, plus what the quota meters admitted it
+/// to spend (issue #20) — the two travel together because the spend is
+/// meaningless without the turn it pays for, and the turn must not be
+/// billed for anything the meter never agreed to.
+struct Admitted {
+    chunks: Vec<Retrieved>,
+    threshold: f32,
+    reply: ModelReply,
+    confidence_pct: i64,
+    admission: Admission,
+}
+
+impl Admitted {
+    /// What the model turn earns, decided against the tenant's threshold
+    /// and the conversation's clarify count.
+    fn decide(&self, clarifies: u32) -> Decision {
+        let retrieved: Vec<&str> = self
+            .chunks
+            .iter()
+            .map(|hit| hit.chunk.id.as_str())
+            .collect();
+        answer::decide(&self.reply, &retrieved, self.threshold, clarifies)
+    }
+}
+
+/// Steps 3–6 of a turn: check the tenant's quotas, retrieve for the
+/// question on the same BM25 path `GET /search` uses, resolve the tenant's
+/// threshold (else the documented default), ask the model, record what it
+/// cost, and parse the reply, quantizing its confidence to the stored
+/// grain so the decision and the row it writes can never disagree. The
+/// conversation's prior turns ride along as history, an agent's `staff`
+/// replies included.
+///
+/// **The quota check is inside here on purpose.** It is the only place
+/// that knows a model call is about to be paid for, so the meter is read
+/// before the call and never after: a `402` or `429` costs no tokens. It
+/// runs after [`pre_model_turn`]'s own admission check, so a turn that
+/// never reaches a model — a conversation a person holds, a closed one —
+/// is never refused for tokens it was not going to spend.
 async fn model_turn(
     state: &ModuleState,
     scope: &Scope,
@@ -592,7 +625,18 @@ async fn model_turn(
     message: &str,
     lang: Option<&str>,
     conversation: Option<&ConversationRow>,
-) -> Result<(Vec<Retrieved>, f32, ModelReply, i64), TurnFailure> {
+) -> Result<Admitted, TurnFailure> {
+    let clock: &dyn Clock = required_port(state.ctx.ports.clock.as_deref(), "Clock")?;
+    let admission = quota::admit(
+        db,
+        tenant_id,
+        clock.now(),
+        state.daily_token_ceiling,
+        conversation.is_none(),
+        true,
+        &scope.request_id,
+    )
+    .await?;
     let chunks = retrieve(db, tenant_id, message, TOP_K).await?;
     let threshold = store::tenant_threshold_pct(db, tenant_id)
         .await?
@@ -603,13 +647,30 @@ async fn model_turn(
     };
     let prompt = build_prompt(&chunks, message, lang, &history);
     let completion = ask(state.text_model.as_deref(), &prompt, scope).await?;
-    // A reply that is not the schema is a bad gateway, and still nothing
-    // written.
+    // The spend is owed from this instant, so it is recorded here in its
+    // own write rather than in the turn's batch below: a reply the
+    // schema rejects, a takeover that lands before the write, or any
+    // batch rollback must not leave a loop spending unmetered.
+    quota::record_tokens(
+        db,
+        tenant_id,
+        clock.now(),
+        quota::completion_tokens(&completion),
+    )
+    .await?;
+    // A reply that is not the schema is a bad gateway — but the tokens
+    // are already counted above, because they were already spent.
     let mut reply = answer::parse_reply(&completion)
         .map_err(|_| Problem::new(&TEXT_MODEL_BAD_ANSWER).instance(&scope.request_id))?;
     let confidence_pct = answer::confidence_pct(reply.confidence);
     reply.confidence = answer::pct_confidence(confidence_pct);
-    Ok((chunks, threshold, reply, confidence_pct))
+    Ok(Admitted {
+        chunks,
+        threshold,
+        reply,
+        confidence_pct,
+        admission,
+    })
 }
 
 /// Re-reads a conversation's state just before the bot's write: a takeover
@@ -795,14 +856,34 @@ async fn knowledge_turn(
     {
         return store_held_message(state, tenant_id, &current, message, lang, counts).await;
     }
+    // Quotas (issue #20) run here too, and one step later than on the
+    // model path: this turn opens a conversation and so spends the
+    // plan's allowance, but it spent no model tokens — the source
+    // answered on its own — so it is metered as a conversation and
+    // nothing else. The check is here rather than around the caller
+    // because only now is it known that a model would *not* have run:
+    // a source that will not stand behind an answer falls through to
+    // the model path, which admits the turn again on its own terms.
+    let admission = quota::admit(
+        db,
+        tenant_id,
+        clock.now(),
+        state.daily_token_ceiling,
+        conversation.is_none(),
+        false,
+        &scope.request_id,
+    )
+    .await?;
     commit_turn(
         state,
         &state.ctx,
         db,
+        scope,
         &turn,
         None,
         contact,
         scope.defer.clone(),
+        &admission,
     )
     .await?;
 
@@ -854,29 +935,51 @@ async fn resolve_conversation(
 
 /// Commits the turn's one atomic write, then kicks escalation.
 ///
-/// The batch is the turn's own statements plus, when `transcript` is
-/// `Some` (an escalating turn with a [`HandoffSink`](crate::HandoffSink)
-/// composed), the sink's for that transcript, and, when `contact` is
-/// `Some`, the sink's remembering that address — so the "escalated" answer,
-/// the ticket behind it and the stored contact commit or roll back
-/// together. The kick runs only *after* the commit: a failure there costs a
+/// The batch is the turn's own statements, the quota meter's spend for
+/// them (issue #20), and, when `transcript` is `Some` (an escalating turn
+/// with a [`HandoffSink`](crate::HandoffSink) composed), the sink's for
+/// that transcript, and, when `contact` is `Some`, the sink's remembering
+/// that address — so the "escalated" answer, what it was billed for, the
+/// ticket behind it and the stored contact commit or roll back together.
+/// The kick runs only *after* the commit: a failure there costs a
 /// delay (the scheduled drain is the backstop), never the ticket the batch
 /// just wrote.
+///
+/// A batch failure that was the **meter's** guard refusing is answered
+/// with the same `402` [`quota::admit`] would have returned: a concurrent
+/// turn took the last conversation slot between the check and this write,
+/// so the turn neither happened nor may be billed for. Every other
+/// failure stays the `500` it was — a quota answer for a broken database
+/// would misreport why the turn did not happen.
 ///
 /// Extracted from [`run_turn`] to keep the turn's ordering readable
 /// as one numbered sequence without the handler tripping the function
 /// length lint.
+#[allow(clippy::too_many_arguments)]
 async fn commit_turn(
     state: &ModuleState,
     ctx: &ModuleContext,
     db: &dyn Database,
+    scope: &Scope,
     turn: &store::Turn,
     transcript: Option<&str>,
     contact: Option<&str>,
     defer: Arc<dyn Defer>,
+    admission: &Admission,
 ) -> Result<(), Problem> {
-    db.batch_atomic(&turn_batch(state, turn, transcript, contact))
-        .await?;
+    let batch = turn_batch(state, turn, transcript, contact, admission);
+    if let Err(err) = db.batch_atomic(&batch).await {
+        // The guard refusing the batch is a quota answer, not a
+        // database failure; anything else — including a re-read that
+        // itself fails — is the error that really happened.
+        if let Some(problem) = admission
+            .refusal_after_failure(db, &turn.tenant_id, &scope.request_id)
+            .await
+        {
+            return Err(problem);
+        }
+        return Err(err.into());
+    }
     if transcript.is_some()
         && let Some(sink) = state.handoff.as_deref()
     {

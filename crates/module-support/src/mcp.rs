@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 
 use crate::handlers::{self, ModuleState};
 use crate::messages::{self, MessageBody, TurnFailure};
+use crate::quota;
 use crate::store;
 
 /// The MCP revision this server answers with when the client requests one
@@ -317,13 +318,31 @@ async fn escalate(
                 let clock = handlers::required_port(ctx.ports.clock.as_deref(), "Clock")
                     .map_err(|_| "no clock is configured".to_owned())?;
                 let id = id_gen.ulid();
+                let now = clock.now();
                 // A transcript with no conversation behind it still needs a
                 // conversation row: the ticket carries a conversation id,
                 // and `get_ticket` hands it back. Opened `escalated` — it
                 // exists only to carry this handoff.
                 let opened =
                     store::open_conversation_stmt(tenant_id, &id, true, &store::iso_now(clock));
-                (id, transcript.to_owned(), vec![opened])
+                // …and it is a conversation like any other, so it spends
+                // the plan's monthly allowance (issue #20). The tool spends
+                // no model tokens, so it is admitted on the conversation
+                // meter alone.
+                let admission = quota::admit(
+                    db,
+                    tenant_id,
+                    now,
+                    state.daily_token_ceiling,
+                    true,
+                    false,
+                    &scope.request_id,
+                )
+                .await
+                .map_err(turn_failure_message)?;
+                let mut statements = vec![opened];
+                statements.extend(admission.statements(tenant_id));
+                (id, transcript.to_owned(), statements)
             }
             _ => {
                 return Err(
