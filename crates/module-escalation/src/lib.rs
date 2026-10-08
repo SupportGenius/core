@@ -6,14 +6,16 @@
 //! [`Pipeline`] is the durable stage runner (one port call and one
 //! all-or-nothing commit per stage, an inbox claim per `ticket:stage`, a
 //! bounded [`RetryPolicy`]); [`Escalation`] wires it into the [`Module`]
-//! contract. The HTTP surface is two route groups under
+//! contract. The HTTP surface is three route groups under
 //! `/v1/escalation`: the `destinations` module (issue #23), where a tenant
 //! — or an operator acting for one — names the tracker its escalations
 //! file into and the credential to file with (validated once and stored
 //! envelope-encrypted through `cratefield-secrets` under a KMS resolved
-//! from config, `secrets::kms_from_config`); and the `tickets` module
+//! from config, `secrets::kms_from_config`); the `tickets` module
 //! (issue #24, part 2), where a tenant lists, reads and closes the
-//! built-in tickets the file stage kept in the module itself.
+//! built-in tickets the file stage kept in the module itself; and the
+//! `reports` module (issue #65), where an application files errors and
+//! bugs that deduplicate into tracker issues.
 
 #![forbid(unsafe_code)]
 
@@ -21,6 +23,8 @@ mod destinations;
 mod health;
 mod observe;
 mod pipeline;
+mod redact;
+mod reports;
 mod router;
 mod secrets;
 mod tenants;
@@ -95,6 +99,18 @@ pub const MIGRATION_DRAIN: SqlMigration = SqlMigration::new(
     "0009",
     "observability",
     include_str!("../migrations/sqlite/0009_observability.sql"),
+);
+
+/// Error and bug intake (issue #65): the `sg_report_groups` deduplication
+/// key, the `sg_reports` intake audit, and the `sg_report_budget` hourly
+/// write cap. Appended on the same terms as [`MIGRATION_DRAIN`]: the id
+/// picks up where the collected-and-locked history left off (it was
+/// authored as `0009` against a main without the observability migration;
+/// `0010` keeps the append-only rule once `0009` was taken).
+pub const MIGRATION_REPORTS: SqlMigration = SqlMigration::new(
+    "0010",
+    "reports",
+    include_str!("../migrations/sqlite/0010_reports.sql"),
 );
 
 /// One `cratefield-secrets` migration under this module's own id,
@@ -278,6 +294,9 @@ impl Module for Escalation {
             "sg_destinations",
             "sg_routes",
             "sg_contacts",
+            "sg_report_groups",
+            "sg_reports",
+            "sg_report_budget",
             "sg_escalation_outbox",
             "sg_escalation_inbox",
             "harness_secret_keys",
@@ -300,6 +319,10 @@ impl Module for Escalation {
     /// The embedded secrets tables declare `none` for the same reason the
     /// harness's own dashboard does: they are keyed to a store and a name,
     /// never to a person.
+    // One flat `const` list, one entry per owned table; it outgrew clippy's
+    // 100-line default with the report-intake tables (issue #65) and reads
+    // better in one piece than split across a const fn.
+    #[allow(clippy::too_many_lines)]
     fn personal_data(&self) -> &'static [PersonalDataSet] {
         const SETS: &[PersonalDataSet] = &[
             PersonalDataSet {
@@ -380,6 +403,34 @@ impl Module for Escalation {
                  (defect, support case, lead) is filed and a *reference* (never the value) to \
                  the credential, keyed to the tenant and the kind, not to any person.",
             ),
+            // Issue #65. The intake audit is keyed by a row id a caller
+            // never sees and holds no free text at all — the message, the
+            // frames and the bug description are scrubbed on the way in and
+            // live only in the tracker issue. So nothing in `sg_reports`
+            // names a person, and its `contact` is not a column: a bug
+            // report's contact address is redacted before it is ever filed.
+            PersonalDataSet::none(
+                "sg_reports",
+                "The audit of reports your application and users sent: a row id, the report's \
+                 kind, the grouping key, its release and what became of it. No message, stack \
+                 frame or description is kept here — those are scrubbed and live in the tracker \
+                 issue only.",
+            ),
+            // Same answer: a deduplication group is a tenant's own defect
+            // counting its own reports. The `title` is the scrubbed error
+            // type and message the tenant already filed into their own
+            // tracker, and the row is keyed to the tenant.
+            PersonalDataSet::none(
+                "sg_report_groups",
+                "One of your application's errors, how many reports of it have arrived, and the \
+                 tracker issue they all filed into.",
+            ),
+            // The hourly write cap: a counter and a timestamp per tenant.
+            PersonalDataSet::none(
+                "sg_report_budget",
+                "How many tracker writes your tenant has spent this hour under the report rate \
+                 cap, and when the spike was announced: a count and two timestamps.",
+            ),
             // Not `none`: the key embeds the ticket id, which is the
             // subject value — but as `<ticket_id>:<stage>`, so a plain
             // column equality cannot match it and erasure cannot reach it.
@@ -431,14 +482,14 @@ impl Module for Escalation {
     /// crate's own `SQLITE_MIGRATIONS`/`POSTGRES_MIGRATIONS` and re-id-ed
     /// (the `control-plane-dashboard` idiom) so the embedded copy cannot
     /// drift. The module files are portable SQL, so the postgres set carries
-    /// the same bytes for ids `0001`, `0002`, `0007` and `0008`, but the
-    /// secrets schema is not (BLOB vs BYTEA, per-engine triggers), so each set
-    /// embeds its own dialect's. `0007` and `0008` are appended after the
+    /// the same bytes for ids `0001`, `0002` and `0007` through `0010`, but
+    /// the secrets schema is not (BLOB vs BYTEA, per-engine triggers), so each set
+    /// embeds its own dialect's. `0007` through `0010` are appended after the
     /// secrets schema rather than inserted before it: the intermediate files
     /// are already collected and locked by sha256 (see [`MIGRATION_FOLLOW`]).
     /// The postgres set must be complete: `select_set` applies it wholesale.
     fn migrations(&self) -> Migrations {
-        const SQLITE: [SqlMigration; 9] = [
+        const SQLITE: [SqlMigration; 10] = [
             MIGRATION_ESCALATION,
             MIGRATION_DUPLICATES,
             sub_migration(
@@ -468,11 +519,12 @@ impl Module for Escalation {
             MIGRATION_ROUTING,
             MIGRATION_FOLLOW,
             MIGRATION_DRAIN,
+            MIGRATION_REPORTS,
         ];
         // The array is the apply order; this refuses a gap, a duplicate
         // or an entry out of order at build time.
         const _: () = cratefield_core::assert_migration_set(&SQLITE);
-        const POSTGRES: [SqlMigration; 9] = [
+        const POSTGRES: [SqlMigration; 10] = [
             MIGRATION_ESCALATION,
             MIGRATION_DUPLICATES,
             sub_migration(
@@ -502,6 +554,7 @@ impl Module for Escalation {
             MIGRATION_ROUTING,
             MIGRATION_FOLLOW,
             MIGRATION_DRAIN,
+            MIGRATION_REPORTS,
         ];
         const _: () = cratefield_core::assert_migration_set(&POSTGRES);
         Migrations {
@@ -551,31 +604,35 @@ impl Module for Escalation {
     }
 
     /// The module's HTTP surface: the destination routes (issue #23), the
-    /// built-in ticketing routes (issue #24, part 2) and the pipeline
-    /// health route (issue #39), mounted under
+    /// built-in ticketing routes (issue #24, part 2), the pipeline health
+    /// route (issue #39) and the report intake (issue #65), mounted under
     /// the same `/v1/escalation` prefix. Auth runs before the body is
     /// parsed: the tenant mounts check the `sg_…` API key, the destination
     /// and health admin mounts the harness admin token, and only then does a
     /// handler read its payload — a `Json<T>` extractor would answer a
     /// malformed body to an unauthenticated caller. The KMS the credential
-    /// store is built over is resolved from config once, here. Both tenant
+    /// store is built over is resolved from config once, here. All tenant
     /// surfaces share the tenant directory, so a suspended tenant is refused
-    /// identically on either.
+    /// identically on any of them.
     fn router(&self, ctx: ModuleContext) -> axum::Router {
         let ctx = Arc::new(ctx);
         let kms = secrets::kms_from_config(&*ctx.config);
         destinations::router(Arc::clone(&ctx), kms, self.tenants.clone())
             .merge(tickets::router(Arc::clone(&ctx), self.tenants.clone()))
+            .merge(reports::router(Arc::clone(&ctx), self.tenants.clone()))
             .merge(health::router(ctx))
     }
 
-    /// The destination routes plus the pipeline health route, declared
+    /// The destination, ticketing, health and report routes, declared
     /// (ADR 0010). The composition also
     /// injects this surface into `module-support`'s `OpenAPI` document
     /// (issue #34), so one document describes both `/v1/support/*` and
     /// `/v1/escalation/*`.
     fn surface(&self) -> cratefield_core::Surface {
         let mut surface = destinations::surface();
+        let reports = reports::surface();
+        surface.actions.extend(reports.actions);
+        surface.views.extend(reports.views);
         surface.actions.extend(health::surface().actions);
         surface
     }
@@ -751,13 +808,13 @@ mod tests {
         // cron drainer does not.
         assert!(module.optional().contains(&Port::Signer));
         let tables = module.tables();
-        assert_eq!(tables.len(), 12);
+        assert_eq!(tables.len(), 15);
         let sg: Vec<&str> = tables
             .iter()
             .copied()
             .filter(|table| table.starts_with("sg_"))
             .collect();
-        assert_eq!(sg.len(), 9, "the module owns nine sg_ tables");
+        assert_eq!(sg.len(), 12, "the module owns twelve sg_ tables");
         let harness: Vec<&str> = tables
             .iter()
             .copied()
@@ -786,7 +843,7 @@ mod tests {
     #[test]
     fn the_migration_set_is_the_module_files_then_the_embedded_secrets_schema() {
         let migrations = module().migrations();
-        assert_eq!(migrations.sqlite.len(), 9);
+        assert_eq!(migrations.sqlite.len(), 10);
         assert_eq!(
             migrations
                 .sqlite
@@ -794,7 +851,7 @@ mod tests {
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
             [
-                "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009"
+                "0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010"
             ]
         );
         assert!(migrations.sqlite[0].sql.contains("CREATE TABLE"));
@@ -809,18 +866,22 @@ mod tests {
         // The follow migration is appended after the secrets schema and
         // carries the module's own portable bytes.
         assert!(migrations.sqlite[7].sql.contains("sg_contacts"));
-        // The observability migration is appended last and carries the
-        // module's own portable bytes.
+        // The observability migration is appended after the follow
+        // migration and carries the module's own portable bytes.
         assert!(migrations.sqlite[8].sql.contains("sg_escalation_drain"));
+        // The reports migration is appended on the same terms and is
+        // portable SQL: one file feeds both sets.
+        assert!(migrations.sqlite[9].sql.contains("sg_report_groups"));
         // The postgres set is complete (select_set applies it wholesale),
-        // carrying the same portable module files for 0001-0002, 0007-0009
+        // carrying the same portable module files for 0001-0002, 0007-0010
         // and the secrets crate's own postgres bytes thereafter.
-        assert_eq!(migrations.postgres.len(), 9);
+        assert_eq!(migrations.postgres.len(), 10);
         assert_eq!(migrations.postgres[0].sql, migrations.sqlite[0].sql);
         assert_eq!(migrations.postgres[1].sql, migrations.sqlite[1].sql);
         assert_eq!(migrations.postgres[6].sql, migrations.sqlite[6].sql);
         assert_eq!(migrations.postgres[7].sql, migrations.sqlite[7].sql);
         assert_eq!(migrations.postgres[8].sql, migrations.sqlite[8].sql);
+        assert_eq!(migrations.postgres[9].sql, migrations.sqlite[9].sql);
         assert_eq!(
             migrations.postgres[2].sql,
             cratefield_secrets::POSTGRES_MIGRATIONS[0].sql
