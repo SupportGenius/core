@@ -71,6 +71,10 @@
     "file": "0024_support_0010_analytics.sql",
     "sha256": "7a1e97c3d2cbfa088cef90a533adf42fbc7f673dd7b7d80bb3cddf0b1f487017"
   },
+  "support/0011": {
+    "file": "0025_support_0011_quotas.sql",
+    "sha256": "78e497ccdd4555b2ee4963584e519b4b188b29f81a66208a3712098c94d365c0"
+  },
   "waitlist/0001": {
     "file": "0001_waitlist_0001_init.sql",
     "sha256": "504c3e013f921975e286b27f6253ac5f2b9f884bf2b89f6d077c4931760c54ea"

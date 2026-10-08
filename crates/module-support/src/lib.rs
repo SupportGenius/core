@@ -92,6 +92,7 @@ mod knowledge;
 pub mod mcp;
 mod messages;
 mod openapi;
+mod quota;
 pub mod store;
 mod uploads;
 mod widget;
@@ -258,6 +259,18 @@ const MIGRATION_ANALYTICS: SqlMigration = SqlMigration::new(
     include_str!("../migrations/sqlite/0010_analytics.sql"),
 );
 
+/// Per-tenant quotas and usage metering (issue #20): `sg_plans` and the
+/// per-tenant `sg_tenant_plan` (admin-set by SQL, with no route in this
+/// change), and `sg_usage` — the meter, whose DDL inside the migration
+/// is `cratefield_core::Usage::new("sg_usage").create_table_sql()`
+/// verbatim, the guarded upsert the module appends to a turn's own
+/// atomic batch binds by those column names.
+const MIGRATION_QUOTAS: SqlMigration = SqlMigration::new(
+    "0011",
+    "quotas",
+    include_str!("../migrations/sqlite/0011_quotas.sql"),
+);
+
 /// The support module: tenant provisioning behind the harness admin
 /// token, API-key-authenticated source ingest, BM25 search and grounded
 /// answers, the cron-driven connectors that keep a workspace's index
@@ -320,6 +333,16 @@ pub struct Support {
     /// the unwired module: the route answers `404` and the widget's
     /// footer simply does not render.
     built_with: Option<String>,
+    /// How many model tokens a tenant may spend in one UTC day when its
+    /// own `sg_tenant_plan` row names no ceiling (issue #20). A builder
+    /// setting rather than module configuration because it is a
+    /// *deployment's* answer to "how much does an unplanned tenant
+    /// spend", the same shape as the other seams here — and because the
+    /// per-tenant override, which is what a support engineer actually
+    /// tunes, is data (`sg_tenant_plan.daily_token_ceiling`).
+    /// `None` — what `Support::default()` and `Support::new()` leave —
+    /// is [`quota::DEFAULT_DAILY_TOKEN_CEILING`].
+    daily_token_ceiling: Option<u64>,
 }
 
 impl Support {
@@ -336,7 +359,25 @@ impl Support {
             visitor_rate_limiter: None,
             api_surfaces: Vec::new(),
             built_with: None,
+            daily_token_ceiling: None,
         }
+    }
+
+    /// A `Support` that stops a tenant at `tokens` model tokens per UTC
+    /// day when that tenant's own `sg_tenant_plan` row names no ceiling
+    /// (issue #20). A tenant that *has* a ceiling keeps it — this is the
+    /// floor for the tenants nobody planned, not an override of the
+    /// ones somebody did.
+    ///
+    /// A builder setter because the value is a deployment's answer to
+    /// "what may an unplanned tenant spend", which is the same shape as
+    /// the other seams on this struct; the per-tenant override, which is
+    /// the knob a support engineer actually reaches for when a customer
+    /// is looping, is data rather than configuration and is set in SQL.
+    #[must_use]
+    pub fn with_daily_token_ceiling(mut self, tokens: u64) -> Self {
+        self.daily_token_ceiling = Some(tokens);
+        self
     }
 
     /// Adds another module's `surface` to the `OpenAPI` document this module
@@ -484,6 +525,10 @@ impl Module for Support {
         ]
     }
 
+    /// Three more tables than a retrieval core needs, all from the
+    /// quota meters (issue #20): the plan catalog a tenant is pointed
+    /// at, the tenant's own plan row and token ceiling, and the usage
+    /// counter both meters are measured against.
     fn tables(&self) -> &'static [&'static str] {
         &[
             "sg_tenants",
@@ -505,6 +550,9 @@ impl Module for Support {
             "sg_daily_stats",
             "sg_daily_gaps",
             "sg_daily_citations",
+            "sg_plans",
+            "sg_tenant_plan",
+            "sg_usage",
         ]
     }
 
@@ -566,7 +614,7 @@ impl Module for Support {
     }
 
     fn migrations(&self) -> Migrations {
-        const MIGRATIONS: [SqlMigration; 10] = [
+        const MIGRATIONS: [SqlMigration; 11] = [
             MIGRATION_INIT,
             MIGRATION_CONVERSATIONS,
             MIGRATION_SOURCE_MANAGEMENT,
@@ -577,6 +625,7 @@ impl Module for Support {
             MIGRATION_WIDGET_SETTINGS,
             MIGRATION_HUMAN_HANDOFF,
             MIGRATION_ANALYTICS,
+            MIGRATION_QUOTAS,
         ];
         // Refuses a gap, a duplicate or an out-of-order id at compile
         // time.
@@ -656,6 +705,8 @@ impl Module for Support {
             visitor_rate_limiter,
             self.api_surfaces.clone(),
             self.built_with.clone(),
+            self.daily_token_ceiling
+                .unwrap_or(quota::DEFAULT_DAILY_TOKEN_CEILING),
         )
     }
 
@@ -917,6 +968,25 @@ const PERSONAL_DATA: &[PersonalDataSet] = &[
         "One rolled-up day per workspace and source: how many times that source's \
              passages were cited by the day's answers. Two ids and a count; nothing \
              here names a person.",
+    ),
+    PersonalDataSet::none(
+        "sg_plans",
+        "The plan catalog an operator maintains: a plan id, a display name, its \
+             allowances and when each was set. Configuration about what a workspace may \
+             spend, not about anyone in it.",
+    ),
+    PersonalDataSet::none(
+        "sg_tenant_plan",
+        "Which plan one workspace is on, and the ceiling it set on its own daily model \
+             tokens: a plan id, a token count and a timestamp. One row per workspace; \
+             numbers about spend, nothing that names a person.",
+    ),
+    PersonalDataSet::none(
+        "sg_usage",
+        "The workspace's metered counters: per month, how many conversations it opened; \
+             per UTC day, how many model tokens its turns cost. A workspace id, a meter \
+             name, a window start and a total — the counters billing reads, with no \
+             column identifying a person.",
     ),
 ];
 

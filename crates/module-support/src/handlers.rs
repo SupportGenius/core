@@ -134,12 +134,20 @@ pub(crate) struct ModuleState {
     /// nothing composed: the route answers `404` and the widget renders
     /// no footer.
     pub built_with: Option<String>,
+    /// The daily model-token ceiling a tenant with no `sg_tenant_plan`
+    /// row of its own is held to (issue #20, `crate::quota`). A tenant
+    /// that named a ceiling in its own row keeps it; this is the floor
+    /// for the tenants nobody planned.
+    pub daily_token_ceiling: u64,
 }
 
 /// Builds the module's router. `api_surfaces` are other modules' surfaces
 /// the composition injected for the `OpenAPI` document (module-support
 /// cannot depend on them), each paired with the module name its paths
 /// mount under.
+// One flat builder-to-state wiring per field, the shape the
+// composition hands over.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn router(
     ctx: Arc<ModuleContext>,
     text_model: Option<Arc<dyn TextModel>>,
@@ -148,6 +156,7 @@ pub(crate) fn router(
     visitor_rate_limiter: Option<Arc<dyn RateLimiter>>,
     api_surfaces: Vec<(String, Surface)>,
     built_with: Option<String>,
+    daily_token_ceiling: u64,
 ) -> axum::Router {
     let mut modules = vec![(crate::MODULE_NAME.to_owned(), surface())];
     modules.extend(api_surfaces);
@@ -160,6 +169,7 @@ pub(crate) fn router(
         visitor_rate_limiter,
         openapi: document,
         built_with,
+        daily_token_ceiling,
     });
     axum::Router::new()
         .route("/admin/tenants", post(create_tenant))
