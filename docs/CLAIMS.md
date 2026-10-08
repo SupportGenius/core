@@ -27,6 +27,7 @@ part of the capability has landed; **planned** = an open issue, no code.
 | Lifecycle: follow the ticket, tell the customer | `planned` | in progress | issue #26, PR #70 open |
 | File ingestion: uploads, PDF text | `planned` | in progress | issue #30, PR #51 (part) |
 | Built with: what it is built on (Factory Zero registry FZ-008) | (implied) | in progress | issue #66, PR open |
+| Error and bug intake: deduped, redacted error reports filed as tracker issues (`POST /v1/escalation/reports`) | (implied) | in progress | issue #65, PR open |
 | Analytics: deflection and escalation metrics | `planned` | planned | issue #36 |
 | Living Brain as a knowledge source | `planned` | planned | issue #64 |
 | Pricing tiers, quotas and billing hooks | `planned` | planned | issue #20 |

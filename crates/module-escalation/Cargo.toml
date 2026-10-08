@@ -66,6 +66,10 @@ async-trait = { workspace = true }
 lexical = { path = "../lexical" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The reports route groups errors by a server-computed fingerprint (issue
+# #65), which is a sha256 over the error's type and top frames. wasm-safe
+# and already in the lock through cratefield-secrets.
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 # The `Tracker` adapters `connectors::routing_tracker` registers. Optional
 # and feature-gated (see `[features]`); the pin is the workspace's one
@@ -85,10 +89,12 @@ time = { version = "0.3.45", default-features = false, features = [
     "std",
     "formatting",
     # The health route parses the RFC 3339 stamps the pipeline wrote so it
-    # can report how long a queued row has been waiting (issue #39). It
-    # does the arithmetic in Rust on purpose: date arithmetic in SQL
-    # (`julianday`, `EXTRACT`) is the dialect-specific surface ADR 0004
-    # forbids. Feature-only, so the lock is unchanged.
+    # can report how long a queued row has been waiting (issue #39), and
+    # the reports retention sweep parses the stored instant back to name
+    # its cut-off (issue #65). It does the arithmetic in Rust on purpose:
+    # date arithmetic in SQL (`julianday`, `EXTRACT`) is the
+    # dialect-specific surface ADR 0004 forbids. Feature-only, so the lock
+    # is unchanged.
     "parsing",
 ] }
 
