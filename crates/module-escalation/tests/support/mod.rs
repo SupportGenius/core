@@ -237,6 +237,7 @@ pub(crate) fn migrated_db() -> Arc<SqliteDatabase> {
             module_escalation::MIGRATION_DUPLICATES,
             module_escalation::MIGRATION_ROUTING,
             module_escalation::MIGRATION_FOLLOW,
+            module_escalation::MIGRATION_DRAIN,
         ],
     )
     .expect("migration applies");

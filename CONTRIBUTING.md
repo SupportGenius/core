@@ -28,3 +28,4 @@ capability ships" step. That keeps every `planned` chip mapped to a real issue.
 
 - [docs/RELEASING.md](docs/RELEASING.md) — how a release is cut and deployed.
 - [docs/SELF-HOSTING.md](docs/SELF-HOSTING.md) — running the static binary.
+- [docs/OPERATIONS.md](docs/OPERATIONS.md) — the escalation pipeline's events, `GET /v1/escalation/admin/health`, and the alert thresholds they feed.

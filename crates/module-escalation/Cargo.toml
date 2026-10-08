@@ -84,6 +84,12 @@ sea-query = { version = "0.32.7", default-features = false, features = [
 time = { version = "0.3.45", default-features = false, features = [
     "std",
     "formatting",
+    # The health route parses the RFC 3339 stamps the pipeline wrote so it
+    # can report how long a queued row has been waiting (issue #39). It
+    # does the arithmetic in Rust on purpose: date arithmetic in SQL
+    # (`julianday`, `EXTRACT`) is the dialect-specific surface ADR 0004
+    # forbids. Feature-only, so the lock is unchanged.
+    "parsing",
 ] }
 
 [dev-dependencies]
@@ -114,6 +120,15 @@ cratefield-adapter-sqlite = { workspace = true }
 # it (the path the issue names), and `FakeMailer` is the wired-mailer
 # side of the notify stage's `no_recipient` pin.
 cratefield-testing = { workspace = true }
+# Captures the `model.call` and `pipeline.stage` spans in the issue #39
+# tests. `registry` alone, with no `fmt`: the assertions read fields by
+# name rather than parsing rendered text back out of a string. Already in
+# the lock through cratefield-runtime-native, so this adds a dependency
+# edge and no new package.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = [
+    "registry",
+    "std",
+] }
 # The destinations routes' acceptance tests mint a tenant key with the
 # harness's own `Signer` through `tenancy::mint` — the same call
 # `module-support`'s admin route makes — so no second module has to be

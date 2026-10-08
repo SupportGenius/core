@@ -39,6 +39,7 @@ use lexical::{bm25, tokenize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use tracing::Instrument;
 
 use crate::error::Error;
 use crate::intake::OUTBOX_TABLE;
@@ -46,6 +47,7 @@ use crate::model::{
     Drafted, EventKind, Judgment, Kind, Stage, StagePayload, Status, Ticket, Verdict, stage_seq,
     webhook_events,
 };
+use crate::observe::{ModelCall, StageResult, StageRun};
 use crate::router::OwnerRouter;
 use crate::store;
 
@@ -367,6 +369,11 @@ impl Pipeline {
             self.process_record(&record).await?;
             processed += 1;
         }
+        // Stamped only once the whole sweep is behind us, so the row means
+        // "the last drain finished", not "a drain started": a sweep that
+        // dies half way leaves the previous stamp alone.
+        self.commit(&[store::record_drain_stmt(&rfc3339(self.now()))])
+            .await?;
         Ok(processed)
     }
 
@@ -374,6 +381,39 @@ impl Pipeline {
     /// recorded durably (retry, dead-letter or plain retirement), so the
     /// only errors that escape are database failures.
     async fn process_record(&self, record: &OutboxRecord) -> Result<(), Error> {
+        // The one span per outbox record an operator queries to answer "is
+        // the pipeline moving?" (issue #39). Opened before the routing
+        // decision so a record that never reaches a stage still reports.
+        // Instrumented rather than entered: `Span::enter`'s guard is
+        // `!Send`, and holding one across the stage's own `.await`s would
+        // make every future here `!Send`.
+        let run = StageRun::start(&record.topic, record.attempts + 1);
+        let result = self
+            .process_record_inner(record, &run)
+            .instrument(run.span().clone())
+            .await;
+        // The one settle every path reaches. `settle` is first-write-wins,
+        // so a handler that already reported its own outcome (retry,
+        // dead-letter, skip, reschedule) keeps it and this is a no-op; a
+        // bare `?` that escaped with the database down — the claim, a
+        // commit, a read — has reported nothing, and a stage span that
+        // closes with no `result` and no event is a record the operator
+        // cannot account for.
+        if result.is_ok() {
+            run.settle(StageResult::Done);
+        } else {
+            run.settle(StageResult::Aborted);
+        }
+        result
+    }
+
+    /// The body of [`Pipeline::process_record`], split out so the span
+    /// the outer method opened stays open across every branch.
+    async fn process_record_inner(
+        &self,
+        record: &OutboxRecord,
+        run: &StageRun,
+    ) -> Result<(), Error> {
         let now = self.now();
         let at = rfc3339(now);
 
@@ -381,6 +421,8 @@ impl Pipeline {
         //    different version of this pipeline; nothing will ever route
         //    it, so it must not sit in the queue retrying forever.
         let Some(stage) = Stage::from_topic(&record.topic) else {
+            // Retired, not retried: nothing will ever route this topic.
+            run.settle(StageResult::DeadLetter);
             return self.retire_unknown_topic(record, &at).await;
         };
 
@@ -389,8 +431,12 @@ impl Pipeline {
         //    is exactly what an audit row would need — so the row is
         //    simply retired.
         let Ok(payload) = serde_json::from_str::<StagePayload>(&record.payload) else {
+            run.settle(StageResult::Skipped);
             return self.complete_row(&record.id).await;
         };
+        // The span opened before the decode, so this is where the
+        // pseudonym finally has something to hash.
+        run.name_tenant(&payload.tenant_id);
 
         // 3. Claim `ticket:stage`. First sight proceeds; a held key needs
         //    the ticket's progress to say which of two worlds this is.
@@ -429,6 +475,7 @@ impl Pipeline {
                         event_id,
                         err,
                         &at,
+                        run,
                     )
                     .await;
             }
@@ -440,6 +487,7 @@ impl Pipeline {
             // the terminal miss (an audit row survives on its own id and
             // the status update is a harmless no-op).
             if stage == Stage::Follow {
+                run.settle(StageResult::Skipped);
                 return self.complete_row(&record.id).await;
             }
             let err = Error::Decode(format!("ticket `{}` is missing", payload.ticket_id));
@@ -452,6 +500,7 @@ impl Pipeline {
                     event_id,
                     err,
                     &at,
+                    run,
                 )
                 .await;
         };
@@ -470,16 +519,19 @@ impl Pipeline {
         // status-update notify is exempt: its key is unique per event, so
         // a held key cannot mean "already committed".
         if !claimed && event_id.is_none() && stage_already_committed(&ticket, stage) {
+            run.settle(StageResult::Skipped);
             return self.complete_row(&record.id).await;
         }
 
-        // 5-6. One port call, then one all-or-nothing batch.
+        // 5-6. One port call, then one all-or-nothing batch. Each handler
+        //      settles the span on the paths that are not its own success;
+        //      `process_record` settles `done` for those that are.
         match stage {
-            Stage::Draft => self.run_draft(record, &ticket, &at).await,
-            Stage::Judge => self.run_judge(record, &ticket, &at).await,
-            Stage::File => self.run_file(record, &ticket, &at).await,
-            Stage::Notify => self.run_notify(record, &ticket, event_id, &at).await,
-            Stage::Follow => self.run_follow(record, &ticket, &at).await,
+            Stage::Draft => self.run_draft(record, &ticket, &at, run).await,
+            Stage::Judge => self.run_judge(record, &ticket, &at, run).await,
+            Stage::File => self.run_file(record, &ticket, &at, run).await,
+            Stage::Notify => self.run_notify(record, &ticket, event_id, &at, run).await,
+            Stage::Follow => self.run_follow(record, &ticket, &at, run).await,
         }
     }
 
@@ -495,6 +547,7 @@ impl Pipeline {
         record: &OutboxRecord,
         ticket: &Ticket,
         at: &str,
+        run: &StageRun,
     ) -> Result<(), Error> {
         // The transcript is customer-authored text: it may carry an email
         // address, a signed link, a bearer token. `scrub_text` redacts those
@@ -505,9 +558,19 @@ impl Pipeline {
             .user(scrub_text(&ticket.transcript))
             .json_schema(Drafted::json_schema());
 
-        let completion = match self.model.complete(&prompt).await {
-            Ok(completion) => completion,
+        let mut call = ModelCall::start(ModelTier::Fast, &ticket.tenant_id, self.now());
+        let answered = self
+            .model
+            .complete(&prompt)
+            .instrument(call.span().clone())
+            .await;
+        let completion = match answered {
+            Ok(completion) => {
+                call.answered(&completion);
+                completion
+            }
             Err(err) => {
+                call.finish(self.now(), "error");
                 return self
                     .fail(
                         record,
@@ -517,6 +580,7 @@ impl Pipeline {
                         None,
                         Error::from(err),
                         at,
+                        run,
                     )
                     .await;
             }
@@ -524,6 +588,9 @@ impl Pipeline {
         // `Completion::json` first; a provider that cannot honour the
         // schema answers with text and `json: None`, and text that does
         // not parse is a terminal failure, not a retry.
+        // The provider answered, so the call is `ok` whether or not the
+        // bytes decode: it cost tokens and returned text either way.
+        call.finish(self.now(), "ok");
         let drafted = match decode_completion::<Drafted>(&completion) {
             Ok(drafted) => drafted,
             Err(err) => {
@@ -536,6 +603,7 @@ impl Pipeline {
                         None,
                         err,
                         at,
+                        run,
                     )
                     .await;
             }
@@ -679,6 +747,7 @@ impl Pipeline {
         record: &OutboxRecord,
         ticket: &Ticket,
         at: &str,
+        run: &StageRun,
     ) -> Result<(), Error> {
         let candidates = self.candidates(ticket).await?;
         let prompt = Prompt::new(ModelTier::Strong)
@@ -686,9 +755,19 @@ impl Pipeline {
             .user(judge_brief(ticket, &candidates))
             .json_schema(Judgment::json_schema());
 
-        let completion = match self.model.complete(&prompt).await {
-            Ok(completion) => completion,
+        let mut call = ModelCall::start(ModelTier::Strong, &ticket.tenant_id, self.now());
+        let answered = self
+            .model
+            .complete(&prompt)
+            .instrument(call.span().clone())
+            .await;
+        let completion = match answered {
+            Ok(completion) => {
+                call.answered(&completion);
+                completion
+            }
             Err(err) => {
+                call.finish(self.now(), "error");
                 return self
                     .fail(
                         record,
@@ -698,10 +777,12 @@ impl Pipeline {
                         None,
                         Error::from(err),
                         at,
+                        run,
                     )
                     .await;
             }
         };
+        call.finish(self.now(), "ok");
         let judgment = match decode_completion::<Judgment>(&completion) {
             Ok(judgment) => judgment,
             Err(err) => {
@@ -714,6 +795,7 @@ impl Pipeline {
                         None,
                         err,
                         at,
+                        run,
                     )
                     .await;
             }
@@ -1143,6 +1225,7 @@ impl Pipeline {
         record: &OutboxRecord,
         ticket: &Ticket,
         at: &str,
+        run: &StageRun,
     ) -> Result<(), Error> {
         match self.file_ticket(ticket).await {
             Ok(outcome) => {
@@ -1244,6 +1327,7 @@ impl Pipeline {
                     None,
                     err,
                     at,
+                    run,
                 )
                 .await
             }
@@ -1501,6 +1585,7 @@ impl Pipeline {
         ticket: &Ticket,
         event_id: Option<&str>,
         at: &str,
+        run: &StageRun,
     ) -> Result<(), Error> {
         // The message and its idempotency key depend on which shape this
         // is. A status update needs the event's `to` state, a database
@@ -1570,6 +1655,7 @@ impl Pipeline {
                                 event_id,
                                 Error::from(err),
                                 at,
+                                run,
                             )
                             .await;
                     }
@@ -1672,6 +1758,7 @@ impl Pipeline {
         record: &OutboxRecord,
         ticket: &Ticket,
         at: &str,
+        run: &StageRun,
     ) -> Result<(), Error> {
         let now = self.now();
 
@@ -1679,6 +1766,7 @@ impl Pipeline {
         // happen for a row the file stage enqueued (it records the external
         // id first), but a defensive complete beats polling forever.
         let Some(external_id) = ticket.external_id.clone() else {
+            run.settle(StageResult::Skipped);
             return self.complete_row(&record.id).await;
         };
 
@@ -1691,6 +1779,7 @@ impl Pipeline {
                     error = %err,
                     "escalation: follow-up poll failed; rescheduling"
                 );
+                run.settle(StageResult::Rescheduled);
                 return self.reschedule_follow(record, now, err.retry_after()).await;
             }
         };
@@ -1698,6 +1787,7 @@ impl Pipeline {
         // A state this port cannot name, or the same one last recorded:
         // no transition to report, no event, no notify. Reschedule.
         if status.state == TicketState::Unknown || Some(status.state) == ticket.tracker_state {
+            run.settle(StageResult::Rescheduled);
             return self.reschedule_follow(record, now, None).await;
         }
 
@@ -1752,6 +1842,7 @@ impl Pipeline {
         // so this run writes nothing and queues the next poll. A real
         // database outage fails that reschedule too and propagates.
         if self.commit(&batch).await.is_err() {
+            run.settle(StageResult::Rescheduled);
             return self.reschedule_follow(record, now, None).await;
         }
         self.defer_next();
@@ -1851,6 +1942,7 @@ impl Pipeline {
         event_id: Option<&str>,
         err: Error,
         at: &str,
+        run: &StageRun,
     ) -> Result<(), Error> {
         let attempts_used = record.attempts + 1;
         let reason = err.to_string();
@@ -1887,6 +1979,7 @@ impl Pipeline {
                 store::inbox_release_stmt(INBOX_TABLE, &claim_key_with(ticket_id, stage, event_id)),
                 store::outbox_retry_later_stmt(OUTBOX_TABLE, &record.id, &next_at),
             ];
+            run.settle(StageResult::Retry);
             self.commit(&batch).await
         } else {
             let detail = json!({
@@ -1947,6 +2040,7 @@ impl Pipeline {
                     .await?,
                 );
             }
+            run.settle(StageResult::DeadLetter);
             self.commit(&batch).await
         }
     }

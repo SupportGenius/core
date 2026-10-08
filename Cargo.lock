@@ -2322,6 +2322,7 @@ dependencies = [
  "time",
  "tower",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

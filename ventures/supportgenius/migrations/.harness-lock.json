@@ -31,6 +31,10 @@
     "file": "0022_escalation_0008_follow.sql",
     "sha256": "ec8b34f2281410869bc89468291a77d3e82f6a209a57ac487d1d7636617bd82b"
   },
+  "escalation/0009": {
+    "file": "0025_escalation_0009_observability.sql",
+    "sha256": "0c83f6d41e7176f03bfab348a300ac4ae74f811ec55196ecc42766721a2d05a2"
+  },
   "support/0001": {
     "file": "0007_support_0001_init.sql",
     "sha256": "c55b0fb12a7dcdc620659f2dc77989771cfd4df761c41b9afc3a1baf60c3f3cc"
