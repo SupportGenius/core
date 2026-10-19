@@ -572,10 +572,14 @@ impl Runner {
 
         let response = match self.http.send(request).await {
             Ok(response) => response,
-            // Transport noise and a spent deadline are the retryable
-            // failures; everything else the port can report is
+            // Transport noise, a spent deadline and a spent budget are the
+            // retryable failures; everything else the port can report is
             // deterministic.
-            Err(HttpError::Transport(_) | HttpError::DeadlineExceeded { .. }) => {
+            Err(
+                HttpError::Transport(_)
+                | HttpError::DeadlineExceeded { .. }
+                | HttpError::BudgetExhausted { .. },
+            ) => {
                 return Ok(FetchOutcome::Transient);
             }
             Err(HttpError::ResponseTooLarge { .. } | HttpError::BlockedDestination(_)) => {

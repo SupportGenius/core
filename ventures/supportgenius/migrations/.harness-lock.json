@@ -106,5 +106,9 @@
   "waitlist/0006": {
     "file": "0006_waitlist_0006_position_counter.sql",
     "sha256": "671812656c87303ee53fd845c3745bbe9d47d12ffecc9e7485d3395541cb821a"
+  },
+  "waitlist/0007": {
+    "file": "0027_waitlist_0007_lock_backfill.sql",
+    "sha256": "6785fee9ba5dee4ab7eba92f36b42748facae3c92837df3f4b67ff5280a80006"
   }
 }
