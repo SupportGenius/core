@@ -286,7 +286,7 @@ mod capture {
 
     pub(crate) fn install() {
         INSTALL.call_once(|| {
-            cratefield_core::set_error_forwarder(|line| {
+            cratefield_core::set_error_forwarder(|_level, line| {
                 LINES.lock().expect("log lock").push(line.to_owned());
             });
         });
