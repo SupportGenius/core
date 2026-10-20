@@ -2356,6 +2356,7 @@ dependencies = [
  "cratefield-core",
  "cratefield-i18n",
  "cratefield-testing",
+ "flate2",
  "getrandom 0.4.3",
  "http",
  "lexical",
