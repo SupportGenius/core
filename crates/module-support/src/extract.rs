@@ -155,6 +155,9 @@ fn pdf_text(bytes: &[u8]) -> Result<String, String> {
             "unreadable PDF: the bytes do not begin with a %PDF- header (content does not match {APPLICATION_PDF})"
         ));
     }
+    // Before lopdf loads anything: `load_mem` itself inflates object
+    // streams, so a bomb in an `/ObjStm` is expanded during the load.
+    check_inflate_budget(bytes)?;
     let document =
         lopdf::Document::load_mem(bytes).map_err(|err| format!("unreadable PDF: {err}"))?;
     if document.is_encrypted() {
@@ -193,9 +196,134 @@ fn pdf_text(bytes: &[u8]) -> Result<String, String> {
     Ok(text)
 }
 
+/// The most one Flate stream may inflate to. A content stream of a
+/// manual page is kilobytes; 8 MiB is generous for any single stream.
+pub(crate) const MAX_STREAM_INFLATED_BYTES: usize = 8 * 1024 * 1024;
+
+/// The most all of a PDF's Flate streams may inflate to, together. Bounds
+/// the memory a decompression bomb can take, however many streams it
+/// spreads the expansion over.
+pub(crate) const MAX_DOCUMENT_INFLATED_BYTES: usize = 32 * 1024 * 1024;
+
+/// Inflates every `stream` body in the raw file, each under
+/// [`MAX_STREAM_INFLATED_BYTES`], and refuses the document when one
+/// expands past its stream budget or all of them together pass
+/// [`MAX_DOCUMENT_INFLATED_BYTES`]. Nothing is stored on refusal.
+///
+/// The scan runs over the bytes, not the parsed objects, on purpose: a
+/// stream body is found by its `stream` keyword, which the PDF syntax
+/// requires for every stream (including `ObjStm` object streams, which
+/// lopdf inflates while loading). A body that is not zlib data fails
+/// its inflate at once and costs nothing toward the budget; a body that
+/// is zlib data is counted by what it inflates to, whatever its
+/// dictionary claims. The work is bounded by the same budget: no stream
+/// is read past its cap, and the scan stops at the document cap.
+/// LZW-coded streams are not inflated here (see the README's gaps).
+fn check_inflate_budget(bytes: &[u8]) -> Result<(), String> {
+    use std::io::Read;
+
+    let mut total = 0_usize;
+    let mut from = 0_usize;
+    while let Some(offset) = bytes[from..]
+        .windows(6)
+        .position(|window| window == b"stream")
+    {
+        let keyword = from + offset;
+        from = keyword + 6;
+        // `endstream` is not a body.
+        if keyword >= 3 && &bytes[keyword - 3..keyword] == b"end" {
+            continue;
+        }
+        // The body follows the keyword's end-of-line: CRLF, LF or CR.
+        let mut body = from;
+        match bytes.get(body) {
+            Some(b'\r') => {
+                body += 1;
+                if bytes.get(body) == Some(&b'\n') {
+                    body += 1;
+                }
+            }
+            Some(b'\n') => body += 1,
+            _ => {}
+        }
+        let mut inflated = Vec::new();
+        // The read stops at the cap plus one byte, so an over-budget
+        // stream is detected without inflating it in full. A decode error
+        // keeps whatever was produced: partial output still counts.
+        let cap = u64::try_from(MAX_STREAM_INFLATED_BYTES + 1).unwrap_or(u64::MAX);
+        let _ = flate2::read::ZlibDecoder::new(&bytes[body..])
+            .take(cap)
+            .read_to_end(&mut inflated);
+        if inflated.len() > MAX_STREAM_INFLATED_BYTES {
+            return Err(format!(
+                "document too large when decompressed: a stream inflates past {} MiB",
+                MAX_STREAM_INFLATED_BYTES / (1024 * 1024)
+            ));
+        }
+        total += inflated.len();
+        if total > MAX_DOCUMENT_INFLATED_BYTES {
+            return Err(format!(
+                "document too large when decompressed: its streams inflate past {} MiB in total",
+                MAX_DOCUMENT_INFLATED_BYTES / (1024 * 1024)
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_stream_inflating_past_its_cap_is_refused() {
+        let pdf = pdf_with_streams(&[vec![0_u8; MAX_STREAM_INFLATED_BYTES + 1]]);
+        let err = text_from(APPLICATION_PDF, &pdf).expect_err("bomb");
+        assert!(
+            err.contains("document too large when decompressed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn many_streams_past_the_document_cap_are_refused() {
+        // Each stream is under its own cap; together they pass the document's.
+        let streams = vec![vec![0_u8; 7 * 1024 * 1024]; 5];
+        let pdf = pdf_with_streams(&streams);
+        let err = text_from(APPLICATION_PDF, &pdf).expect_err("bomb");
+        assert!(err.contains("in total"), "{err}");
+    }
+
+    #[test]
+    fn streams_within_both_budgets_pass_the_scan() {
+        let streams = vec![vec![b'a'; 1024 * 1024]; 3];
+        let pdf = pdf_with_streams(&streams);
+        check_inflate_budget(&pdf).expect("within budget");
+    }
+
+    /// A PDF with one unreferenced Flate stream per entry of `streams`,
+    /// written through lopdf's own compressor so the bytes are real zlib.
+    fn pdf_with_streams(streams: &[Vec<u8>]) -> Vec<u8> {
+        use lopdf::dictionary;
+        let mut doc = lopdf::Document::with_version("1.4");
+        for body in streams {
+            doc.add_object(lopdf::Stream::new(dictionary! {}, body.clone()));
+        }
+        let pages_id = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Kids" => lopdf::Object::Array(Vec::new()),
+            "Count" => 0,
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+        doc.compress();
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).expect("serialises");
+        bytes
+    }
 
     #[test]
     fn plain_and_markdown_decode_strictly() {

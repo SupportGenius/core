@@ -45,6 +45,11 @@ schemars = { workspace = true }
 # `pom`, not `nom`), so the same extraction runs in a Worker isolate and
 # in the native binary — no feature gate, no second implementation.
 lopdf = { version = "0.32.0", default-features = false, features = ["pom_parser"] }
+# Inflates each Flate stream of an uploaded PDF under a byte budget before
+# lopdf sees the document, so a decompression bomb is refused rather than
+# expanded. Pure Rust (miniz_oxide), so it builds for wasm32 too; the same
+# 1.1 line lopdf already resolves to, so no second copy enters the graph.
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 # Structured logs from the extract drain and the abandoned-upload GC —
 # work that happens outside any request.
 tracing = { workspace = true }

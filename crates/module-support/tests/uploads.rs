@@ -932,6 +932,55 @@ async fn an_encrypted_pdf_is_refused_not_decrypted() {
     }
 }
 
+/// A PDF whose only real content is one unreferenced Flate stream that
+/// inflates to `inflated` zero bytes: a few kilobytes on the wire, a
+/// decompression bomb once expanded.
+fn decompression_bomb_pdf(inflated: usize) -> Vec<u8> {
+    use lopdf::dictionary;
+    let mut doc = lopdf::Document::with_version("1.4");
+    doc.add_object(lopdf::Stream::new(dictionary! {}, vec![0_u8; inflated]));
+    let pages_id = doc.add_object(dictionary! {
+        "Type" => "Pages",
+        "Kids" => lopdf::Object::Array(Vec::new()),
+        "Count" => 0,
+    });
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+    doc.compress();
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialises");
+    bytes
+}
+
+/// A stream inflating past its 8 MiB budget is refused at extraction:
+/// the upload fails with the reason, nothing is indexed, and the parts
+/// are dropped. The upload itself is small (the bomb is compressed).
+#[pollster::test]
+async fn a_decompression_bomb_is_refused_and_stores_nothing() {
+    for (kit, blob) in kits() {
+        let key = mint_tenant(&kit).await;
+        let pdf = decompression_bomb_pdf(9 * 1024 * 1024);
+        assert!(
+            pdf.len() < 64 * 1024,
+            "the bomb is small on the wire: {}",
+            pdf.len()
+        );
+        let upload_id = upload_in_parts(&kit, &key, "bomb.pdf", "application/pdf", pdf).await;
+        assert_failed(
+            &kit,
+            &key,
+            &upload_id,
+            "document too large when decompressed",
+        )
+        .await;
+        assert_eq!(blob.len(), 0, "the failed upload's parts are dropped");
+        assert_eq!(count_of(&kit, "sg_sources"), 0, "nothing was indexed");
+    }
+}
+
 #[pollster::test]
 async fn a_pdf_past_the_page_limit_fails_before_its_pages_are_read() {
     for (kit, blob) in kits() {

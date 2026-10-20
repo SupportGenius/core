@@ -125,10 +125,20 @@ source: an empty file, a PDF with no pages, a scanned or image-only PDF
 (no text layer; there is no OCR), and an encrypted PDF (it is refused,
 not decrypted, so a permission-locked PDF that could be read with an empty
 password is also refused). A PDF's text is read page by page, and reading
-stops once the text passes the 2 MiB ceiling. Residual risk: a PDF's
-compressed streams are inflated by lopdf, so a small file that expands
-heavily is bounded by the page count and the ceiling, not by its
-decompressed size.
+stops once the text passes the 2 MiB ceiling.
+
+Decompression bombs are refused before lopdf loads the file. Every
+`stream` body is inflated under a budget: 8 MiB for any one stream and
+32 MiB for all of them together (`MAX_STREAM_INFLATED_BYTES` and
+`MAX_DOCUMENT_INFLATED_BYTES`). A document past either is refused with
+"document too large when decompressed", and nothing is stored. The scan
+runs over the raw bytes because lopdf inflates object streams while
+loading. A large honest PDF whose text inflates past 32 MiB in total is
+refused too, so this is a real limit on very large documents.
+
+Gaps: LZW-coded streams are not budgeted (lopdf decodes them, and the
+budget does not cover them), and encrypted PDFs are refused without
+decryption, as above.
 
 The `extract` job runs inline as soon as the `202` is on its way (the
 `Defer` port) and, durably, from cron either way — a deployment that
