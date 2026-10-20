@@ -708,6 +708,280 @@ async fn a_bad_document_fails_the_upload_and_drops_the_parts() {
     }
 }
 
+/// A PDF with one page per entry of `pages` (an empty entry is a page with
+/// no text operations: the scanned case), optionally with an `/Encrypt`
+/// entry in the trailer, which is all the extractor checks before refusing.
+fn pdf_with_pages(pages: &[Vec<lopdf::content::Operation>], encrypted: bool) -> Vec<u8> {
+    use lopdf::content::Content;
+    // See `one_page_pdf`: the macro must be in scope, not path-invoked.
+    use lopdf::dictionary;
+
+    let mut doc = lopdf::Document::with_version("1.4");
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let resources_id = doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => font_id },
+    });
+    let pages_id = doc.add_object(dictionary! {
+        "Type" => "Pages",
+        "Kids" => lopdf::Object::Array(Vec::new()),
+        "Count" => 0,
+    });
+    let mut kids = Vec::new();
+    for operations in pages {
+        let content = Content {
+            operations: operations.clone(),
+        };
+        let content_id = doc.add_object(lopdf::Stream::new(
+            dictionary! {},
+            content.encode().expect("content encodes"),
+        ));
+        let leaf_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "Resources" => resources_id,
+        });
+        kids.push(lopdf::Object::Reference(leaf_id));
+    }
+    if let lopdf::Object::Dictionary(dict) = doc.objects.get_mut(&pages_id).expect("pages") {
+        dict.set("Kids", lopdf::Object::Array(kids));
+        dict.set("Count", i64::try_from(pages.len()).expect("page count"));
+    }
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+    if encrypted {
+        let encrypt_id = doc.add_object(dictionary! {
+            "Filter" => "Standard",
+            "V" => 1,
+            "R" => 2,
+            "O" => lopdf::Object::string_literal(vec![0_u8; 32]),
+            "U" => lopdf::Object::string_literal(vec![0_u8; 32]),
+            "P" => -4,
+        });
+        doc.trailer.set("Encrypt", encrypt_id);
+    }
+    doc.compress();
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialises");
+    bytes
+}
+
+/// One `Tj` showing `text`.
+fn shown(text: &str) -> lopdf::content::Operation {
+    lopdf::content::Operation::new("Tj", vec![lopdf::Object::string_literal(text)])
+}
+
+/// The upload's status body after a drain, asserted to be `failed` with
+/// an error containing `reason`; returns the error for further checks.
+async fn assert_failed(kit: &TestHarness, key: &str, upload_id: &str, reason: &str) -> String {
+    kit.defer.drain().await;
+    let status = get_upload(kit, key, upload_id).await;
+    assert_eq!(status.str_field("status"), "failed", "{}", status.body);
+    let error = status.str_field("error");
+    assert!(error.contains(reason), "{error:?} lacks {reason:?}");
+    assert!(status.body["source_id"].is_null(), "{}", status.body);
+    error
+}
+
+#[pollster::test]
+async fn a_type_mismatch_is_refused_at_the_first_part() {
+    for (kit, blob) in kits() {
+        let key = mint_tenant(&kit).await;
+
+        // A PDF declared over plain prose: refused with 415, nothing stored.
+        let opened = open_upload(&kit, &key, "manual.pdf", "application/pdf", 2000).await;
+        let upload_id = opened.str_field("id");
+        let prose = b"plain words, not a PDF at all. ".repeat(70);
+        let refused = put_part(&kit, &key, &upload_id, 0, prose).await;
+        assert_eq!(
+            refused.status,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "{}",
+            refused.body
+        );
+        assert_eq!(
+            refused.problem_type(),
+            format!("{PROBLEMS}content-type-mismatch")
+        );
+        assert_eq!(blob.len(), 0, "a refused part is not stored");
+        assert_eq!(
+            get_upload(&kit, &key, &upload_id).await.str_field("status"),
+            "open"
+        );
+
+        // Text declared over a PDF: refused on its signature.
+        let opened = open_upload(&kit, &key, "notes.txt", "text/plain", 40).await;
+        let refused = put_part(
+            &kit,
+            &key,
+            &opened.str_field("id"),
+            0,
+            b"%PDF-1.4\n1 0 obj\n".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            refused.status,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "{}",
+            refused.body
+        );
+        assert_eq!(
+            refused.problem_type(),
+            format!("{PROBLEMS}content-type-mismatch")
+        );
+    }
+}
+
+/// A NUL byte in a later part is past the first-part check, so the
+/// extraction sniff is what refuses it: the upload fails, parts dropped.
+#[pollster::test]
+async fn a_binary_later_part_fails_the_text_upload_at_extraction() {
+    for (kit, blob) in kits() {
+        let key = mint_tenant(&kit).await;
+        let head = b"# a heading\n".repeat(8);
+        let declared = head.len() + 100;
+        let opened = open_upload(&kit, &key, "data.md", "text/markdown", declared).await;
+        let upload_id = opened.str_field("id");
+        assert_eq!(
+            put_part(&kit, &key, &upload_id, 0, head).await.status,
+            StatusCode::OK
+        );
+        assert_eq!(
+            put_part(&kit, &key, &upload_id, 1, vec![0_u8; 100])
+                .await
+                .status,
+            StatusCode::OK
+        );
+        assert_eq!(
+            complete(&kit, &key, &upload_id).await.status,
+            StatusCode::ACCEPTED
+        );
+        assert_failed(
+            &kit,
+            &key,
+            &upload_id,
+            "content does not match text/markdown",
+        )
+        .await;
+        assert_eq!(blob.len(), 0, "the failed upload's parts are dropped");
+    }
+}
+
+#[pollster::test]
+async fn an_empty_pdf_fails_with_no_extractable_text() {
+    for (kit, blob) in kits() {
+        let key = mint_tenant(&kit).await;
+        let upload_id = upload_in_parts(
+            &kit,
+            &key,
+            "empty.pdf",
+            "application/pdf",
+            pdf_with_pages(&[], false),
+        )
+        .await;
+        assert_failed(&kit, &key, &upload_id, "no extractable text").await;
+        assert_eq!(blob.len(), 0, "the failed upload's parts are dropped");
+    }
+}
+
+/// A scanned PDF is a page with an image and no text operations. Its
+/// text layer is empty, so the honest answer is "no extractable text",
+/// never an empty source.
+#[pollster::test]
+async fn a_scanned_pdf_fails_with_no_extractable_text() {
+    for (kit, blob) in kits() {
+        let key = mint_tenant(&kit).await;
+        let image_only = vec![
+            lopdf::content::Operation::new("q", vec![]),
+            lopdf::content::Operation::new("Q", vec![]),
+        ];
+        let upload_id = upload_in_parts(
+            &kit,
+            &key,
+            "scan.pdf",
+            "application/pdf",
+            pdf_with_pages(&[image_only.clone(), image_only], false),
+        )
+        .await;
+        assert_failed(&kit, &key, &upload_id, "no extractable text").await;
+        assert_eq!(blob.len(), 0, "the failed upload's parts are dropped");
+    }
+}
+
+#[pollster::test]
+async fn an_encrypted_pdf_is_refused_not_decrypted() {
+    for (kit, blob) in kits() {
+        let key = mint_tenant(&kit).await;
+        let pdf = pdf_with_pages(&[vec![shown("the locked contract clause")]], true);
+        let upload_id = upload_in_parts(&kit, &key, "locked.pdf", "application/pdf", pdf).await;
+        let error = assert_failed(&kit, &key, &upload_id, "no extractable text").await;
+        assert!(error.contains("encrypted"), "{error}");
+        assert_eq!(blob.len(), 0, "the failed upload's parts are dropped");
+
+        // Nothing from the locked document reached the index.
+        let hits = search(&kit, &key, "contract").await;
+        let results = hits.body["results"].as_array().expect("results");
+        assert!(results.is_empty(), "{}", hits.body);
+    }
+}
+
+#[pollster::test]
+async fn a_pdf_past_the_page_limit_fails_before_its_pages_are_read() {
+    for (kit, blob) in kits() {
+        let key = mint_tenant(&kit).await;
+        let pages = vec![vec![shown("a page")]; 501];
+        let upload_id = upload_in_parts(
+            &kit,
+            &key,
+            "long.pdf",
+            "application/pdf",
+            pdf_with_pages(&pages, false),
+        )
+        .await;
+        assert_failed(&kit, &key, &upload_id, "the maximum is 500").await;
+        assert_eq!(blob.len(), 0, "the failed upload's parts are dropped");
+    }
+}
+
+#[pollster::test]
+async fn an_uploaded_pdf_is_invisible_to_another_tenant() {
+    for (kit, _blob) in kits() {
+        let alice = mint_tenant(&kit).await;
+        let mallory = mint_tenant(&kit).await;
+        let upload_id = upload_in_parts(
+            &kit,
+            &alice,
+            "private.pdf",
+            "application/pdf",
+            one_page_pdf("the sealed warehouse inventory lists zinc"),
+        )
+        .await;
+        kit.defer.drain().await;
+        let status = get_upload(&kit, &alice, &upload_id).await;
+        assert_eq!(status.str_field("status"), "extracted", "{}", status.body);
+
+        let own = search(&kit, &alice, "zinc").await;
+        assert!(!own.body["results"].as_array().expect("results").is_empty());
+        let foreign = search(&kit, &mallory, "zinc").await;
+        assert_eq!(foreign.status, StatusCode::OK, "{}", foreign.body);
+        assert!(
+            foreign.body["results"]
+                .as_array()
+                .expect("results")
+                .is_empty(),
+            "another tenant sees Alice's document: {}",
+            foreign.body
+        );
+    }
+}
+
 /// Plain text is the identity extractor, so 3 MiB of it — inside every
 /// transport limit, `complete` accepted — extracts to 3 MiB of text,
 /// past the 2 MiB ceiling. The extraction-only bound fails the upload

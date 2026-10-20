@@ -110,6 +110,25 @@ Limits, and why:
 | Per-tenant upload storage | 50 MiB default, `SUPPORT_UPLOAD_QUOTA_BYTES` | counts `open` and `complete` uploads only — extraction returns the bytes |
 | Extracted text | ≤ 2 MiB | the index is sized for manuals; a document whose text expands past this fails the upload |
 | Abandoned-upload lifetime | 24 h, then cron deletes it | an `open` upload nobody completed is storage nobody is coming back for |
+| PDF pages | ≤ 500 | bounds the parse: every page's content stream is decoded; a longer PDF fails the upload |
+
+The declared content type is checked against the bytes, not trusted.
+A PDF must carry a `%PDF-` header; a text type must be UTF-8 with no NUL
+byte and no PDF signature. The first part is judged as it arrives, and a
+mismatch is `415 content-type-mismatch` with nothing stored; the whole
+document is judged again at extraction, since a later part can carry the
+binary bytes.
+
+Some documents have no words to index, and the upload fails with an
+`error` starting `no extractable text` rather than producing an empty
+source: an empty file, a PDF with no pages, a scanned or image-only PDF
+(no text layer; there is no OCR), and an encrypted PDF (it is refused,
+not decrypted, so a permission-locked PDF that could be read with an empty
+password is also refused). A PDF's text is read page by page, and reading
+stops once the text passes the 2 MiB ceiling. Residual risk: a PDF's
+compressed streams are inflated by lopdf, so a small file that expands
+heavily is bounded by the page count and the ceiling, not by its
+decompressed size.
 
 The `extract` job runs inline as soon as the `202` is on its way (the
 `Defer` port) and, durably, from cron either way — a deployment that

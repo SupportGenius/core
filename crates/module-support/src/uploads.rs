@@ -154,6 +154,17 @@ const UNSUPPORTED_MEDIA_TYPE: ProblemDef = ProblemDef {
     description: "The upload's content type is not one this service can extract text from.",
 };
 
+/// 415: the bytes are not the content type the upload declared. Judged
+/// from the bytes themselves (a PDF signature, UTF-8, no NUL), so a
+/// mislabelled file is refused as early as its first part arrives.
+const CONTENT_MISMATCH: ProblemDef = ProblemDef {
+    slug: "content-type-mismatch",
+    status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+    title: "Content does not match its declared type",
+    description: "The bytes do not look like the content type the upload declared, so the \
+                  upload was refused.",
+};
+
 /// 409: parts were sent to, or `complete` was called on, an upload that
 /// is no longer `open`.
 const UPLOAD_CLOSED: ProblemDef = ProblemDef {
@@ -399,6 +410,16 @@ pub(crate) async fn put_part(
 
     let part_bytes = i64::try_from(body.len()).unwrap_or(i64::MAX);
     let n = i64::from(n);
+    // The first part decides early whether the declared type is a lie.
+    // Refused here, nothing is stored; the full document is sniffed again
+    // at extraction, because a later part can carry the binary bytes.
+    if n == 0
+        && let Some(why) = extract::first_part_mismatch(&upload.content_type, &body)
+    {
+        return Err(Problem::new(&CONTENT_MISMATCH)
+            .with_detail(why)
+            .instance(&scope.request_id));
+    }
     // A re-PUT of an existing ordinal replaces it, so the running total
     // swaps the old part's bytes out before the new ones are counted.
     let prior = store::upload_parts(db, &upload_id)
