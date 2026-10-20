@@ -136,9 +136,11 @@ runs over the raw bytes because lopdf inflates object streams while
 loading. A large honest PDF whose text inflates past 32 MiB in total is
 refused too, so this is a real limit on very large documents.
 
-Gaps: LZW-coded streams are not budgeted (lopdf decodes them, and the
-budget does not cover them), and encrypted PDFs are refused without
-decryption, as above.
+A PDF that names the `LZWDecode` filter (or `LZW`, with `#xx` name escapes
+decoded) is refused with "unsupported compression (LZW)": lopdf would decode
+it without a budget, and modern PDFs almost never use it.
+
+Gaps: encrypted PDFs are refused without decryption, as above.
 
 The `extract` job runs inline as soon as the `202` is on its way (the
 `Defer` port) and, durably, from cron either way — a deployment that

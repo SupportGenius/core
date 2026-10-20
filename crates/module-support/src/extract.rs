@@ -222,6 +222,14 @@ pub(crate) const MAX_DOCUMENT_INFLATED_BYTES: usize = 32 * 1024 * 1024;
 fn check_inflate_budget(bytes: &[u8]) -> Result<(), String> {
     use std::io::Read;
 
+    // LZW has no budget here, and lopdf decodes it without one, so any
+    // document that names it is refused outright. Modern PDFs almost never do.
+    if names_lzw(bytes) {
+        return Err(
+            "unsupported compression (LZW): this service reads Flate-compressed PDFs".to_owned(),
+        );
+    }
+
     let mut total = 0_usize;
     let mut from = 0_usize;
     while let Some(offset) = bytes[from..]
@@ -271,9 +279,73 @@ fn check_inflate_budget(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether the raw file names the `LZWDecode` filter (or its `LZW`
+/// abbreviation) as a PDF name, `#xx` escapes decoded, so a spelled-out
+/// `/LZW#44ecode` is caught the same as the plain form. Names are read as
+/// PDF regular characters up to the next delimiter or whitespace.
+fn names_lzw(bytes: &[u8]) -> bool {
+    const DELIMITERS: &[u8] = b" \t\r\n\x0c\0()<>[]{}/%";
+    const MAX_NAME: usize = 64;
+    bytes.iter().enumerate().any(|(at, byte)| {
+        if *byte != b'/' {
+            return false;
+        }
+        let mut name = Vec::new();
+        let mut rest = bytes[at + 1..].iter().copied().take(MAX_NAME);
+        while let Some(next) = rest.next() {
+            if DELIMITERS.contains(&next) {
+                break;
+            }
+            if next == b'#' {
+                let high = rest.next().and_then(hex_value);
+                let low = rest.next().and_then(hex_value);
+                match (high, low) {
+                    (Some(high), Some(low)) => name.push(high * 16 + low),
+                    _ => name.push(b'#'),
+                }
+            } else {
+                name.push(next);
+            }
+        }
+        name == b"LZWDecode" || name == b"LZW"
+    })
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_lzw_filter_is_refused_however_it_is_spelled() {
+        for dict in [
+            "<< /Filter /LZWDecode >>",
+            "<< /Filter /LZW >>",
+            "<< /Filter /LZW#44ecode >>",
+            "<< /Filter [/ASCIIHexDecode /LZWDecode] >>",
+        ] {
+            let pdf = format!("1 0 obj {dict} stream\nabc\nendstream endobj");
+            let err = check_inflate_budget(pdf.as_bytes()).expect_err(dict);
+            assert!(
+                err.contains("unsupported compression (LZW)"),
+                "{dict}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flate_filter_is_not_mistaken_for_lzw() {
+        let pdf = b"1 0 obj << /Filter /FlateDecode >> stream\nabc\nendstream endobj";
+        check_inflate_budget(pdf).expect("Flate is not refused by the LZW check");
+    }
 
     #[test]
     fn one_stream_inflating_past_its_cap_is_refused() {
