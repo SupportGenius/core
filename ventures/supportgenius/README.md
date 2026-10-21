@@ -189,3 +189,8 @@ cargo run --features cli --bin fz -- migrations collect
 Commit the new `migrations/NNNN_*.sql` files it writes (they are source,
 not build artifacts), then `wrangler d1 migrations apply supportgenius
 --remote` on the next deploy.
+
+
+## Rate-limit namespace ids (account-wide)
+
+Cloudflare Workers rate-limit `namespace_id`s are account-wide, not per Worker: any two Workers (or environments) on the same Cloudflare account that use the same id share counters. SupportGenius owns the block **3100-3109**; its ids are top-level `RATE_LIMITER` 3100, `VISITOR_RATE_LIMITER` 3101; staging 3102 and 3103. Pick new ids from an unused number inside this block and check the other ventures' wrangler configs before adding one.
