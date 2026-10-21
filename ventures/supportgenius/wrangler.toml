@@ -97,7 +97,7 @@ binding = "DB"
 database_name = "supportgenius"
 # NOT A REAL ID. A human runs `wrangler d1 create supportgenius` and pastes
 # the returned UUID here; deploys fail until this is replaced.
-database_id = "REPLACE_ME_WITH_THE_UUID_FROM_WRANGLER_D1_CREATE"
+database_id = "de3e9cf6-5ace-418b-85a7-c0cd4a4cd388"
 migrations_dir = "migrations"
 
 # The R2 bucket backing the harness `Blob` port, mounted unconditionally
@@ -184,7 +184,7 @@ database_name = "supportgenius-staging"
 # NOT A REAL ID, same as production's above. A human runs
 # `wrangler d1 create supportgenius-staging` and pastes the returned UUID
 # here; the deploy workflow's preflight fails until this is replaced.
-database_id = "REPLACE_ME_WITH_THE_UUID_FROM_WRANGLER_D1_CREATE"
+database_id = "369e26dc-9718-45a3-8a68-34a44e32ebea"
 migrations_dir = "migrations"
 
 [[env.staging.r2_buckets]]
