@@ -829,7 +829,7 @@ mod tests {
             .iter()
             .find(|e| e.name == "Cratefield")
             .expect("Cratefield is in the registry");
-        assert_eq!(status_word(cratefield.status), "planned");
+        assert_eq!(status_word(cratefield.status), "live");
     }
 
     /// Wrapping breaks on whitespace and never loses or duplicates a

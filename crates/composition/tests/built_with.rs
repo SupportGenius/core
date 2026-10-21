@@ -16,7 +16,14 @@ use supportgenius_composition::built_with::{
 
 /// Every entry the registry names for FZ-008, in the registry's order —
 /// which is *not* the rendered order (see [`stack`]).
-const REGISTRY_IDS: [&str; 5] = ["FZ-004", "polar", "FZ-009", "FZ-012", "cloudflare"];
+const REGISTRY_IDS: [&str; 6] = [
+    "FZ-004",
+    "polar",
+    "FZ-009",
+    "FZ-012",
+    "google-fonts",
+    "cloudflare",
+];
 
 #[test]
 fn the_stack_lists_exactly_the_registry_entries_live_first() {
@@ -24,9 +31,10 @@ fn the_stack_lists_exactly_the_registry_entries_live_first() {
     assert_eq!(
         ids,
         vec![
-            "cloudflare", // the only live one
-            "FZ-004",     // the rest keep registry order
-            "polar",
+            "FZ-004",       // live entries first, in registry order
+            "google-fonts", // live
+            "cloudflare",   // live
+            "polar",        // then planned, in registry order
             "FZ-009",
             "FZ-012",
         ]
@@ -34,7 +42,7 @@ fn the_stack_lists_exactly_the_registry_entries_live_first() {
     assert_eq!(
         stack().len(),
         REGISTRY_IDS.len(),
-        "the stack is exactly the registry's five entries, no more and no fewer"
+        "the stack is exactly the registry's six entries, no more and no fewer"
     );
     for id in REGISTRY_IDS {
         assert!(stack().iter().any(|entry| entry.id == id), "{id} is listed");
@@ -72,11 +80,11 @@ fn nothing_planned_is_shown_as_live() {
         .collect();
     assert_eq!(
         live,
-        vec!["cloudflare"],
-        "exactly one entry is live, and it is the hosting one"
+        vec!["FZ-004", "google-fonts", "cloudflare"],
+        "exactly three entries are live: the hosting provider and two framework dependencies"
     );
     // And the rest are all planned rather than unlabelled: a reader
-    // cannot mistake Cratefield or Polar for something already running.
+    // cannot mistake Polar or the other Factory Zero ventures for something already running.
     for entry in stack().iter().filter(|e| e.status != Status::Live) {
         assert_eq!(entry.status, Status::Planned, "{}: planned", entry.id);
     }
@@ -87,7 +95,7 @@ fn subprocessors_are_the_third_party_entries_only() {
     let ids: Vec<&str> = subprocessors().iter().map(|entry| entry.id).collect();
     assert_eq!(
         ids,
-        vec!["cloudflare", "polar"],
+        vec!["google-fonts", "cloudflare", "polar"],
         "third-party entries, live first then planned"
     );
     for entry in subprocessors() {
@@ -162,7 +170,7 @@ fn the_summary_payload_has_the_documented_shape() {
     assert_eq!(summary["source"], SOURCE);
 
     let uses = summary["uses"].as_array().expect("a uses array");
-    // The stack's five rows, live first, then the "Listed by / Factory
+    // The stack's six rows, live first, then the "Listed by / Factory
     // Zero" chip the site appends — which is deliberately not a stack
     // entry, so it is absent from `stack()`.
     assert_eq!(uses.len(), stack().len() + 1);
@@ -186,7 +194,7 @@ fn the_summary_payload_has_the_documented_shape() {
     let statuses: Vec<&str> = stack().iter().map(|entry| entry.status.as_str()).collect();
     assert_eq!(
         statuses,
-        vec!["live", "planned", "planned", "planned", "planned"]
+        vec!["live", "live", "live", "planned", "planned", "planned"]
     );
     for (row, expected) in uses.iter().take(stack().len()).zip(&statuses) {
         assert_eq!(row["status"], *expected);

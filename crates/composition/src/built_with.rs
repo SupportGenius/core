@@ -25,7 +25,7 @@
 //! [`stack`] sorts by [`Status`], live before planned, keeping registry
 //! order inside each group. The order is the promise: a reader scanning
 //! the About section should see what the site actually does *today*
-//! (Cloudflare) above what it intends to (Cratefield, Polar,
+//! (Cratefield, Google Fonts, Cloudflare) above what it intends to (Polar,
 //! promptdecode, Keep Shipping). Nothing planned is ever presented as
 //! live, which is the whole reason `status` is a per-entry field rather
 //! than a section heading.
