@@ -72,7 +72,7 @@ SUPPORTGENIUS_MODEL_STRONG = "claude-sonnet-5"
 [[unsafe.bindings]]
 name = "RATE_LIMITER"
 type = "ratelimit"
-namespace_id = "1001"
+namespace_id = "3100"
 simple = { limit = 60, period = 60 }
 
 # The second Rate Limiting binding the web widget routes (issue #33) run
@@ -89,7 +89,7 @@ simple = { limit = 60, period = 60 }
 [[unsafe.bindings]]
 name = "VISITOR_RATE_LIMITER"
 type = "ratelimit"
-namespace_id = "1002"
+namespace_id = "3101"
 simple = { limit = 10, period = 60 }
 
 [[d1_databases]]
@@ -164,18 +164,19 @@ SUPPORTGENIUS_MODEL_STRONG = "claude-sonnet-5"
 
 # Staging's own rate-limit namespaces. `namespace_id` must be unique across
 # the whole account, not just this Worker, so staging never shares a bucket
-# (or its counters) with production: 1003/1004 beside the top-level
-# 1001/1002, with the same limits.
+# (or its counters) with production: 3102/3103 beside the top-level
+# 3100/3101, with the same limits. SupportGenius owns the account block
+# 3100-3109 (see ventures/supportgenius/README.md).
 [[env.staging.unsafe.bindings]]
 name = "RATE_LIMITER"
 type = "ratelimit"
-namespace_id = "1003"
+namespace_id = "3102"
 simple = { limit = 60, period = 60 }
 
 [[env.staging.unsafe.bindings]]
 name = "VISITOR_RATE_LIMITER"
 type = "ratelimit"
-namespace_id = "1004"
+namespace_id = "3103"
 simple = { limit = 10, period = 60 }
 
 [[env.staging.d1_databases]]
