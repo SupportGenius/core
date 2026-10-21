@@ -11,8 +11,8 @@
       "url": "https://cratefield.com/",
       "role": "framework",
       "phrase": "Built with",
-      "status": "planned",
-      "note": "The ticketing and routing core is being written on the Cratefield harness; it is not deployed."
+      "status": "live",
+      "note": "The waitlist Worker at api.supportgeni.us runs on the Cratefield harness waitlist module; the ticketing and routing core is being written on the harness and is not deployed."
     },
     {
       "id": "polar",
@@ -43,6 +43,16 @@
       "phrase": "Deploys by",
       "status": "planned",
       "note": "Every venture site and Worker deployed from the Keep Shipping console."
+    },
+    {
+      "id": "google-fonts",
+      "name": "Google Fonts",
+      "kind": "third-party",
+      "url": "https://fonts.google.com",
+      "role": "fonts",
+      "phrase": "Typefaces from",
+      "status": "live",
+      "note": "The site’s typefaces (Geist, Geist Mono), loaded from Google."
     },
     {
       "id": "cloudflare",

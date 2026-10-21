@@ -142,14 +142,14 @@ jobs:
           fi
 
   conformance:
-    # 1475d0190b4ef05c20fdd450f3967ce6ec005360 is the harness commit that
-    # published cratefield-core 0.6.0 and every dependent (Cratefield/harness#558,
-    # the 0.6.0 crates.io release). No release tag exists, so the full SHA is
-    # the pin; it is on main.
+    # e6de12794eb7287b6eaaea6037bba4bd73d77714 is the harness commit that
+    # published cratefield-runtime-cloudflare 0.5.1, cratefield-runtime-native 0.4.5,
+    # cratefield-adapter-postgres 0.3.4, cratefield-testing 0.5.4, and cratefield-cli 0.7.3
+    # (Cratefield/harness#910). No release tag exists, so the full SHA is the pin; it is on main.
     name: conformance (module kit)
     needs: detect-modules
     if: needs.detect-modules.outputs.has_modules == 'true'
-    uses: Cratefield/harness/.github/workflows/conformance.yml@1475d0190b4ef05c20fdd450f3967ce6ec005360
+    uses: Cratefield/harness/.github/workflows/conformance.yml@e6de12794eb7287b6eaaea6037bba4bd73d77714
     with:
       module-glob: "crates/module-*"
 

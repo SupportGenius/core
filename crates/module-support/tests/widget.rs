@@ -884,7 +884,7 @@ async fn widget_origins_column(kit: &TestHarness, tenant_id: &str) -> Option<Opt
 /// The payload the composition bakes in and this module serves: the shape
 /// `built_with::summary_json()` emits, small enough to inline. Real entries,
 /// live first then planned, so the widget's ordering assertion has teeth.
-const BUILT_WITH: &str = r#"{"venture":"SupportGenius","source":"https://factory0.ventures/stack.json","registry":"https://factory0.ventures/ventures/supportgenius/","subprocessors":"https://factory0.ventures/ventures/supportgenius/","uses":[{"name":"Cloudflare","phrase":"Hosted on","url":"https://www.cloudflare.com","status":"live","note":"The site."},{"name":"Cratefield","phrase":"Built with","url":"https://cratefield.com/","status":"planned","note":"Not deployed."},{"name":"Polar","phrase":"Payments by","url":"https://polar.sh","status":"planned","note":"Nothing on sale yet."}]}"#;
+const BUILT_WITH: &str = r#"{"venture":"SupportGenius","source":"https://factory0.ventures/stack.json","registry":"https://factory0.ventures/ventures/supportgenius/","subprocessors":"https://factory0.ventures/ventures/supportgenius/","uses":[{"name":"Cratefield","phrase":"Built with","url":"https://cratefield.com/","status":"live","note":"The waitlist Worker at api.supportgeni.us runs on the Cratefield harness waitlist module; the ticketing and routing core is being written on the harness and is not deployed."},{"name":"Polar","phrase":"Payments by","url":"https://polar.sh","status":"planned","note":"Paid plans through Polar as Merchant of Record, via the Cratefield Payments port. Nothing is on sale yet."},{"name":"promptdecode","phrase":"Screened by","url":"https://promptdeco.de/","status":"planned","note":"Free text in bug reports is screened for hidden instructions before a model drafts the ticket."},{"name":"Keep Shipping","phrase":"Deploys by","url":"https://keepshipping.run/","status":"planned","note":"Every venture site and Worker deployed from the Keep Shipping console."},{"name":"Google Fonts","phrase":"Typefaces from","url":"https://fonts.google.com","status":"live","note":"The site's typefaces (Geist, Geist Mono), loaded from Google."},{"name":"Cloudflare","phrase":"Hosted on","url":"https://www.cloudflare.com","status":"live","note":"The site."},{"name":"Factory Zero","phrase":"Listed by","url":"https://factory0.ventures/ventures/supportgenius/","status":"live","note":"The venture page this stack is copied from."}]}"#;
 
 /// A kit whose `Support` carries the venture's stack, the way the composition
 /// wires it. Everything else about the module is the ordinary default.
@@ -936,7 +936,7 @@ async fn the_built_with_list_is_served_as_the_composition_rendered_it() {
     #[rustfmt::skip]
     assert!(uses.iter().any(|row| row["name"] == "Cloudflare" && row["status"] == "live"));
     #[rustfmt::skip]
-    assert!(uses.iter().any(|row| row["name"] == "Cratefield" && row["status"] == "planned"));
+    assert!(uses.iter().any(|row| row["name"] == "Cratefield" && row["status"] == "live"));
     assert_eq!(
         body["subprocessors"],
         "https://factory0.ventures/ventures/supportgenius/"
