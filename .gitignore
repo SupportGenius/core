@@ -9,9 +9,10 @@
 # Wrangler local state (`.wrangler/` holds the local D1 sqlite, caches).
 .wrangler/
 
-# Node tooling (wrangler installs via npx).
+# Node tooling (wrangler installs via bunx).
 node_modules/
 
 # The self-hosted binary's default SQLite database (`DATABASE_URL` unset
 # boots at ./supportgenius.db).
 *.db
+package-lock.json
