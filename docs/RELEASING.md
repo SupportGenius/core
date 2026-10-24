@@ -78,19 +78,19 @@ template lacks D1:Edit, so add it.
 ## 3. First production deploy (one time, a human runs it)
 
 ```sh
-npx wrangler d1 create supportgenius
-npx wrangler d1 create supportgenius-staging
+bunx wrangler d1 create supportgenius
+bunx wrangler d1 create supportgenius-staging
 # paste each returned database_id into wrangler.toml ([d1_databases] and [env.staging])
-npx wrangler r2 bucket create supportgenius-uploads
-npx wrangler secret put HARNESS_SECRET      # required, >= 32 bytes
-npx wrangler secret put RESEND_API_KEY      # required, unless OWLPOST_API_KEY is set
-npx wrangler secret put OWLPOST_API_KEY     # optional; takes precedence over RESEND_API_KEY
-npx wrangler secret put TURNSTILE_SECRET    # required for production traffic
-npx wrangler secret put ADMIN_TOKEN         # optional (admin CSV export)
-npx wrangler secret put ANTHROPIC_API_KEY   # optional (grounded answers)
+bunx wrangler r2 bucket create supportgenius-uploads
+bunx wrangler secret put HARNESS_SECRET      # required, >= 32 bytes
+bunx wrangler secret put RESEND_API_KEY      # required, unless OWLPOST_API_KEY is set
+bunx wrangler secret put OWLPOST_API_KEY     # optional; takes precedence over RESEND_API_KEY
+bunx wrangler secret put TURNSTILE_SECRET    # required for production traffic
+bunx wrangler secret put ADMIN_TOKEN         # optional (admin CSV export)
+bunx wrangler secret put ANTHROPIC_API_KEY   # optional (grounded answers)
 # repeat each with `--env staging` for the staging Worker
-npx wrangler d1 migrations apply DB --remote
-npx wrangler deploy                          # or push the tag and let deploy.yml deploy
+bunx wrangler d1 migrations apply DB --remote
+bunx wrangler deploy                          # or push the tag and let deploy.yml deploy
 ```
 
 Before setting `OWLPOST_API_KEY`, verify the sending domain

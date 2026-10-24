@@ -33,14 +33,14 @@ The `#[event(scheduled)]` handler in
 
 ## Deploying (a human runs these)
 
-1. `npx wrangler d1 create supportgenius`
+1. `bunx wrangler d1 create supportgenius`
 2. Paste the returned database UUID into `database_id` in `wrangler.toml`
    (it currently holds an obvious `REPLACE_ME...` placeholder; deploys
    fail until it is replaced).
-3. `npx wrangler r2 bucket create supportgenius-uploads` — the bucket the
+3. `bunx wrangler r2 bucket create supportgenius-uploads` — the bucket the
    chunked-upload routes (`POST /v1/support/uploads`) store document
    parts in, bound as `BLOB` in `wrangler.toml`.
-4. Set the secrets — each with `npx wrangler secret put <NAME>`:
+4. Set the secrets — each with `bunx wrangler secret put <NAME>`:
    - `HARNESS_SECRET` (required, at least 32 bytes; backs the harness
      `Signer` port),
    - `RESEND_API_KEY` (one of this or `OWLPOST_API_KEY` is required; with
@@ -57,10 +57,10 @@ The `#[event(scheduled)]` handler in
      `POST /v1/support/messages` answers
      `503 text-model-not-configured` and everything else works),
    - `ADMIN_TOKEN` (optional; gates the admin CSV export).
-5. `npx worker-build --release` (or let `wrangler deploy` run it via
+5. `bunx worker-build --release` (or let `wrangler deploy` run it via
    `[build]`) and confirm `build/worker/shim.mjs` appears.
-6. `npx wrangler d1 migrations apply supportgenius --remote`
-7. `npx wrangler deploy`
+6. `bunx wrangler d1 migrations apply supportgenius --remote`
+7. `bunx wrangler deploy`
 
 ## The site's half
 
